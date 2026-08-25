@@ -1,0 +1,210 @@
+{
+  "_fixture_note": "Real scoreboard event, game 401752763 (Texas A&M at Missouri, 2025-11-08), as returned by https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20251108&groups=8 — verified live on 2026-08-25. Only the headline 'video' sub-object was trimmed for size; every field shown here is verbatim API output.",
+  "id": "401752763",
+  "uid": "s:20~l:23~e:401752763",
+  "date": "2025-11-08T20:30Z",
+  "name": "Texas A&M Aggies at Missouri Tigers",
+  "shortName": "TA&M @ MIZ",
+  "season": { "year": 2025, "type": 2, "slug": "regular-season" },
+  "week": { "number": 11 },
+  "competitions": [
+    {
+      "id": "401752763",
+      "uid": "s:20~l:23~e:401752763~c:401752763",
+      "date": "2025-11-08T20:30Z",
+      "attendance": 57321,
+      "type": { "id": "1", "abbreviation": "STD" },
+      "timeValid": true,
+      "dateValid": true,
+      "neutralSite": false,
+      "conferenceCompetition": true,
+      "playByPlayAvailable": true,
+      "recent": false,
+      "venue": {
+        "id": "3838",
+        "fullName": "Memorial Stadium",
+        "address": { "city": "Columbia", "state": "MO", "country": "USA" },
+        "indoor": false
+      },
+      "competitors": [
+        {
+          "id": "142",
+          "uid": "s:20~l:23~t:142",
+          "type": "team",
+          "order": 0,
+          "homeAway": "home",
+          "winner": false,
+          "team": {
+            "id": "142",
+            "uid": "s:20~l:23~t:142",
+            "location": "Missouri",
+            "name": "Tigers",
+            "abbreviation": "MIZ",
+            "displayName": "Missouri Tigers",
+            "shortDisplayName": "Missouri",
+            "color": "f1b82d",
+            "alternateColor": "000000",
+            "isActive": true,
+            "venue": { "id": "3838" },
+            "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/142.png",
+            "conferenceId": "8"
+          },
+          "score": "17",
+          "linescores": [
+            { "value": 0.0, "displayValue": "0", "period": 1 },
+            { "value": 0.0, "displayValue": "0", "period": 2 },
+            { "value": 7.0, "displayValue": "7", "period": 3 },
+            { "value": 10.0, "displayValue": "10", "period": 4 }
+          ],
+          "statistics": [],
+          "curatedRank": { "current": 22 },
+          "records": [
+            { "name": "overall", "abbreviation": "Game", "type": "total", "summary": "6-3" },
+            { "name": "Home", "type": "home", "summary": "5-2" },
+            { "name": "Road", "type": "road", "summary": "1-1" },
+            { "name": "vs. Conf.", "type": "vsconf", "summary": "2-3" }
+          ]
+        },
+        {
+          "id": "245",
+          "uid": "s:20~l:23~t:245",
+          "type": "team",
+          "order": 1,
+          "homeAway": "away",
+          "winner": true,
+          "team": {
+            "id": "245",
+            "uid": "s:20~l:23~t:245",
+            "location": "Texas A&M",
+            "name": "Aggies",
+            "abbreviation": "TA&M",
+            "displayName": "Texas A&M Aggies",
+            "shortDisplayName": "Texas A&M",
+            "color": "500000",
+            "alternateColor": "ffffff",
+            "isActive": true,
+            "venue": { "id": "3795" },
+            "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/245.png",
+            "conferenceId": "8"
+          },
+          "score": "38",
+          "linescores": [
+            { "value": 7.0, "displayValue": "7", "period": 1 },
+            { "value": 7.0, "displayValue": "7", "period": 2 },
+            { "value": 10.0, "displayValue": "10", "period": 3 },
+            { "value": 14.0, "displayValue": "14", "period": 4 }
+          ],
+          "statistics": [],
+          "curatedRank": { "current": 3 },
+          "records": [
+            { "name": "overall", "abbreviation": "Game", "type": "total", "summary": "9-0" },
+            { "name": "Home", "type": "home", "summary": "5-0" },
+            { "name": "Road", "type": "road", "summary": "4-0" },
+            { "name": "vs. Conf.", "type": "vsconf", "summary": "6-0" }
+          ]
+        }
+      ],
+      "notes": [],
+      "status": {
+        "clock": 0.0,
+        "displayClock": "0:00",
+        "period": 4,
+        "type": {
+          "id": "3",
+          "name": "STATUS_FINAL",
+          "state": "post",
+          "completed": true,
+          "description": "Final",
+          "detail": "Final",
+          "shortDetail": "Final"
+        }
+      },
+      "broadcasts": [ { "market": "national", "names": ["ABC"] } ],
+      "leaders": [
+        {
+          "name": "passingYards",
+          "displayName": "Passing Leader",
+          "shortDisplayName": "PASS",
+          "abbreviation": "PYDS",
+          "leaders": [
+            {
+              "displayValue": "20/29, 221 YDS, 2 TD",
+              "value": 221.0,
+              "athlete": {
+                "id": "4870971",
+                "fullName": "Marcel Reed",
+                "displayName": "Marcel Reed",
+                "shortName": "M. Reed",
+                "headshot": "https://a.espncdn.com/i/headshots/college-football/players/full/4870971.png",
+                "jersey": "10",
+                "position": { "abbreviation": "QB" },
+                "team": { "id": "245" },
+                "active": true
+              },
+              "team": { "id": "245" }
+            }
+          ]
+        },
+        {
+          "name": "rushingYards",
+          "displayName": "Rushing Leader",
+          "shortDisplayName": "RUSH",
+          "abbreviation": "RYDS",
+          "leaders": [
+            {
+              "displayValue": "17 CAR, 110 YDS, 1 TD",
+              "value": 110.0,
+              "athlete": {
+                "id": "4921116",
+                "fullName": "Jamal Roberts",
+                "displayName": "Jamal Roberts",
+                "shortName": "J. Roberts",
+                "headshot": "https://a.espncdn.com/i/headshots/college-football/players/full/4921116.png",
+                "jersey": "20",
+                "position": { "abbreviation": "RB" },
+                "team": { "id": "142" },
+                "active": true
+              },
+              "team": { "id": "142" }
+            }
+          ]
+        },
+        {
+          "name": "receivingYards",
+          "displayName": "Receiving Leader",
+          "shortDisplayName": "REC",
+          "abbreviation": "RECYDS",
+          "leaders": [
+            {
+              "displayValue": "4 REC, 84 YDS, 1 TD",
+              "value": 84.0,
+              "athlete": {
+                "id": "4870653",
+                "fullName": "KC Concepcion",
+                "displayName": "KC Concepcion",
+                "shortName": "K. Concepcion",
+                "headshot": "https://a.espncdn.com/i/headshots/college-football/players/full/4870653.png",
+                "jersey": "7",
+                "position": { "abbreviation": "WR" },
+                "team": { "id": "245" },
+                "active": false
+              },
+              "team": { "id": "245" }
+            }
+          ]
+        }
+      ],
+      "groups": { "id": "8", "name": "Southeastern Conference", "shortName": "SEC", "isConference": true },
+      "format": { "regulation": { "periods": 4 } },
+      "startDate": "2025-11-08T20:30Z",
+      "broadcast": "ABC",
+      "headlines": [
+        {
+          "type": "Recap",
+          "description": "— Marcel Reed threw for 221 yards and two touchdowns, Texas A&M's hounding defense made for a forgettable first start for Missouri quarterback Matt Zollers, and the third-ranked Aggies beat the No. 19 Tigers 38-17 on Saturday to remain undefeated.",
+          "shortLinkText": "No. 3 Texas A&M's dominant defense overwhelms No. 19 Missouri's freshman QB in 38-17 victory"
+        }
+      ]
+    }
+  ]
+}

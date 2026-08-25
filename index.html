@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NCAA Football Scoreboard</title>
+  <meta name="description" content="Live college football scoreboard for the ACC, SEC, Big Ten, Big 12 and American. Scores, play-by-play and stats from the ESPN data source. No videos.">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <div class="brand">
+        <span class="brand-mark">▲</span>
+        <span class="brand-name">NCAA Football</span>
+        <span class="brand-sub">Scoreboard</span>
+      </div>
+      <div class="datebar" role="group" aria-label="Game date">
+        <button id="prevDay" class="dbtn" title="Previous day" aria-label="Previous day">◀</button>
+        <input type="date" id="dateInput" class="dinput" aria-label="Game date">
+        <button id="nextDay" class="dbtn" title="Next day" aria-label="Next day">▶</button>
+        <button id="todayBtn" class="dbtn today">Today</button>
+      </div>
+      <div class="livebadge" id="liveBadge" hidden>
+        <span class="dot"></span><span id="liveCount">0</span>&nbsp;LIVE
+      </div>
+    </div>
+  </header>
+
+  <div class="subbar" id="subbar"></div>
+
+  <main id="main" tabindex="-1"></main>
+
+  <footer class="foot">
+    <span class="foot-src">Data: ESPN public JSON API (site.api.espn.com) — the same source that powers espn.com. Text only, no videos.</span>
+    <details id="diagWrap">
+      <summary>diagnostics</summary>
+      <pre id="diag"></pre>
+    </details>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
