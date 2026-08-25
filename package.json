@@ -1,0 +1,14 @@
+{
+  "name": "ncaa-football-scoreboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Clean client-side NCAA football scoreboard for ACC, SEC, Big Ten, American, and Big 12 built on ESPN's public JSON endpoints.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "npm run test:unit && npm run test:smoke",
+    "test:unit": "node --test test/espn.test.mjs",
+    "test:smoke": "node test/smoke.mjs"
+  }
+}

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NCAA Football Scoreboard — FBS Conferences</title>
+    <meta
+      name="description"
+      content="Clean live NCAA football scoreboard for ACC, SEC, Big Ten, Big 12, and American. Official ESPN data: scores, live play-by-play, team and player stats."
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark">🏈</span>
+        <div>
+          <h1>NCAA Football Scoreboard</h1>
+          <p class="muted">ACC · SEC · Big Ten · Big 12 · American — live from ESPN</p>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="date-nav">
+          <button id="prev-day" title="Previous day" aria-label="Previous day">‹</button>
+          <button id="today">Today</button>
+          <button id="next-day" title="Next day" aria-label="Next day">›</button>
+          <input id="date-picker" type="date" aria-label="Pick a date" />
+        </div>
+        <button id="refresh" class="refresh" title="Refresh data">↻ Refresh</button>
+        <span id="status" class="status"></span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <div class="filters" id="conference-filters"></div>
+        <div id="scoreboard" class="scoreboard"></div>
+      </aside>
+
+      <section id="detail" class="detail">
+        <div class="empty">Select a game from the scoreboard.</div>
+      </section>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
