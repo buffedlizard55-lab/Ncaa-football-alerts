@@ -86,12 +86,34 @@
 
   /* ---------------- Date helpers ---------------- */
 
-  function localDateStr(d) {
+  // ESPN's football scoreboard treats `dates=` as an Eastern calendar date.
+  // Keeping the selected "today" in that same timezone prevents visitors west
+  // or east of the US from accidentally loading yesterday's/tomorrow's slate
+  // around midnight.
+  function easternDateStr(d) {
     var dt = d || new Date();
-    var y = dt.getFullYear();
-    var m = String(dt.getMonth() + 1).padStart(2, '0');
-    var day = String(dt.getDate()).padStart(2, '0');
-    return y + m + day;
+    if (isNaN(dt.getTime())) return '';
+    try {
+      var parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).formatToParts(dt);
+      var values = {};
+      parts.forEach(function (p) { values[p.type] = p.value; });
+      return values.year + values.month + values.day;
+    } catch (e) {
+      // A Date's local calendar is a reasonable last-resort display fallback
+      // for older browsers that do not support timeZone formatting.
+      var y = dt.getFullYear();
+      var m = String(dt.getMonth() + 1).padStart(2, '0');
+      var day = String(dt.getDate()).padStart(2, '0');
+      return y + m + day;
+    }
+  }
+
+  // Kept as the public helper name used by the app/tests. Its result is now
+  // deliberately Eastern rather than the browser's local calendar date.
+  function localDateStr(d) {
+    return easternDateStr(d);
   }
 
   function shiftDate(dateStr, days) {
@@ -542,10 +564,13 @@
   function fmtKickoff(iso, dateStr) {
     var d = new Date(iso);
     if (isNaN(d.getTime())) return '';
-    var sameDay = localDateStr(d) === dateStr;
-    var opts = { hour: 'numeric', minute: '2-digit' };
+    // `dateStr` is an ESPN/Eastern date, so compare and format in Eastern
+    // time as well. Formatting in the visitor's timezone made a late game
+    // appear under a different day from the scoreboard it was returned for.
+    var sameDay = easternDateStr(d) === dateStr;
+    var opts = { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' };
     if (!sameDay) opts.weekday = 'short';
-    return d.toLocaleTimeString('en-US', opts);
+    return d.toLocaleTimeString('en-US', opts) + ' ET';
   }
 
   /* ================================================================
@@ -556,7 +581,7 @@
       API_BASE: API_BASE, CONFERENCES: CONFERENCES,
       scoreboardUrl: scoreboardUrl, scoreboardRangeUrl: scoreboardRangeUrl,
       summaryUrl: summaryUrl, proxiedUrl: proxiedUrl,
-      espnFetch: espnFetch, localDateStr: localDateStr, shiftDate: shiftDate,
+      espnFetch: espnFetch, easternDateStr: easternDateStr, localDateStr: localDateStr, shiftDate: shiftDate,
       etDateFromWallclock: etDateFromWallclock, fmtDayLabel: fmtDayLabel,
       eventsOf: eventsOf, groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
       parseEvent: parseEvent,
@@ -1532,6 +1557,7 @@
     summaryUrl: summaryUrl,
     proxiedUrl: proxiedUrl,
     espnFetch: espnFetch,
+    easternDateStr: easternDateStr,
     localDateStr: localDateStr,
     shiftDate: shiftDate,
     etDateFromWallclock: etDateFromWallclock,

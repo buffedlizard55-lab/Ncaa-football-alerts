@@ -112,6 +112,15 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.shiftDate('20260101', -1), '20251231');
     assert.strictEqual(NB.shiftDate('20260101', 1), '20260102');
   });
+  test('today and kickoff labels use ESPN Eastern calendar dates', () => {
+    // 00:30 UTC on Aug 26 is still Aug 25 in New York. The selected date and
+    // kickoff label must agree with ESPN's dates= filter at this boundary.
+    const lateUtc = new Date('2026-08-26T00:30:00Z');
+    assert.strictEqual(NB.easternDateStr(lateUtc), '20260825');
+    assert.strictEqual(NB.localDateStr(lateUtc), '20260825');
+    assert.strictEqual(NB.fmtKickoff('2026-08-26T00:30:00Z', '20260825'), '8:30 PM ET');
+    assert.strictEqual(NB.fmtKickoff('2026-08-26T00:30:00Z', '20260826'), 'Tue 8:30 PM ET');
+  });
   test('etDateFromWallclock EST (winter)', () => {
     // 2025-11-08T22:59Z is 17:59 EST — same Eastern date
     assert.strictEqual(NB.etDateFromWallclock('2025-11-08T22:59:27Z'), '20251108');
