@@ -32,8 +32,22 @@
   ];
 
   function scoreboardUrl(dateStr, groupId) {
-    var u = API_BASE + '/scoreboard?dates=' + encodeURIComponent(dateStr);
-    if (groupId) u += '&groups=' + encodeURIComponent(groupId);
+    var u = API_BASE + '/scoreboard?dates=' + encodeURIComponent(dateStr) + '&limit=300';
+    // Group ids are plain digits from CONFERENCES, joined with raw commas —
+    // the exact combined form verified live on 2026-08-25 (groups=8,5 on
+    // 2025-11-08 returned the union: 11 events vs 7 SEC-only / 5 B1G-only).
+    // Do not encodeURIComponent this — that would produce %2C (unverified).
+    if (groupId) u += '&groups=' + groupId;
+    return u;
+  }
+
+  // Ranged query for the nearby-games search. Verified live 2026-08-25:
+  // dates=20260825-20260831&groups=... returned that week's events.
+  // Note: ranged responses carry `"calendar": []` — only single-day
+  // responses include the season calendar.
+  function scoreboardRangeUrl(fromStr, toStr, groupId) {
+    var u = API_BASE + '/scoreboard?dates=' + encodeURIComponent(fromStr + '-' + toStr) + '&limit=500';
+    if (groupId) u += '&groups=' + groupId;
     return u;
   }
 
@@ -100,6 +114,79 @@
     } catch (e) {
       return null;
     }
+  }
+
+  // "20260829" -> "Sat, Aug 29". Anchored at local noon so the weekday is
+  // correct in every timezone.
+  function fmtDayLabel(dateStr) {
+    if (!/^\d{8}$/.test(String(dateStr))) return String(dateStr || '');
+    var dt = new Date(+dateStr.slice(0, 4), +dateStr.slice(4, 6) - 1, +dateStr.slice(6, 8), 12, 0, 0);
+    if (isNaN(dt.getTime())) return String(dateStr);
+    return dt.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+  }
+
+  /* ---------------- Nearby-games helpers (pure) ---------------- */
+
+  // Scoreboard events live at the TOP level of the response —
+  // {"leagues":[...],"events":[...]} — verified in every live dump
+  // (2026-08-25). They are NOT inside leagues[0].
+  function eventsOf(data) {
+    return (data && data.events) || [];
+  }
+
+  // Group ranged-response events by the Eastern date they were played on —
+  // the same convention the API's `dates=` filter uses.
+  function groupByDay(events) {
+    var m = new Map();
+    (events || []).forEach(function (ev) {
+      if (!ev || !ev.id || !ev.date) return;
+      var d = etDateFromWallclock(ev.date);
+      if (!d) return;
+      if (!m.has(d)) m.set(d, []);
+      m.get(d).push(ev);
+    });
+    return Array.from(m.keys()).sort().map(function (d) {
+      return { date: d, events: m.get(d) };
+    });
+  }
+
+  // Fallback probe windows derived from a single-day response's league
+  // calendar (leagues[0].calendar + calendarStartDate). Used only when the
+  // ±14-day probes come back empty (deep offseason):
+  //   back — the last 3 weeks of the previous league year (e.g. for the
+  //          2026 league year starting 2026-02-01: 2026-01-11..2026-01-31,
+  //          which contains the Jan 19 CFP title game — verified).
+  //   fwd  — the next season/segment window that starts after the current
+  //          date (e.g. Regular Season opening 2026-08-22).
+  function calendarProbeWindows(league, dateStr) {
+    var out = { fwd: null, back: null };
+    if (!league) return out;
+    var starts = [];
+    if (league.calendarStartDate) {
+      var d0 = etDateFromWallclock(league.calendarStartDate);
+      if (d0) starts.push(d0);
+    }
+    var future = [];
+    (league.calendar || []).forEach(function (seg) {
+      var ds = seg.startDate ? etDateFromWallclock(seg.startDate) : null;
+      if (ds) {
+        starts.push(ds);
+        if (ds > dateStr) future.push(ds);
+      }
+      (seg.entries || []).forEach(function (e) {
+        var de = e.startDate ? etDateFromWallclock(e.startDate) : null;
+        if (de && de > dateStr) future.push(de);
+      });
+    });
+    if (starts.length) {
+      starts.sort();
+      out.back = [shiftDate(starts[0], -21), shiftDate(starts[0], -1)];
+    }
+    if (future.length) {
+      future.sort();
+      out.fwd = [future[0], shiftDate(future[0], 13)];
+    }
+    return out;
   }
 
   /* ---------------- Scoreboard parsing ---------------- */
@@ -391,6 +478,10 @@
       plays: extractPlays(s),
       article: s.article ? { headline: s.article.headline || '', text: s.article.description || '' } : null,
       rawKeys: Object.keys(s || {}).sort(),
+      // Scheduled kickoff from summary.header.competitions[0].date. Present on
+      // pre-game summaries (verified live 2026-08-25, event 401856766) where
+      // there are no drives/plays yet — used for deep-link resolution.
+      headerDate: (s.header && s.header.competitions && s.header.competitions[0] && s.header.competitions[0].date) || null,
       clock: null // live scoreboard clock (attached while polling)
     };
   }
@@ -463,9 +554,12 @@
   if (typeof document === 'undefined') {
     return {
       API_BASE: API_BASE, CONFERENCES: CONFERENCES,
-      scoreboardUrl: scoreboardUrl, summaryUrl: summaryUrl, proxiedUrl: proxiedUrl,
+      scoreboardUrl: scoreboardUrl, scoreboardRangeUrl: scoreboardRangeUrl,
+      summaryUrl: summaryUrl, proxiedUrl: proxiedUrl,
       espnFetch: espnFetch, localDateStr: localDateStr, shiftDate: shiftDate,
-      etDateFromWallclock: etDateFromWallclock, parseEvent: parseEvent,
+      etDateFromWallclock: etDateFromWallclock, fmtDayLabel: fmtDayLabel,
+      eventsOf: eventsOf, groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
+      parseEvent: parseEvent,
       parseCompetitor: parseCompetitor, mergeEvents: mergeEvents, groupGames: groupGames,
       periodLabel: periodLabel, normalizePlay: normalizePlay, extractPlays: extractPlays,
       parseDrives: parseDrives, parseSummary: parseSummary, lastPlayScore: lastPlayScore,
@@ -485,6 +579,10 @@
     viaProxy: false,
     weekLabel: '',
     seasonYear: null,
+    league: null,       // leagues[0] of the loaded day (calendar for nearby windows)
+    nearby: null,       // { loading, next, prev, error } — empty-day discovery
+    nearbyFor: null,    // date the nearby search was run for
+    nearbyIndex: {},    // gameId -> parsed event (nearby rows are clickable)
     view: 'scoreboard',
     gameId: null,
     game: null,          // parsed scoreboard event for the open game
@@ -531,6 +629,39 @@
   }
 
   /* ---------------- Scoreboard view ---------------- */
+  function enabledGroupIds() {
+    return CONFERENCES.filter(function (c) { return state.confs[c.id]; }).map(function (c) { return c.id; });
+  }
+
+  // Fetch one day. Prefers a single combined request (groups=1,8,5,4,151 —
+  // union verified live 2026-08-25) and falls back to the old per-conference
+  // parallel requests if the combined call fails for any reason.
+  async function fetchDay(dateStr, groupIds) {
+    function unwrap(r) { return { lists: [r.data], viaProxy: r.viaProxy, errors: [] }; }
+    if (groupIds.length) {
+      try {
+        return unwrap(await espnFetch(scoreboardUrl(dateStr, groupIds.join(','))));
+      } catch (e) {
+        var errors = [String((e && e.message) || e)];
+        var lists = [];
+        var viaProxy = false;
+        var rs = await Promise.all(groupIds.map(function (gid) {
+          return espnFetch(scoreboardUrl(dateStr, gid)).then(
+            function (r) { return { ok: true, r: r }; },
+            function (err) { return { ok: false, err: String((err && err.message) || err) }; }
+          );
+        }));
+        rs.forEach(function (x) {
+          if (x.ok) { lists.push(x.r.data); if (x.r.viaProxy) viaProxy = true; }
+          else errors.push(x.err);
+        });
+        return { lists: lists, viaProxy: viaProxy, errors: errors };
+      }
+    }
+    // No conference selected: no request (matches the previous behavior).
+    return { lists: [], viaProxy: false, errors: [] };
+  }
+
   async function loadScoreboard(showSpinner) {
     if (showSpinner !== false) {
       state.loading = true;
@@ -538,29 +669,24 @@
       render();
     }
     try {
-      var groups = Object.keys(state.confs).filter(function (id) { return state.confs[id]; });
-      var res = await Promise.all(groups.map(function (gid) {
-        return espnFetch(scoreboardUrl(state.date, gid)).then(
-          function (r) { return { data: r.data, viaProxy: r.viaProxy, failed: false }; },
-          function (e) { return { data: null, viaProxy: false, failed: true, err: String((e && e.message) || e) }; }
-        );
-      }));
+      var out = await fetchDay(state.date, enabledGroupIds());
 
       var events = [];
-      var failures = [];
-      res.forEach(function (r) {
-        if (r.failed) { failures.push(r.err); return; }
-        var league = (r.data && r.data.leagues && r.data.leagues[0]) || {};
-        events.push(league.events || []);
-        if (league.calendar && league.calendar.length && league.season) {
+      out.lists.forEach(function (data) {
+        // Events are top-level on the scoreboard payload (verified live);
+        // leagues[0] is used only for season/week/calendar info.
+        events.push(eventsOf(data));
+        var league = (data && data.leagues && data.leagues[0]) || null;
+        if (league && league.calendar && league.calendar.length && league.season) {
           state.seasonYear = league.season.year;
           state.weekLabel = weekForDate(league.calendar, state.date);
+          state.league = league;
         }
       });
 
       state.games = mergeEvents(events);
-      state.viaProxy = res.some(function (r) { return r.viaProxy; });
-      state.error = failures.length ? failures.join('; ') : null;
+      state.viaProxy = out.viaProxy;
+      state.error = out.errors.length ? out.errors.join('; ') : null;
       state.lastUpdated = new Date();
       state.loadedDate = state.date;
     } catch (e) {
@@ -568,6 +694,14 @@
         (state.viaProxy ? ' (direct and proxy requests both failed)' : '');
     }
     state.loading = false;
+    if (state.games.length || state.error) {
+      state.nearby = null;
+      state.nearbyIndex = {};
+      state.nearbyFor = null;
+    } else if (state.nearbyFor !== state.date && enabledGroupIds().length) {
+      state.nearbyFor = state.date;
+      findNearby(); // async; renders itself when done
+    }
     render();
     if (state.view === 'scoreboard') {
       stopPolling();
@@ -595,6 +729,70 @@
     return '';
   }
 
+  /* ---------------- Nearby-games search (empty days) ----------------
+   * When the selected day has no games, look for the next upcoming games
+   * and the most recent results so the scoreboard is never a dead end:
+   *   1. probe the next/previous 14 days (one ranged request each way —
+   *      verified live: dates=FROM-TO returns every event in the span);
+   *   2. if a direction is empty (deep offseason), use the season calendar
+   *      from the day response to jump straight to the likely window
+   *      (see calendarProbeWindows).
+   * All probes use the enabled conference set.
+   */
+  function nearbyDay(day) {
+    var games = day.events.map(parseEvent);
+    games.sort(function (a, b) { return (a.date || '').localeCompare(b.date || ''); });
+    games.forEach(function (g) { g.dayDate = day.date; });
+    return { date: day.date, label: fmtDayLabel(day.date), games: games };
+  }
+
+  var nearbyRun = 0; // increments per search; stale runs discard their results
+
+  async function findNearby() {
+    var run = ++nearbyRun;
+    var probeDate = state.date;
+    var g = enabledGroupIds().join(',');
+    state.nearby = { loading: true, next: null, prev: null, error: null };
+    render();
+
+    function probeDays(from, to) {
+      return espnFetch(scoreboardRangeUrl(from, to, g))
+        .then(function (r) { return groupByDay(eventsOf(r.data)); })
+        .catch(function () { return null; }); // null = request failed, [] = no games
+    }
+    function pickFirst(days) { return (days && days.length) ? days[0] : null; }
+    function pickLast(days) { return (days && days.length) ? days[days.length - 1] : null; }
+
+    var fwd = await probeDays(shiftDate(probeDate, 1), shiftDate(probeDate, 14));
+    var back = await probeDays(shiftDate(probeDate, -14), shiftDate(probeDate, -1));
+    var next = pickFirst(fwd);
+    var prev = pickLast(back);
+
+    if ((!next || !prev) && state.league) {
+      var w = calendarProbeWindows(state.league, probeDate);
+      var extra = [];
+      if (!next && w.fwd) extra.push(probeDays(w.fwd[0], w.fwd[1]).then(pickFirst).then(function (d) { if (d) next = d; }));
+      if (!prev && w.back) extra.push(probeDays(w.back[0], w.back[1]).then(pickLast).then(function (d) { if (d) prev = d; }));
+      if (extra.length) await Promise.all(extra);
+    }
+
+    // The user may have navigated away or changed the search while probing —
+    // drop stale results.
+    if (run !== nearbyRun || state.view !== 'scoreboard' || state.loadedDate !== probeDate || state.games.length) return;
+
+    state.nearby = {
+      loading: false,
+      next: next ? nearbyDay(next) : null,
+      prev: prev ? nearbyDay(prev) : null,
+      error: (fwd === null || back === null) ? 'One or more nearby-games searches failed (network).' : null
+    };
+    state.nearbyIndex = {};
+    [state.nearby.next, state.nearby.prev].forEach(function (day) {
+      if (day) day.games.forEach(function (ev) { state.nearbyIndex[ev.id] = ev; });
+    });
+    render();
+  }
+
   function renderSubbar() {
     var html = '';
     if (state.seasonYear) {
@@ -611,7 +809,8 @@
     subbar.innerHTML = html;
   }
 
-  function gameRowHtml(g) {
+  function gameRowHtml(g, ctxDate) {
+    var dayDate = ctxDate || state.date;
     var sv = statusVM(g);
     var stHtml;
     if (sv.kind === 'live') {
@@ -622,7 +821,7 @@
     } else if (sv.kind === 'final') {
       stHtml = '<span class="st-big">' + esc(sv.label) + '</span>';
     } else {
-      stHtml = '<span class="st-time">' + esc(fmtKickoff(g.date, state.date)) + '</span>';
+      stHtml = '<span class="st-time">' + esc(fmtKickoff(g.date, dayDate)) + '</span>';
     }
 
     function teamSide(side, cls) {
@@ -680,6 +879,33 @@
       '</article>';
   }
 
+  function nearbySection(kind, day) {
+    var html = '<div class="nb-block">' +
+      '<div class="grouplabel nb-label">' +
+        '<span>' + (kind === 'next' ? 'Upcoming — ' : 'Recent results — ') + esc(day.label) +
+        ' (' + day.games.length + ' game' + (day.games.length === 1 ? '' : 's') + ')</span>' +
+        '<button class="chip nb-jump" data-jump="' + esc(day.date) + '">Go to ' + esc(day.label) + ' →</button>' +
+      '</div>';
+    day.games.forEach(function (g) { html += gameRowHtml(g, day.date); });
+    return html + '</div>';
+  }
+
+  function nearbyHtml() {
+    var nb = state.nearby;
+    if (!nb) return '';
+    var html = '<div class="nearby">';
+    if (nb.loading) {
+      html += '<div class="nb-hunting"><span class="spinner inline"></span>Looking for the next games up and the most recent results…</div>';
+    }
+    if (nb.error) html += '<div class="banner info">' + esc(nb.error) + '</div>';
+    if (nb.prev) html += nearbySection('prev', nb.prev);
+    if (nb.next) html += nearbySection('next', nb.next);
+    if (!nb.loading && !nb.error && !nb.prev && !nb.next) {
+      html += '<div class="empty">No games found in the surrounding window — pick a date above.</div>';
+    }
+    return html + '</div>';
+  }
+
   function renderScoreboard() {
     var html = '';
     if (state.error && !state.games.length) {
@@ -691,12 +917,19 @@
     if (state.loading && !state.games.length) {
       html += '<div class="spinner"></div>';
     } else if (!state.games.length) {
-      html += '<div class="empty"><strong>No games on this date</strong>Try another day with the date picker — or re-enable a conference chip above.</div>';
+      if (!enabledGroupIds().length) {
+        html += '<div class="empty day-empty"><strong>No conferences selected</strong>Turn on at least one conference chip above to see games.</div>';
+      } else {
+        html += '<div class="empty day-empty"><strong>No games on this date</strong>' +
+          'None of the selected conferences play on this day. The closest games on either side are below — click any game to open it.' +
+          '</div>';
+        html += nearbyHtml();
+      }
     } else {
       var sections = groupGames(state.games);
       sections.forEach(function (s, i) {
         html += '<div class="grouplabel' + (i === 0 ? ' first' : '') + '">' + esc(s.label) + ' (' + s.games.length + ')</div>';
-        s.games.forEach(function (g) { html += gameRowHtml(g); });
+        s.games.forEach(function (g) { html += gameRowHtml(g, state.date); });
       });
     }
     main.innerHTML = html;
@@ -737,14 +970,23 @@
   async function resolveGameEvent() {
     try {
       var d = state.detail;
-      if (!d || !d.plays.length) return;
-      var first = d.plays[0];
-      var iso = first.time ? new Date(first.time).toISOString() : null;
-      var et = iso ? etDateFromWallclock(iso) : null;
+      if (!d) return;
+      // Post/live games: use the first play's wall clock. Pre-games have no
+      // plays — use the scheduled kickoff from summary.header (verified live:
+      // header.competitions[0].date is present on pre-game summaries).
+      var iso = null;
+      if (d.plays.length && d.plays[0].time) iso = new Date(d.plays[0].time).toISOString();
+      else if (d.headerDate) iso = d.headerDate;
+      if (!iso) return;
+      var et = etDateFromWallclock(iso);
       if (!et) return;
       var r = await espnFetch(scoreboardUrl(et)); // full day; one-shot
       var league = (r.data && r.data.leagues && r.data.leagues[0]) || {};
-      var events = league.events || [];
+      // Events live at the TOP level of the scoreboard payload (verified in
+      // every live response: {"leagues":[...],"events":[...]}), not inside
+      // leagues[0]. This was previously read from the wrong place, so deep
+      // links never resolved the scoreboard event.
+      var events = (r.data && r.data.events) || [];
       var ev = events.find(function (e) { return String(e.id) === state.gameId; });
       if (ev) {
         state.game = parseEvent(ev);
@@ -754,7 +996,10 @@
         state.loadedDate = et;
         state.viaProxy = r.viaProxy || state.viaProxy;
       }
-    } catch (e) { /* header still renders from summary data */ }
+    } catch (e) {
+      // Non-fatal: the header still renders from summary data.
+      if (typeof console !== 'undefined') console.warn('resolveGameEvent failed:', (e && e.message) || e);
+    }
   }
 
   function syncScoresFromPlays() {
@@ -804,7 +1049,7 @@
     Promise.all(urls).then(function (datas) {
       var events = [];
       datas.forEach(function (d) {
-        if (d && d.leagues && d.leagues[0]) events = events.concat(d.leagues[0].events || []);
+        if (d) events = events.concat(eventsOf(d)); // top-level events (verified)
       });
       var ev = events.find(function (e) { return String(e.id) === state.gameId; });
       if (!ev) return;
@@ -861,6 +1106,12 @@
       // Deep link, scoreboard event not resolved yet: infer from the last play.
       var lp = d.plays[d.plays.length - 1];
       st = { kind: 'live', label: periodLabel(lp.period) + ' ' + lp.clock, fromPlay: true };
+    } else if (d && d.headerDate) {
+      // Deep link to a scheduled game (no plays yet): kickoff time vs final
+      // inferred from the header date.
+      st = Date.parse(d.headerDate) > Date.now()
+        ? { kind: 'pre', label: '' }
+        : { kind: 'final', label: 'Final' };
     } else st = { kind: 'final', label: 'Final' };
     var live = st.kind === 'live' || st.kind === 'halftime';
     var done = st.kind === 'final';
@@ -874,7 +1125,8 @@
     } else if (st.kind === 'final') {
       statusLine = '<span>' + esc(st.label) + '</span>';
     } else {
-      statusLine = '<span class="clock">' + esc(g ? fmtKickoff(g.date, state.date) : '') + '</span>';
+      var kickIso = g ? g.date : (d ? d.headerDate : null);
+      statusLine = '<span class="clock">' + esc(kickIso ? fmtKickoff(kickIso, state.date) : '') + '</span>';
     }
 
     var gh = '<button class="backbtn" id="backBtn">← All scores</button>' +
@@ -1137,6 +1389,12 @@
       conferences: Object.keys(state.confs).filter(function (id) { return state.confs[id]; }),
       games: state.games.length,
       live: state.games.filter(function (g) { return g.status.state === 'in'; }).length,
+      nearby: state.nearby ? {
+        loading: state.nearby.loading,
+        next: state.nearby.next ? state.nearby.next.date + ' (' + state.nearby.next.games.length + ')' : null,
+        prev: state.nearby.prev ? state.nearby.prev.date + ' (' + state.nearby.prev.games.length + ')' : null,
+        error: state.nearby.error || null
+      } : null,
       lastUpdated: state.lastUpdated ? state.lastUpdated.toLocaleTimeString() : null,
       viaProxy: state.viaProxy,
       error: state.error
@@ -1169,20 +1427,35 @@
     } // else route() (hashchange) triggers the load
   }
 
-  function goGame(gameId) {
+  function goGame(gameId, gameDate) {
     stopPolling();
     state.view = 'game';
     state.gameId = String(gameId);
+    if (gameDate) state.date = gameDate;
     location.hash = '/' + state.date + '/' + gameId;
-  } // route() triggers loadGame with the event from state.games
+  } // route() triggers loadGame with the event from lookupGame()
+
+  // Find a parsed event by id anywhere it is currently held: the loaded day's
+  // games, or the nearby (upcoming/recent) discovery rows.
+  function lookupGame(id) {
+    var g = state.games.find(function (x) { return x.id === id; });
+    if (g) return { game: g, date: state.date };
+    var n = state.nearbyIndex && state.nearbyIndex[id];
+    if (n) return { game: n, date: n.dayDate || state.date };
+    return null;
+  }
 
   main.addEventListener('click', function (e) {
     var t = e.target;
+    var jump = t.closest ? t.closest('[data-jump]') : null;
+    if (jump) {
+      goScoreboard(jump.getAttribute('data-jump'));
+      return;
+    }
     var row = t.closest ? t.closest('.game-row') : null;
     if (row) {
-      var id = row.getAttribute('data-id');
-      var g = state.games.find(function (x) { return x.id === id; });
-      if (g) goGame(g.id);
+      var found = lookupGame(row.getAttribute('data-id'));
+      if (found) goGame(found.game.id, found.date);
       return;
     }
     var tab = t.closest ? t.closest('[data-tab]') : null;
@@ -1196,9 +1469,8 @@
     if (e.key !== 'Enter') return;
     var row = e.target.closest ? e.target.closest('.game-row') : null;
     if (row) {
-      var id2 = row.getAttribute('data-id');
-      var g2 = state.games.find(function (x) { return x.id === id2; });
-      if (g2) goGame(g2.id);
+      var found = lookupGame(row.getAttribute('data-id'));
+      if (found) goGame(found.game.id, found.date);
     }
   });
 
@@ -1207,6 +1479,7 @@
     if (!chip) return;
     var id = chip.getAttribute('data-conf');
     state.confs[id] = !state.confs[id];
+    state.nearbyFor = null; // conference set changed — re-run the nearby search
     loadScoreboard();
   });
 
@@ -1229,11 +1502,15 @@
     }
     if (gid && /^\d+$/.test(gid)) {
       state.view = 'game';
-      loadGame(gid, state.games.find(function (g) { return g.id === gid; }) || null);
+      var found = lookupGame(gid);
+      loadGame(gid, found ? found.game : null);
     } else {
       state.view = 'scoreboard';
       stopPolling();
-      if (state.loadedDate !== state.date) loadScoreboard();
+      // Reload (don't just re-render) if the day has no games and no
+      // nearby-games search has run for it — e.g. coming back from a game
+      // that was opened via deep link on another day.
+      if (state.loadedDate !== state.date || (!state.games.length && !state.nearby)) loadScoreboard();
       else render(true);
     }
   }
@@ -1251,12 +1528,17 @@
     CONFERENCES: CONFERENCES,
     API_BASE: API_BASE,
     scoreboardUrl: scoreboardUrl,
+    scoreboardRangeUrl: scoreboardRangeUrl,
     summaryUrl: summaryUrl,
     proxiedUrl: proxiedUrl,
     espnFetch: espnFetch,
     localDateStr: localDateStr,
     shiftDate: shiftDate,
     etDateFromWallclock: etDateFromWallclock,
+    fmtDayLabel: fmtDayLabel,
+    eventsOf: eventsOf,
+    groupByDay: groupByDay,
+    calendarProbeWindows: calendarProbeWindows,
     parseEvent: parseEvent,
     parseCompetitor: parseCompetitor,
     mergeEvents: mergeEvents,
