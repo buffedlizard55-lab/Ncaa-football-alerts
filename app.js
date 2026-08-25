@@ -352,6 +352,15 @@
     ].filter(function (s) { return s.games.length; });
   }
 
+  // On a fresh visit, retain today only when it still has a scheduled or live
+  // game. A slate made entirely of completed games should advance to the next
+  // game day, just like an empty offseason date.
+  function shouldOpenNextGameDay(games) {
+    return !(games || []).some(function (g) {
+      return g && g.status && g.status.state !== 'post';
+    });
+  }
+
   /* ---------------- Summary (game detail) parsing ---------------- */
 
   function periodLabel(n) {
@@ -586,7 +595,7 @@
       eventsOf: eventsOf, groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
       parseEvent: parseEvent,
       parseCompetitor: parseCompetitor, mergeEvents: mergeEvents, groupGames: groupGames,
-      periodLabel: periodLabel, normalizePlay: normalizePlay, extractPlays: extractPlays,
+      shouldOpenNextGameDay: shouldOpenNextGameDay, periodLabel: periodLabel, normalizePlay: normalizePlay, extractPlays: extractPlays,
       parseDrives: parseDrives, parseSummary: parseSummary, lastPlayScore: lastPlayScore,
       teamStatRows: teamStatRows, statusVM: statusVM, lineColumns: lineColumns, fmtKickoff: fmtKickoff
     };
@@ -608,6 +617,9 @@
     nearby: null,       // { loading, next, prev, error } — empty-day discovery
     nearbyFor: null,    // date the nearby search was run for
     nearbyIndex: {},    // gameId -> parsed event (nearby rows are clickable)
+    // Set only for a clean first visit. Once a game day is found, normal date
+    // navigation remains entirely under the visitor's control.
+    defaultToNextGameDay: !location.hash,
     view: 'scoreboard',
     gameId: null,
     game: null,          // parsed scoreboard event for the open game
@@ -719,11 +731,15 @@
         (state.viaProxy ? ' (direct and proxy requests both failed)' : '');
     }
     state.loading = false;
-    if (state.games.length || state.error) {
+    // A clean visit is useful even if today contains only final scores: open
+    // the next day that has a scheduled game instead. On any later navigation
+    // we preserve the selected day's normal scoreboard/nearby-results view.
+    var discoverNext = state.defaultToNextGameDay && shouldOpenNextGameDay(state.games);
+    if (state.games.length && !discoverNext) {
       state.nearby = null;
       state.nearbyIndex = {};
       state.nearbyFor = null;
-    } else if (state.nearbyFor !== state.date && enabledGroupIds().length) {
+    } else if (!state.error && state.nearbyFor !== state.date && enabledGroupIds().length) {
       state.nearbyFor = state.date;
       findNearby(); // async; renders itself when done
     }
@@ -815,6 +831,17 @@
     [state.nearby.next, state.nearby.prev].forEach(function (day) {
       if (day) day.games.forEach(function (ev) { state.nearbyIndex[ev.id] = ev; });
     });
+
+    // Only the initial, hash-free visit auto-navigates. If discovery fails or
+    // ESPN has no forward event in the probed/calendar window, keep the date
+    // the visitor opened and show the normal nearby-results state instead.
+    if (state.defaultToNextGameDay) {
+      state.defaultToNextGameDay = false;
+      if (state.nearby.next) {
+        goScoreboard(state.nearby.next.date);
+        return;
+      }
+    }
     render();
   }
 
@@ -1569,6 +1596,7 @@
     parseCompetitor: parseCompetitor,
     mergeEvents: mergeEvents,
     groupGames: groupGames,
+    shouldOpenNextGameDay: shouldOpenNextGameDay,
     periodLabel: periodLabel,
     normalizePlay: normalizePlay,
     extractPlays: extractPlays,

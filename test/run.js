@@ -279,6 +279,19 @@ function waitForPort(url, ms) {
     const g = NB.parseEvent(live);
     assert.strictEqual(NB.statusVM(g).label, '2nd 7:42');
   });
+  test('fresh visit advances past an empty or completed-only slate', () => {
+    const finalOnly = [NB.parseEvent(sb)];
+    assert.strictEqual(NB.shouldOpenNextGameDay([]), true);
+    assert.strictEqual(NB.shouldOpenNextGameDay(finalOnly), true);
+
+    const scheduled = JSON.parse(JSON.stringify(sb));
+    scheduled.competitions[0].status.type.state = 'pre';
+    assert.strictEqual(NB.shouldOpenNextGameDay([NB.parseEvent(scheduled)]), false);
+
+    const live = JSON.parse(JSON.stringify(sb));
+    live.competitions[0].status.type.state = 'in';
+    assert.strictEqual(NB.shouldOpenNextGameDay([NB.parseEvent(live)]), false);
+  });
 
   console.log('--- summary parsing (real fixture) ---');
   const detail = NB.parseSummary(sum);
