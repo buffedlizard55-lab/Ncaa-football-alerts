@@ -5,6 +5,9 @@ A clean, dark-themed scoreboard for **college football**, focused on five confer
 **ACC · SEC · Big Ten · Big 12 · American**
 
 - Clickable scoreboard: browse a day's games, click any game to open it, click back to switch games.
+- **Default opens on the next game day**: on a fresh visit, an empty or completed-only
+  current slate advances to the next day with a scheduled game. A date with a scheduled
+  or live game stays selected.
 - **Empty days are never dead ends**: if the selected day has no games (e.g. midweek in
   August), the app automatically finds and lists the **next upcoming games** and the
   **most recent results** for the enabled conferences, with one-click jump buttons.

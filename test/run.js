@@ -112,6 +112,15 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.shiftDate('20260101', -1), '20251231');
     assert.strictEqual(NB.shiftDate('20260101', 1), '20260102');
   });
+  test('today and kickoff labels use ESPN Eastern calendar dates', () => {
+    // 00:30 UTC on Aug 26 is still Aug 25 in New York. The selected date and
+    // kickoff label must agree with ESPN's dates= filter at this boundary.
+    const lateUtc = new Date('2026-08-26T00:30:00Z');
+    assert.strictEqual(NB.easternDateStr(lateUtc), '20260825');
+    assert.strictEqual(NB.localDateStr(lateUtc), '20260825');
+    assert.strictEqual(NB.fmtKickoff('2026-08-26T00:30:00Z', '20260825'), '8:30 PM ET');
+    assert.strictEqual(NB.fmtKickoff('2026-08-26T00:30:00Z', '20260826'), 'Tue 8:30 PM ET');
+  });
   test('etDateFromWallclock EST (winter)', () => {
     // 2025-11-08T22:59Z is 17:59 EST — same Eastern date
     assert.strictEqual(NB.etDateFromWallclock('2025-11-08T22:59:27Z'), '20251108');
@@ -269,6 +278,19 @@ function waitForPort(url, ms) {
     live.competitions[0].status = { clock: 0.0, displayClock: '7:42', period: 2, type: { id: '2', name: 'STATUS_IN_PROGRESS', state: 'in', completed: false, description: '2nd & 7', shortDetail: '2nd & 7' } };
     const g = NB.parseEvent(live);
     assert.strictEqual(NB.statusVM(g).label, '2nd 7:42');
+  });
+  test('fresh visit advances past an empty or completed-only slate', () => {
+    const finalOnly = [NB.parseEvent(sb)];
+    assert.strictEqual(NB.shouldOpenNextGameDay([]), true);
+    assert.strictEqual(NB.shouldOpenNextGameDay(finalOnly), true);
+
+    const scheduled = JSON.parse(JSON.stringify(sb));
+    scheduled.competitions[0].status.type.state = 'pre';
+    assert.strictEqual(NB.shouldOpenNextGameDay([NB.parseEvent(scheduled)]), false);
+
+    const live = JSON.parse(JSON.stringify(sb));
+    live.competitions[0].status.type.state = 'in';
+    assert.strictEqual(NB.shouldOpenNextGameDay([NB.parseEvent(live)]), false);
   });
 
   console.log('--- summary parsing (real fixture) ---');
