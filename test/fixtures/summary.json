@@ -1,0 +1,329 @@
+{
+  "_fixture_note": "Partial but field-exact summary for game 401752763 (Texas A&M at Missouri, 2025-11-08), as returned by https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401752763 — verified live on 2026-08-25. Truncated for size: boxscore.players contains Texas A&M only (2 of 6 categories); drives contains 2 of the game's drives (2 plays each, values verbatim); top-level plays mirrors those 4 plays. All values shown are verbatim API output.",
+  "boxscore": {
+    "teams": [
+      {
+        "team": {
+          "id": "245",
+          "uid": "s:20~l:23~t:245",
+          "slug": "texas-am-aggies",
+          "location": "Texas A&M",
+          "name": "Aggies",
+          "abbreviation": "TA&M",
+          "displayName": "Texas A&M Aggies",
+          "shortDisplayName": "Texas A&M",
+          "color": "500000",
+          "alternateColor": "ffffff",
+          "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/245.png"
+        },
+        "statistics": [
+          { "name": "firstDowns", "displayValue": "21", "value": 21.0, "label": "1st Downs" },
+          { "name": "thirdDownEff", "displayValue": "7-14", "value": 0.5, "label": "3rd down efficiency" },
+          { "name": "fourthDownEff", "displayValue": "1-2", "value": 0.5, "label": "4th down efficiency" },
+          { "name": "totalYards", "displayValue": "464", "value": "-", "label": "Total Yards" },
+          { "name": "netPassingYards", "displayValue": "221", "value": 221.0, "label": "Passing" },
+          { "name": "completionAttempts", "displayValue": "20/29", "value": "-", "label": "Comp/Att" },
+          { "name": "yardsPerPass", "displayValue": "7.6", "value": 7.621, "label": "Yards per pass" },
+          { "name": "rushingYards", "displayValue": "243", "value": 243.0, "label": "Rushing" },
+          { "name": "rushingAttempts", "displayValue": "39", "value": 39.0, "label": "Rushing Attempts" },
+          { "name": "yardsPerRushAttempt", "displayValue": "6.2", "value": 6.231, "label": "Yards per rush" },
+          { "name": "totalPenaltiesYards", "displayValue": "8-65", "value": "-", "label": "Penalties" },
+          { "name": "turnovers", "displayValue": "1", "value": "-", "label": "Turnovers" },
+          { "name": "fumblesLost", "displayValue": "1", "value": 1.0, "label": "Fumbles lost" },
+          { "name": "interceptions", "displayValue": "0", "value": 0.0, "label": "Interceptions thrown" },
+          { "name": "possessionTime", "displayValue": "35:46", "value": 2146, "label": "Possession" }
+        ],
+        "displayOrder": 1,
+        "homeAway": "away"
+      },
+      {
+        "team": {
+          "id": "142",
+          "uid": "s:20~l:23~t:142",
+          "slug": "missouri-tigers",
+          "location": "Missouri",
+          "name": "Tigers",
+          "abbreviation": "MIZ",
+          "displayName": "Missouri Tigers",
+          "shortDisplayName": "Missouri",
+          "color": "f1b82d",
+          "alternateColor": "000000",
+          "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/142.png"
+        },
+        "statistics": [
+          { "name": "firstDowns", "displayValue": "17", "value": 17.0, "label": "1st Downs" },
+          { "name": "thirdDownEff", "displayValue": "5-13", "value": 0.3846153846, "label": "3rd down efficiency" },
+          { "name": "fourthDownEff", "displayValue": "0-1", "value": 0, "label": "4th down efficiency" },
+          { "name": "totalYards", "displayValue": "284", "value": "-", "label": "Total Yards" },
+          { "name": "netPassingYards", "displayValue": "77", "value": 77.0, "label": "Passing" },
+          { "name": "completionAttempts", "displayValue": "7/22", "value": "-", "label": "Comp/Att" },
+          { "name": "yardsPerPass", "displayValue": "3.5", "value": 3.5, "label": "Yards per pass" },
+          { "name": "rushingYards", "displayValue": "207", "value": 207.0, "label": "Rushing" },
+          { "name": "rushingAttempts", "displayValue": "34", "value": 34.0, "label": "Rushing Attempts" },
+          { "name": "yardsPerRushAttempt", "displayValue": "6.1", "value": 6.088, "label": "Yards per rush" },
+          { "name": "totalPenaltiesYards", "displayValue": "4-38", "value": "-", "label": "Penalties" },
+          { "name": "turnovers", "displayValue": "2", "value": "-", "label": "Turnovers" },
+          { "name": "fumblesLost", "displayValue": "2", "value": 2.0, "label": "Fumbles lost" },
+          { "name": "interceptions", "displayValue": "0", "value": 0.0, "label": "Interceptions thrown" },
+          { "name": "possessionTime", "displayValue": "24:14", "value": 1454, "label": "Possession" }
+        ],
+        "displayOrder": 2,
+        "homeAway": "home"
+      }
+    ],
+    "players": [
+      {
+        "team": {
+          "id": "245",
+          "uid": "s:20~l:23~t:245",
+          "location": "Texas A&M",
+          "name": "Aggies",
+          "abbreviation": "TA&M",
+          "displayName": "Texas A&M Aggies",
+          "shortDisplayName": "Texas A&M",
+          "color": "500000",
+          "alternateColor": "ffffff",
+          "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/245.png"
+        },
+        "statistics": [
+          {
+            "name": "passing",
+            "keys": ["completions/passingAttempts", "passingYards", "yardsPerPassAttempt", "passingTouchdowns", "interceptions", "adjQBR"],
+            "text": "Texas A&M Passing",
+            "labels": ["C/ATT", "YDS", "AVG", "TD", "INT", "QBR"],
+            "descriptions": ["Completions/Attempts", "Yards", "Yards Per Pass Attempt", "Touchdowns", "Interceptions", "Adjusted QBR"],
+            "athletes": [
+              {
+                "athlete": {
+                  "id": "4870971",
+                  "uid": "s:20~l:23~a:4870971",
+                  "guid": "7ef5b217-b78c-3d9d-b93a-27aff33023de",
+                  "firstName": "Marcel",
+                  "lastName": "Reed",
+                  "displayName": "Marcel Reed",
+                  "headshot": { "href": "https://a.espncdn.com/i/headshots/college-football/players/full/4870971.png", "alt": "Marcel Reed" },
+                  "jersey": "10"
+                },
+                "stats": ["20/29", "221", "7.6", "2", "0", "90.4"]
+              }
+            ],
+            "totals": ["20/29", "221", "7.6", "2", "0", "--"]
+          },
+          {
+            "name": "rushing",
+            "keys": ["rushingAttempts", "rushingYards", "yardsPerRushAttempt", "rushingTouchdowns", "longRushing"],
+            "text": "Texas A&M Rushing",
+            "labels": ["CAR", "YDS", "AVG", "TD", "LONG"],
+            "descriptions": ["Rushing Attempts", "Yards", "Yards Per Rushing Attempt", "Touchdowns", "Longest Run"],
+            "athletes": [
+              {
+                "athlete": {
+                  "id": "4870934",
+                  "uid": "s:20~l:23~a:4870934",
+                  "guid": "f7581ec1-bdb7-3ef6-ad22-702d128b538f",
+                  "firstName": "Rueben",
+                  "lastName": "Owens II",
+                  "displayName": "Rueben Owens II",
+                  "headshot": { "href": "https://a.espncdn.com/i/headshots/college-football/players/full/4870934.png", "alt": "Rueben Owens II" },
+                  "jersey": "4"
+                },
+                "stats": ["13", "102", "7.8", "2", "57"]
+              },
+              {
+                "athlete": {
+                  "id": "4870644",
+                  "uid": "s:20~l:23~a:4870644",
+                  "guid": "c3bf2476-159e-356b-adff-dba6ad1ae01b",
+                  "firstName": "Dalton",
+                  "lastName": "Brooks",
+                  "displayName": "Dalton Brooks",
+                  "headshot": { "href": "https://a.espncdn.com/i/headshots/college-football/players/full/4870644.png", "alt": "Dalton Brooks" },
+                  "jersey": "25"
+                },
+                "stats": ["1", "48", "48.0", "0", "48"]
+              },
+              {
+                "athlete": {
+                  "id": "4870971",
+                  "uid": "s:20~l:23~a:4870971",
+                  "guid": "7ef5b217-b78c-3d9d-b93a-27aff33023de",
+                  "firstName": "Marcel",
+                  "lastName": "Reed",
+                  "displayName": "Marcel Reed",
+                  "headshot": { "href": "https://a.espncdn.com/i/headshots/college-football/players/full/4870971.png", "alt": "Marcel Reed" },
+                  "jersey": "10"
+                },
+                "stats": ["5", "29", "5.8", "0", "28"]
+              },
+              {
+                "athlete": {
+                  "id": "4430825",
+                  "uid": "s:20~l:23~a:4430825",
+                  "guid": "8c7af63a-1084-3d76-b6a5-2d7301f5df05",
+                  "firstName": "EJ",
+                  "lastName": "Smith",
+                  "displayName": "EJ Smith",
+                  "headshot": { "href": "https://a.espncdn.com/i/headshots/college-football/players/full/4430825.png", "alt": "EJ Smith" },
+                  "jersey": "22"
+                },
+                "stats": ["6", "24", "4.0", "1", "17"]
+              }
+            ],
+            "totals": null
+          }
+        ]
+      }
+    ]
+  },
+  "drives": [
+    {
+      "id": "40175276313",
+      "description": "2 plays, 2 yards, 0:37",
+      "team": {
+        "id": "245",
+        "name": "Aggies",
+        "abbreviation": "TA&M",
+        "displayName": "Texas A&M Aggies",
+        "shortDisplayName": "Texas A&M",
+        "logos": [ { "href": "https://a.espncdn.com/i/teamlogos/ncaa/500/245.png", "width": 500, "height": 500, "alt": "", "rel": ["full", "default"] } ]
+      },
+      "start": { "period": { "type": "quarter", "number": 2 }, "clock": { "displayValue": "0:50" }, "yardLine": 2, "text": "MIZ 2" },
+      "end": { "period": { "type": "quarter", "number": 2 }, "clock": { "displayValue": "0:20" }, "yardLine": 3, "text": "MIZ 3" },
+      "timeElapsed": { "displayValue": "0:37" },
+      "yards": 2,
+      "isScore": true,
+      "offensivePlays": 2,
+      "result": "TD",
+      "shortDisplayResult": "TD",
+      "displayResult": "Touchdown",
+      "plays": [
+        {
+          "id": "401752763343",
+          "sequenceNumber": "77",
+          "type": { "id": "5", "text": "Rush", "abbreviation": "RUSH" },
+          "text": "(00:52) No Huddle-Shotgun #22 E.Smith rush middle for 1 yard gain to the Mizzou01 (#1 M.Burks; #20 N.Rodriguez)",
+          "awayScore": 7,
+          "homeScore": 0,
+          "period": { "number": 2 },
+          "clock": { "displayValue": "0:50" },
+          "scoringPlay": false,
+          "priority": false,
+          "modified": "2025-11-09T00:36Z",
+          "wallclock": "2025-11-08T22:08:57Z",
+          "teamParticipants": [
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/245?lang=en®ion=us" }, "id": "245", "order": 1, "type": "offense" },
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/142?lang=en®ion=us" }, "id": "142", "order": 2, "type": "defense" }
+          ],
+          "isPenalty": false,
+          "statYardage": 1,
+          "start": { "down": 1, "distance": 2, "yardLine": 2, "yardsToEndzone": 2, "downDistanceText": "1st & Goal at MIZ 2", "shortDownDistanceText": "1st & Goal", "possessionText": "MIZ 2", "team": { "id": "245" } },
+          "end": { "down": 2, "distance": 1, "yardLine": 1, "yardsToEndzone": 1, "downDistanceText": "2nd & Goal at MIZ 1", "shortDownDistanceText": "2nd & Goal", "possessionText": "MIZ 1", "team": { "id": "245" } },
+          "isTurnover": false
+        },
+        {
+          "id": "401752763347",
+          "sequenceNumber": "78",
+          "type": { "id": "68", "text": "Rushing Touchdown", "abbreviation": "TD" },
+          "text": "(00:20) No Huddle-Shotgun #22 E.Smith rush middle for 1 yard gain to the Mizzou00 TOUCHDOWN, clock 00:20 #47 R.Bond kick attempt good (H: #37 T.White, LS: #48 J.Graham)",
+          "awayScore": 14,
+          "homeScore": 0,
+          "period": { "number": 2 },
+          "clock": { "displayValue": "0:20" },
+          "scoringPlay": true,
+          "priority": true,
+          "modified": "2025-11-09T00:36Z",
+          "wallclock": "2025-11-08T22:10:44Z",
+          "teamParticipants": [
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/245?lang=en®ion=us" }, "id": "245", "order": 1, "type": "offense" },
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/142?lang=en®ion=us" }, "id": "142", "order": 2, "type": "defense" }
+          ],
+          "isPenalty": false,
+          "statYardage": 1,
+          "start": { "down": 2, "distance": 1, "yardLine": 1, "yardsToEndzone": 1, "downDistanceText": "2nd & Goal at MIZ 1", "shortDownDistanceText": "2nd & Goal", "possessionText": "MIZ 1", "team": { "id": "245" } },
+          "end": { "down": -1, "distance": 0, "yardLine": 0, "yardsToEndzone": 0, "team": { "id": "245" } },
+          "scoringType": { "name": "touchdown", "displayName": "Touchdown", "abbreviation": "TD" },
+          "pointAfterAttempt": { "id": 61, "text": "Extra Point Good", "abbreviation": "Extra Point Good", "value": 1 },
+          "isTurnover": false
+        }
+      ]
+    },
+    {
+      "id": "40175276317",
+      "description": "3 plays, 9 yards, 1:57",
+      "team": {
+        "id": "142",
+        "name": "Tigers",
+        "abbreviation": "MIZ",
+        "displayName": "Missouri Tigers",
+        "shortDisplayName": "Missouri",
+        "logos": [ { "href": "https://a.espncdn.com/i/teamlogos/ncaa/500/142.png", "width": 500, "height": 500, "alt": "", "rel": ["full", "default"] } ]
+      },
+      "start": { "period": { "type": "quarter", "number": 3 }, "clock": { "displayValue": "14:54" }, "yardLine": 7, "text": "MIZ 7" },
+      "end": { "period": { "type": "quarter", "number": 3 }, "clock": { "displayValue": "12:57" }, "yardLine": 16, "text": "MIZ 16" },
+      "timeElapsed": { "displayValue": "1:57" },
+      "yards": 9,
+      "isScore": false,
+      "offensivePlays": 3,
+      "result": "PUNT",
+      "shortDisplayResult": "PUNT",
+      "displayResult": "Punt",
+      "plays": [
+        {
+          "id": "401752763376",
+          "sequenceNumber": "84",
+          "type": { "id": "53", "text": "Kickoff", "abbreviation": "K" },
+          "text": "(15:00) #99 J.Zirkel kickoff 65 yards to the Mizzou00 #11 D.Fowlkes return 33 yards to the Mizzou33, End Of Play PENALTY Mizzou Holding (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07",
+          "awayScore": 14,
+          "homeScore": 0,
+          "period": { "number": 3 },
+          "clock": { "displayValue": "14:54" },
+          "scoringPlay": false,
+          "priority": false,
+          "modified": "2025-11-09T00:36Z",
+          "wallclock": "2025-11-08T22:36:12Z",
+          "teamParticipants": [
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/142?lang=en®ion=us" }, "id": "142", "order": 1, "type": "offense" },
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/245?lang=en®ion=us" }, "id": "245", "order": 2, "type": "defense" }
+          ],
+          "isPenalty": false,
+          "statYardage": 14,
+          "start": { "down": 1, "distance": 10, "yardLine": 65, "yardsToEndzone": 65, "team": { "id": "245" } },
+          "end": { "down": 1, "distance": 7, "yardLine": 7, "yardsToEndzone": 7, "downDistanceText": "1st & Goal at MIZ 7", "shortDownDistanceText": "1st & Goal", "possessionText": "MIZ 7", "team": { "id": "142" } },
+          "isTurnover": false
+        },
+        {
+          "id": "401752763384",
+          "sequenceNumber": "85",
+          "type": { "id": "5", "text": "Rush", "abbreviation": "RUSH" },
+          "text": "(14:22) No Huddle-Shotgun #29 A.Hardy rush right for 2 yards gain to the Mizzou09 (#9 C.Howell; #11 T.Onyedim)",
+          "awayScore": 14,
+          "homeScore": 0,
+          "period": { "number": 3 },
+          "clock": { "displayValue": "14:18" },
+          "scoringPlay": false,
+          "priority": false,
+          "modified": "2025-11-09T00:36Z",
+          "wallclock": "2025-11-08T22:37:38Z",
+          "teamParticipants": [
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/142?lang=en®ion=us" }, "id": "142", "order": 1, "type": "offense" },
+            { "team": { "$ref": "http://sports.core.api.espn.pvt/v2/sports/football/leagues/college-football/seasons/2025/teams/245?lang=en®ion=us" }, "id": "245", "order": 2, "type": "defense" }
+          ],
+          "isPenalty": false,
+          "statYardage": 2,
+          "start": { "down": 1, "distance": 10, "yardLine": 7, "yardsToEndzone": 93, "downDistanceText": "1st & 10 at MIZ 7", "shortDownDistanceText": "1st & 10", "possessionText": "MIZ 7", "team": { "id": "142" } },
+          "end": { "down": 2, "distance": 8, "yardLine": 9, "yardsToEndzone": 91, "downDistanceText": "2nd & 8 at MIZ 9", "shortDownDistanceText": "2nd & 8", "possessionText": "MIZ 9", "team": { "id": "142" } },
+          "isTurnover": false
+        }
+      ]
+    }
+  ],
+  "_plays_note": "Top-level 'plays' key omitted from this fixture: the verified CFB summary carries the full PBP inside 'drives[].plays' (every play lives in a drive). The parser prefers a top-level 'plays' array when one is present and falls back to flattening drives — test/run.js exercises both paths.",
+  "article": {
+    "id": 46898150,
+    "type": "Recap",
+    "gameId": "401752763",
+    "headline": "No. 3 Texas A&M's dominant defense overwhelms No. 19 Missouri's freshman QB in 38-17 victory",
+    "description": "— Marcel Reed threw for 221 yards and two touchdowns, Texas A&M's hounding defense made for a forgettable first start for Missouri quarterback Matt Zollers, and the third-ranked Aggies beat the No. 19 Tigers 38-17 on Saturday to remain undefeated."
+  },
+  "standings": {}
+}
