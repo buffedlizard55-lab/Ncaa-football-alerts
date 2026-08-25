@@ -69,10 +69,28 @@ function waitForPort(url, ms) {
 
   console.log('--- URL builders ---');
   test('scoreboardUrl single date', () => {
-    assert.strictEqual(NB.scoreboardUrl('20260829'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829');
+    assert.strictEqual(NB.scoreboardUrl('20260829'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300');
   });
   test('scoreboardUrl with groups filter', () => {
-    assert.strictEqual(NB.scoreboardUrl('20260829', '8'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&groups=8');
+    assert.strictEqual(NB.scoreboardUrl('20260829', '8'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300&groups=8');
+  });
+  test('scoreboardUrl combined groups keep raw commas (verified form)', () => {
+    // groups=8,5 on 2025-11-08 returned the union (11 events) when called
+    // live with raw commas — %2C has not been verified, so never encode them.
+    const u = NB.scoreboardUrl('20251108', '1,8,5,4,151');
+    assert.ok(u.endsWith('&groups=1,8,5,4,151'));
+    assert.ok(u.indexOf('%2C') === -1);
+  });
+  test('scoreboardRangeUrl builds a ranged query', () => {
+    assert.strictEqual(
+      NB.scoreboardRangeUrl('20260826', '20260908', '1,8'),
+      'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260826-20260908&limit=500&groups=1,8'
+    );
+  });
+  test('scoreboardRangeUrl without groups', () => {
+    const u = NB.scoreboardRangeUrl('20260110', '20260131');
+    assert.ok(u.endsWith('dates=20260110-20260131&limit=500'));
+    assert.ok(u.indexOf('groups') === -1);
   });
   test('summaryUrl uses event= (not gameId=)', () => {
     assert.strictEqual(NB.summaryUrl('401752763'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401752763');
@@ -107,6 +125,70 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.periodLabel(4), '4th');
     assert.strictEqual(NB.periodLabel(5), 'OT');
     assert.strictEqual(NB.periodLabel(6), 'OT2');
+  });
+  test('fmtDayLabel renders weekday + date', () => {
+    // 2026-08-29 is the Saturday of Week 1 (UNC @ TCU in Dublin, verified).
+    assert.strictEqual(NB.fmtDayLabel('20260829'), 'Sat, Aug 29');
+    // 2026-01-19 is the Monday CFP title game date (verified).
+    assert.strictEqual(NB.fmtDayLabel('20260119'), 'Mon, Jan 19');
+    assert.strictEqual(NB.fmtDayLabel('nonsense'), 'nonsense');
+  });
+
+  console.log('--- nearby-games helpers ---');
+  test('eventsOf pulls top-level events (verified response shape)', () => {
+    // Live scoreboard responses are {"leagues":[...],"events":[...]} — the
+    // events array is NOT inside leagues[0] (verified in every live dump).
+    assert.deepStrictEqual(NB.eventsOf({ leagues: [{ id: '23' }], events: [{ id: '1' }] }), [{ id: '1' }]);
+    assert.deepStrictEqual(NB.eventsOf({ leagues: [{ id: '23', events: [{ id: 'wrong' }] }], events: [{ id: 'right' }] }), [{ id: 'right' }]);
+    assert.deepStrictEqual(NB.eventsOf({}), []);
+    assert.deepStrictEqual(NB.eventsOf(null), []);
+  });
+  test('groupByDay groups by Eastern date, sorted', () => {
+    const evs = [
+      { id: 'a', date: '2026-08-29T16:00Z' },  // Sat Aug 29, 12:00 ET
+      { id: 'b', date: '2026-09-06T00:15Z' },  // Sat Sep 5, 20:15 ET (UTC Sunday -> ET Saturday)
+      { id: 'c', date: '2026-08-29T23:00Z' }   // Sat Aug 29, 19:00 ET
+    ];
+    const days = NB.groupByDay(evs);
+    assert.deepStrictEqual(days.map((d) => d.date), ['20260829', '20260905']);
+    assert.strictEqual(days[0].events.length, 2);
+    assert.deepStrictEqual(days[0].events.map((e) => e.id), ['a', 'c']);
+  });
+  test('groupByDay skips malformed events', () => {
+    const days = NB.groupByDay([{ id: 'x' }, null, { id: 'y', date: 'not-a-date' }, { date: '2026-08-29T16:00Z' }]);
+    assert.strictEqual(days.length, 0);
+  });
+  test('calendarProbeWindows: back window spans the previous league-year end', () => {
+    // Real 2026-season calendar values (verbatim from the live API,
+    // 2026-08-25). League year starts 2026-02-01, so the last games of the
+    // previous season live in the 3 weeks before it — Jan 11..31, 2026,
+    // which contains the Jan 19 CFP title game (verified).
+    const league = {
+      calendarStartDate: '2026-02-01T08:00Z',
+      calendar: [
+        { label: 'Regular Season', value: '2', startDate: '2026-08-22T07:00Z', endDate: '2026-12-13T07:59Z', entries: [
+          { label: 'Week 1', value: '1', startDate: '2026-08-22T07:00Z', endDate: '2026-09-08T06:59Z' }
+        ] },
+        { label: 'Postseason', value: '3', startDate: '2026-12-13T08:00Z', endDate: '2027-01-28T07:59Z', entries: [] },
+        { label: 'Off Season', value: '4', startDate: '2027-01-28T08:00Z', endDate: '2027-02-01T07:59Z', entries: [] }
+      ]
+    };
+    const w = NB.calendarProbeWindows(league, '20260715'); // deep offseason date
+    assert.deepStrictEqual(w.back, ['20260111', '20260131']);
+    assert.deepStrictEqual(w.fwd, ['20260822', '20260904']); // season opener window
+  });
+  test('calendarProbeWindows: no future season -> fwd null', () => {
+    const league = {
+      calendarStartDate: '2025-02-01T08:00Z',
+      calendar: [
+        { label: 'Regular Season', value: '2', startDate: '2025-08-23T07:00Z', endDate: '2025-12-13T07:59Z', entries: [] },
+        { label: 'Postseason', value: '3', startDate: '2025-12-13T08:00Z', endDate: '2026-01-21T07:59Z', entries: [] }
+      ]
+    };
+    const w = NB.calendarProbeWindows(league, '20260110');
+    assert.strictEqual(w.fwd, null);
+    assert.deepStrictEqual(w.back, ['20250111', '20250131']);
+    assert.strictEqual(NB.calendarProbeWindows(null, '20260825').fwd, null);
   });
 
   console.log('--- scoreboard parsing (real fixture) ---');
@@ -280,6 +362,40 @@ function waitForPort(url, ms) {
     assert.ok(Array.isArray(detail.rawKeys));
     assert.ok(detail.rawKeys.indexOf('boxscore') !== -1);
     assert.ok(detail.rawKeys.indexOf('drives') !== -1);
+  });
+  test('parseSummary: pre-game summary (no plays) keeps header kickoff date', () => {
+    // Shaped verbatim from the live pre-game summary for event 401856766
+    // (UNC @ TCU, 2026-08-29, Aviva Stadium) fetched 2026-08-25: teams with
+    // empty statistics, no drives/plays/article, and header.competitions[0].date.
+    const pre = {
+      boxscore: {
+        teams: [
+          { team: { id: '153', abbreviation: 'UNC', displayName: 'North Carolina Tar Heels', color: '7bafd4', logo: 'https://a.espncdn.com/i/teamlogos/ncaa/500/153.png' }, statistics: [], displayOrder: 1, homeAway: 'away' },
+          { team: { id: '2628', abbreviation: 'TCU', displayName: 'TCU Horned Frogs', color: '4d1979', logo: 'https://a.espncdn.com/i/teamlogos/ncaa/500/2628.png' }, statistics: [], displayOrder: 2, homeAway: 'home' }
+        ]
+      },
+      format: { regulation: { periods: 4, displayName: 'Quarter', slug: 'quarter', clock: 900.0 } },
+      gameInfo: { venue: { id: '3504', fullName: 'Aviva Stadium', address: { city: 'Dublin', country: 'Ireland' }, grass: true } },
+      header: {
+        id: '401856766',
+        competitions: [{
+          id: '401856766', date: '2026-08-29T16:00Z', dateValid: true, neutralSite: true,
+          conferenceCompetition: false, boxscoreAvailable: false, playByPlaySource: 'none'
+        }]
+      }
+    };
+    const d = NB.parseSummary(pre);
+    assert.strictEqual(d.headerDate, '2026-08-29T16:00Z');
+    assert.strictEqual(d.teams.length, 2);
+    assert.strictEqual(d.teams[0].abbreviation, 'UNC');   // away-first ordering holds
+    assert.strictEqual(d.teams[1].abbreviation, 'TCU');
+    assert.strictEqual(d.teams[0].stats.length, 0);
+    assert.strictEqual(d.plays.length, 0);
+    assert.strictEqual(d.drives.length, 0);
+    assert.strictEqual(d.article, null);
+    assert.strictEqual(d.players.length, 0);
+    // The fixture (post-game) has no trimmed header -> headerDate null, not a crash.
+    assert.ok(detail.headerDate === null || typeof detail.headerDate === 'string');
   });
 
   console.log('--- server ---');
