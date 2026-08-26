@@ -1,0 +1,33 @@
+{
+  "contests": [
+    {
+      "__typename": "Contest",
+      "id": "6458979",
+      "sportCode": "MFB",
+      "division": 11,
+      "clock": "",
+      "currentPeriod": "FINAL",
+      "finalMessage": "FINAL",
+      "gameState": "F",
+      "statusCodeDisplay": "final",
+      "startTime": "15:00",
+      "startTimeEpoch": 1765656000,
+      "week": "16",
+      "seasonYear": 2025,
+      "hasBoxscore": true,
+      "hasPbp": true,
+      "hasTeamStats": true,
+      "linescores": [
+        { "period": "1", "home": "7", "visit": "0" },
+        { "period": "2", "home": "0", "visit": "13" },
+        { "period": "3", "home": "3", "visit": "3" },
+        { "period": "4", "home": "7", "visit": "0" }
+      ],
+      "teams": [
+        { "isHome": true, "teamId": "1356", "seoname": "navy", "nameFull": "U.S. Naval Academy", "nameShort": "Navy", "name6Char": "NAVY", "score": 17, "isWinner": true, "record": "(9-2)", "conferenceSeo": "american" },
+        { "isHome": false, "teamId": "2352", "seoname": "army", "nameFull": "U.S. Military Academy", "nameShort": "Army West Point", "name6Char": "ARMY", "score": 16, "isWinner": false, "record": "(6-5)", "conferenceSeo": "american" }
+      ],
+      "location": { "venue": "M&T Bank Stadium", "city": "Baltimore", "stateUsps": "MD" }
+    }
+  ]
+}

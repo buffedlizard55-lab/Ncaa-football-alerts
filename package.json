@@ -2,7 +2,7 @@
   "name": "ncaa-football-scoreboard",
   "version": "1.0.0",
   "private": true,
-  "description": "Clean live scoreboard for ACC, SEC, Big Ten, Big 12 and American college football. Data from the public ESPN JSON API (same source as espn.com). No videos.",
+  "description": "Clean live scoreboard for ACC, SEC, Big Ten, Big 12 and American college football. Data from ESPN public JSON with a verified NCAA.com fallback. No videos.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

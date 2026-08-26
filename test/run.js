@@ -9,7 +9,7 @@
  *
  * The live-network path (fetching ESPN from the browser) is verified in the
  * live preview; see README.md "Verification" for what was checked against the
- * real API on 2026-08-25.
+ * real API on 2026-08-26.
  */
 const { execFileSync, spawn } = require('child_process');
 const path = require('path');
@@ -67,6 +67,8 @@ function waitForPort(url, ms) {
   const NB = require(path.join(ROOT, 'app.js'));
   const sb = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'scoreboard-event.json'), 'utf8'));
   const sum = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'summary.json'), 'utf8'));
+  const ncaaScoreboard = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ncaa-scoreboard.json'), 'utf8'));
+  const ncaaGame = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ncaa-game.json'), 'utf8'));
 
   console.log('--- URL builders ---');
   test('scoreboardUrl single date', () => {
@@ -76,8 +78,9 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.scoreboardUrl('20260829', '8'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300&groups=8');
   });
   test('scoreboardUrl combined groups keep raw commas (verified form)', () => {
-    // groups=8,5 on 2025-11-08 returned the union (11 events) when called
-    // live with raw commas — %2C has not been verified, so never encode them.
+    // The builder remains available for diagnostics, but the live loader
+    // deliberately never sends this combined form because current responses
+    // contain placeholder events for comma-separated groups.
     const u = NB.scoreboardUrl('20251108', '1,8,5,4,151');
     assert.ok(u.endsWith('&groups=1,8,5,4,151'));
     assert.ok(u.indexOf('%2C') === -1);
@@ -102,6 +105,19 @@ function waitForPort(url, ms) {
   });
   test('summaryUrl uses event= (not gameId=)', () => {
     assert.strictEqual(NB.summaryUrl('401752763'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401752763');
+  });
+  test('provider fallback uses the independently verified ESPN web host', () => {
+    assert.deepStrictEqual(NB.providerUrls(NB.scoreboardUrl('20260829')), [
+      'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300',
+      'https://site.web.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300'
+    ]);
+    assert.deepStrictEqual(NB.providerUrls(NB.ncaaScoreboardUrl('20260829')), [NB.ncaaScoreboardUrl('20260829')]);
+  });
+  test('NCAA game detail URL builders stay on the retained public host', () => {
+    assert.strictEqual(NB.ncaaGameUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979');
+    assert.strictEqual(NB.ncaaBoxscoreUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/boxscore');
+    assert.strictEqual(NB.ncaaPlayByPlayUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/play-by-play');
+    assert.strictEqual(NB.ncaaTeamStatsUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/team-stats');
   });
   test('proxiedUrl wraps and encodes', () => {
     const p = NB.proxiedUrl('https://site.api.espn.com/x?a=1&b=2');
@@ -204,6 +220,63 @@ function waitForPort(url, ms) {
     assert.strictEqual(ev[0].date, '2026-08-29T16:00:00.000Z');
     assert.strictEqual(ev[0].competitions[0].competitors[0].team.displayName, 'UNC');
     assert.strictEqual(ev[0].competitions[0].status.type.state, 'pre');
+  });
+  test('NCAA community scoreboard games[] shape is also normalized', () => {
+    const data = { games: [{ game: {
+      gameID: 'g1', startDate: '12/13/2025', startTimeEpoch: 1765656000, gameState: 'final', finalMessage: 'FINAL',
+      away: { score: '16', winner: false, names: { char6: 'ARMY', short: 'Army West Point' }, conferences: [{ conferenceSeo: 'american' }] },
+      home: { score: '17', winner: true, names: { char6: 'NAVY', short: 'Navy' }, conferences: [{ conferenceSeo: 'american' }] }
+    } }] };
+    const event = NB.eventsOf(data)[0];
+    assert.strictEqual(event.id, 'g1');
+    assert.strictEqual(NB.parseEvent(event).status.state, 'post');
+    assert.strictEqual(NB.parseEvent(event).away.abbreviation, 'ARMY');
+    assert.strictEqual(NB.parseEvent(event).home.score, 17);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable(data), true);
+    assert.strictEqual(NB.eventsOf(ncaaGame).length, 1); // game/{id} uses root contests[]
+  });
+  test('NCAA fallback validates contests, preserves isHome, status, scores, and conference IDs', () => {
+    const events = NB.eventsOf(ncaaScoreboard);
+    assert.strictEqual(events.length, 2);
+    const upcoming = events.find((e) => e.id === '6604316');
+    const final = events.find((e) => e.id === '6531855');
+    assert.ok(upcoming && final);
+    assert.strictEqual(upcoming.source, 'ncaa');
+    assert.strictEqual(upcoming.competitions[0].status.type.state, 'pre');
+    assert.strictEqual(upcoming.competitions[0].competitors.find((c) => c.homeAway === 'home').team.abbreviation, 'UNC');
+    assert.deepStrictEqual(NB.parseEvent(upcoming).conferenceIds.sort(), ['1', '4']);
+    assert.strictEqual(NB.parseEvent(final).away.score, 21);
+    assert.strictEqual(NB.parseEvent(final).home.score, 27);
+    assert.strictEqual(NB.parseEvent(final).status.state, 'post');
+    assert.strictEqual(NB.eventMatchesGroups(upcoming, ['4']), true);
+    assert.strictEqual(NB.eventMatchesGroups(upcoming, ['8']), false);
+  });
+  test('placeholder ESPN responses are rejected, while a real empty slate is valid', () => {
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [{}] }), false);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [] }), true);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ error: 'upstream failed' }), false);
+    assert.strictEqual(NB.validEventsOf({ events: [{}] }).length, 0);
+  });
+  test('NCAA game overview/detail parsing keeps fallback scores and optional stats/PBP', () => {
+    const boxscore = { teamBoxscore: [
+      { teamId: 1356, teamStats: { firstDowns: '17' }, playerStats: [
+        { firstName: 'Blake', lastName: 'Horvath', number: 11, category: 'rushing', rushingAttempts: '34', rushingYards: '107' }
+      ] },
+      { teamId: 2352, teamStats: { firstDowns: '11' }, playerStats: [] }
+    ] };
+    const pbp = { contestId: 6458979, periods: [{ periodNumber: 1, playbyplayStats: [
+      { teamId: 1356, plays: [{ playText: 'Horvath rush for 5 yards.', driveText: '1 and 10 at 25', clock: '07:00', homeScore: 7, visitorScore: 0 }] }
+    ] }] };
+    const detail = NB.parseNCAADetail(ncaaGame, boxscore, pbp, boxscore);
+    assert.strictEqual(detail.teams[0].abbreviation, 'ARMY');
+    assert.strictEqual(detail.teams[1].abbreviation, 'NAVY');
+    assert.strictEqual(detail.teams[0].score, 16);
+    assert.strictEqual(detail.teams[1].score, 17);
+    assert.strictEqual(detail.teams[1].stats.find((s) => s.name === 'firstDowns').displayValue, '17');
+    assert.strictEqual(detail.players[0].teamId, '1356');
+    assert.strictEqual(detail.players[0].categories[0].athletes[0].name, 'Blake Horvath');
+    assert.strictEqual(detail.plays[0].offTeamId, '1356');
+    assert.strictEqual(detail.plays[0].type, 'Rush');
   });
   test('groupByDay groups by Eastern date, sorted', () => {
     const evs = [
@@ -505,9 +578,11 @@ function waitForPort(url, ms) {
       const js = await (await fetch(base + '/app.js')).text();
       assert.ok(js.indexOf('CONFERENCES') !== -1);
       assert.ok(js.indexOf('/api/espn?url=') !== -1);
+      assert.ok(js.indexOf('site.web.api.espn.com') !== -1);
+      assert.ok(js.indexOf('sdataprod.ncaa.com') !== -1);
       assert.ok((await (await fetch(base + '/styles.css')).text()).indexOf('.game-row') !== -1);
     });
-    await atest('same-origin ESPN relay rejects non-ESPN targets', async () => {
+    await atest('same-origin provider relay rejects arbitrary targets', async () => {
       const target = encodeURIComponent('https://example.com/not-espn');
       const res = await fetch(base + '/api/espn?url=' + target);
       assert.strictEqual(res.status, 400);

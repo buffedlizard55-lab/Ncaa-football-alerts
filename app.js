@@ -1,10 +1,10 @@
 /* ============================================================
  * NCAA Football Scoreboard
- * Data source: ESPN public JSON API (site.api.espn.com) — the same
- * API that powers espn.com. Text only. No videos.
+ * Data sources: ESPN public JSON API first, with verified NCAA fallbacks.
+ * Text only. No videos.
  *
  * Every endpoint/parameter used here was verified against live
- * API responses on 2026-08-25 (see README.md for the evidence).
+ * API responses on 2026-08-26 (see README.md for the evidence).
  * ============================================================ */
 (function (root, factory) {
   var api = factory();
@@ -14,6 +14,12 @@
   'use strict';
 
   var API_BASE = 'https://site.api.espn.com/apis/site/v2/sports/football/college-football';
+  // ESPN serves the same public JSON contract from this second host. It was
+  // independently checked on 2026-08-26 and is used only as a provider-host
+  // fallback, never as a made-up endpoint.
+  var ESPN_WEB_BASE = 'https://site.web.api.espn.com/apis/site/v2/sports/football/college-football';
+  var NCAA_GRAPHQL_BASE = 'https://sdataprod.ncaa.com';
+  var NCAA_COMMUNITY_BASE = 'https://ncaa-api.henrygd.me';
 
   /* Conference group IDs for the scoreboard `groups=` filter.
    * Verified 2026-08-25 against live responses:
@@ -33,16 +39,15 @@
 
   function scoreboardUrl(dateStr, groupId) {
     var u = API_BASE + '/scoreboard?dates=' + encodeURIComponent(dateStr) + '&limit=300';
-    // Group ids are plain digits from CONFERENCES, joined with raw commas —
-    // the exact combined form verified live on 2026-08-25 (groups=8,5 on
-    // 2025-11-08 returned the union: 11 events vs 7 SEC-only / 5 B1G-only).
-    // Do not encodeURIComponent this — that would produce %2C (unverified).
+    // Keep commas raw for callers that intentionally build a multi-group
+    // diagnostic URL. The live loader does NOT use a combined list: ESPN
+    // currently returns placeholder `{}` events for comma-separated groups.
     if (groupId) u += '&groups=' + groupId;
     return u;
   }
 
-  // Ranged query for the nearby-games search. Verified live 2026-08-25:
-  // dates=20260825-20260831&groups=... returned that week's events.
+  // Ranged query for the nearby-games search. The no-group form was
+  // independently verified on 2026-08-26 to return complete event objects.
   // Note: ranged responses carry `"calendar": []` — only single-day
   // responses include the season calendar.
   function scoreboardRangeUrl(fromStr, toStr, groupId) {
@@ -66,23 +71,30 @@
     var month = Number(String(dateStr).slice(4, 6));
     var seasonYear = month < 8 ? y - 1 : y;
     var variables = { sportCode: 'MFB', division: 11, seasonYear: seasonYear, contestDate: dateStr.slice(0, 4) + '-' + dateStr.slice(4, 6) + '-' + dateStr.slice(6, 8) };
-    return 'https://sdataprod.ncaa.com/?extensions=' + encodeURIComponent(JSON.stringify({ persistedQuery: { version: 1, sha256Hash: NCAA_SCOREBOARD_HASH } })) + '&variables=' + encodeURIComponent(JSON.stringify(variables));
+    return NCAA_GRAPHQL_BASE + '/?extensions=' + encodeURIComponent(JSON.stringify({ persistedQuery: { version: 1, sha256Hash: NCAA_SCOREBOARD_HASH } })) + '&variables=' + encodeURIComponent(JSON.stringify(variables));
   }
 
+  // The public NCAA-backed game feed uses the same contest IDs returned by
+  // the GraphQL scoreboard. Its detail routes are optional: pre-game contests
+  // advertise hasBoxscore/hasPbp/hasTeamStats as false, while completed games
+  // expose the corresponding JSON routes.
+  function ncaaGameUrl(gameId, route) {
+    return NCAA_COMMUNITY_BASE + '/game/' + encodeURIComponent(gameId) + (route ? '/' + route : '');
+  }
+  function ncaaBoxscoreUrl(gameId) { return ncaaGameUrl(gameId, 'boxscore'); }
+  function ncaaPlayByPlayUrl(gameId) { return ncaaGameUrl(gameId, 'play-by-play'); }
+  function ncaaTeamStatsUrl(gameId) { return ncaaGameUrl(gameId, 'team-stats'); }
+
   // Fallback routes for browsers whose network blocks direct cross-origin
-  // calls (CORS). The direct call to site.api.espn.com is always tried first;
-  // if it fails we walk this list of public CORS proxies in order. The original
-  // allorigins.win entry stays first (it is the documented fallback and the one
-  // the tests cover). If a single third-party proxy is down — exactly the
-  // failure the README observed on 2026-08-25 (allorigins returned Cloudflare
-  // 522) — the next proxy is still tried, so the site does not silently die.
+  // calls (CORS). The app's same-origin relay is tried before these public
+  // proxies. The proxies are deliberately a last resort: they are third-party
+  // infrastructure, not the scoreboard's source of truth.
   var CORS_PROXIES = [
     { id: 'allorigins',   build: function (url) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url); } },
     { id: 'corsproxy.io', build: function (url) { return 'https://corsproxy.io/?url=' + encodeURIComponent(url); } },
     { id: 'codetabs',     build: function (url) { return 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url); } }
   ];
 
-  // Every proxy URL for a given ESPN URL, in priority order.
   function proxyUrls(url) {
     return CORS_PROXIES.map(function (p) { return p.build(url); });
   }
@@ -93,16 +105,26 @@
     return CORS_PROXIES[0].build(url);
   }
 
+  // Return provider-host alternatives only for the verified ESPN contract.
+  // NCAA URLs must not be rewritten to ESPN (or vice versa).
+  function providerUrls(url) {
+    var out = [url];
+    if (typeof url === 'string' && url.indexOf(API_BASE) === 0) {
+      out.push(ESPN_WEB_BASE + url.slice(API_BASE.length));
+    }
+    return out;
+  }
+
   // Prefer the app's same-origin server relay in the browser. This avoids
-  // depending on ESPN's browser CORS headers or on a public proxy. Node tests
-  // do not have `location`, so they continue to exercise the direct path.
+  // depending on provider CORS headers or on a public proxy. Node tests do not
+  // have `location`, so they exercise the direct provider path.
   function sameOriginProxyUrl(url) {
     if (typeof location === 'undefined' || !location.origin) return null;
     return '/api/espn?url=' + encodeURIComponent(url);
   }
 
   async function espnFetch(url, timeoutMs) {
-    var t = timeoutMs || 20000;
+    var t = timeoutMs || 12000;
     function attempt(u) {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, t);
@@ -112,32 +134,45 @@
             var body = '';
             try { body = await res.text(); } catch (ignore) {}
             var detail = '';
-            try { detail = (JSON.parse(body).detail || JSON.parse(body).error || ''); } catch (ignore2) {}
+            try {
+              var parsed = JSON.parse(body);
+              detail = parsed.detail || parsed.error || '';
+            } catch (ignore2) {}
             throw new Error('HTTP ' + res.status + (detail ? ': ' + detail : ''));
           }
           return res.json();
         })
         .finally(function () { clearTimeout(timer); });
     }
+
     var lastErr = null;
-    var relay = sameOriginProxyUrl(url);
-    if (relay) {
+    var candidates = providerUrls(url);
+    // Each provider host gets the controlled same-origin route first, then a
+    // direct request. This makes the browser path work even when site.api is
+    // unreachable but site.web is healthy.
+    for (var i = 0; i < candidates.length; i++) {
+      var candidate = candidates[i];
+      var relay = sameOriginProxyUrl(candidate);
+      if (relay) {
+        try {
+          return { data: await attempt(relay), viaProxy: true, proxy: 'server', provider: candidate };
+        } catch (err) { lastErr = err; }
+      }
       try {
-        return { data: await attempt(relay), viaProxy: true, proxy: 'server' };
-      } catch (err) { lastErr = err; }
+        return { data: await attempt(candidate), viaProxy: false, proxy: null, provider: candidate };
+      } catch (err2) { lastErr = err2; }
     }
-    try {
-      var data = await attempt(url);
-      return { data: data, viaProxy: false, proxy: null };
-    } catch (err2) { lastErr = err2; }
-    // Direct call failed. Walk the public proxy chain as a last resort.
-    for (var i = 0; i < CORS_PROXIES.length; i++) {
+
+    // Direct/provider calls failed. Walk public proxies as a last resort. Use
+    // the originally requested URL first so this remains deterministic and so
+    // a proxy never silently changes providers.
+    for (var j = 0; j < CORS_PROXIES.length; j++) {
       try {
-        var p = await attempt(CORS_PROXIES[i].build(url));
-        return { data: p, viaProxy: true, proxy: CORS_PROXIES[i].id };
+        var p = await attempt(CORS_PROXIES[j].build(url));
+        return { data: p, viaProxy: true, proxy: CORS_PROXIES[j].id, provider: url };
       } catch (e) { lastErr = e; }
     }
-    throw lastErr;
+    throw lastErr || new Error('Provider request failed');
   }
 
   /* ---------------- Date helpers ---------------- */
@@ -208,32 +243,229 @@
   // Scoreboard events live at the TOP level of the response —
   // {"leagues":[...],"events":[...]} — verified in every live dump
   // (2026-08-25). They are NOT inside leagues[0].
+  var NCAA_CONFERENCE_INFO = {
+    acc: { id: '1', short: 'ACC', name: 'Atlantic Coast Conference' },
+    sec: { id: '8', short: 'SEC', name: 'Southeastern Conference' },
+    'big-ten': { id: '5', short: 'Big Ten', name: 'Big Ten Conference' },
+    'big-12': { id: '4', short: 'Big 12', name: 'Big 12 Conference' },
+    american: { id: '151', short: 'American', name: 'American Athletic Conference' }
+  };
+
+  function ncaaConferenceId(team) {
+    if (!team) return null;
+    if (team.conferenceId !== undefined && team.conferenceId !== null && team.conferenceId !== '') return String(team.conferenceId);
+    var seo = team.conferenceSeo;
+    if (!seo && Array.isArray(team.conferences) && team.conferences[0]) seo = team.conferences[0].conferenceSeo;
+    var info = seo && NCAA_CONFERENCE_INFO[String(seo).toLowerCase()];
+    return info ? info.id : null;
+  }
+
+  function ncaaConference(team) {
+    if (!team) return null;
+    var id = ncaaConferenceId(team);
+    var seo = team.conferenceSeo;
+    if (!seo && Array.isArray(team.conferences) && team.conferences[0]) seo = team.conferences[0].conferenceSeo;
+    var info = seo && NCAA_CONFERENCE_INFO[String(seo).toLowerCase()];
+    if (info) return info;
+    if (id) {
+      return CONFERENCES.find(function (c) { return c.id === id; }) || { id: id, short: id, name: id };
+    }
+    return null;
+  }
+
+  function ncaaTeamName(team) {
+    return (team && team.nameShort) || (team && team.names && team.names.short) || (team && team.nameFull) || '?';
+  }
+
+  function ncaaTeamAbbreviation(team) {
+    return (team && team.name6Char) || (team && team.names && team.names.char6) || ncaaTeamName(team);
+  }
+
+  function ncaaState(value) {
+    var s = String(value || '').toLowerCase();
+    if (s === 'f' || s === 'final' || s === 'post' || s === 'completed') return 'post';
+    if (s === 'i' || s === 'in' || s === 'live' || s === 'in_progress' || s === 'in-progress') return 'in';
+    return 'pre';
+  }
+
+  function ncaaPeriod(value) {
+    if (value === undefined || value === null || value === '') return 0;
+    var n = Number(value);
+    if (!isNaN(n)) return n;
+    var m = String(value).match(/(\d+)/);
+    return m ? Number(m[1]) : 0;
+  }
+
+  function ncaaIsoDate(item) {
+    if (item && item.startTimeEpoch !== undefined && item.startTimeEpoch !== null && item.startTimeEpoch !== '') {
+      var epoch = Number(item.startTimeEpoch);
+      if (isFinite(epoch)) return new Date(epoch * 1000).toISOString();
+    }
+    var md = item && String(item.startDate || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (md) {
+      // This is only a malformed-data fallback; all verified NCAA responses
+      // include startTimeEpoch. Treating an absent epoch as UTC is preferable
+      // to inventing the visitor's local timezone.
+      var clock = String(item.startTime || '00:00').match(/^(\d{1,2}):(\d{2})/);
+      var hh = clock ? String(clock[1]).padStart(2, '0') : '00';
+      var mm = clock ? clock[2] : '00';
+      return md[3] + '-' + md[1] + '-' + md[2] + 'T' + hh + ':' + mm + ':00Z';
+    }
+    return '';
+  }
+
+  function ncaaLinescores(contest, isHome) {
+    return (contest && contest.linescores || []).map(function (line) {
+      var value = isHome ? line.home : (line.visit !== undefined ? line.visit : line.visitor);
+      return { period: ncaaPeriod(line.period), value: value === undefined || value === null ? '0' : value };
+    }).filter(function (line) { return line.period > 0; });
+  }
+
+  function makeNCAAEvent(contest, oldGame) {
+    var c = contest || oldGame || {};
+    var away = oldGame ? oldGame.away : null;
+    var home = oldGame ? oldGame.home : null;
+    if (!oldGame) {
+      var teams = Array.isArray(c.teams) ? c.teams : [];
+      away = teams.find(function (t) { return t && t.isHome === false; });
+      home = teams.find(function (t) { return t && t.isHome === true; });
+    }
+    if (!away || !home) return null;
+
+    function competitor(team, homeAway) {
+      var conf = ncaaConference(team);
+      var id = team.teamId || team.id || (team.names && team.names.id) || null;
+      var score = team.score;
+      if (score === '' || score === undefined || score === null) score = null;
+      var rank = Number(team.teamRank || team.gameRank || team.rank);
+      if (!rank || rank < 1 || rank > 25) rank = null;
+      var record = team.record || '';
+      if (record) record = String(record).replace(/^\((.*)\)$/, '$1');
+      var records = record ? [{ type: 'total', summary: record }] : [];
+      return {
+        id: id ? String(id) : null,
+        homeAway: homeAway,
+        score: score,
+        winner: !!team.isWinner || !!team.winner,
+        records: records,
+        curatedRank: rank ? { current: rank } : null,
+        linescores: ncaaLinescores(c, homeAway === 'home'),
+        team: {
+          id: id ? String(id) : null,
+          abbreviation: ncaaTeamAbbreviation(team),
+          displayName: ncaaTeamName(team),
+          shortDisplayName: ncaaTeamName(team),
+          color: team.color || null,
+          logo: team.logo || null,
+          conferenceId: conf ? conf.id : ncaaConferenceId(team)
+        }
+      };
+    }
+
+    var state = ncaaState(c.gameState || c.status || c.statusCodeDisplay);
+    var conferenceIds = [ncaaConferenceId(away), ncaaConferenceId(home)].filter(Boolean);
+    var uniqueConferenceIds = conferenceIds.filter(function (id, i, all) { return all.indexOf(id) === i; });
+    var group = uniqueConferenceIds.length === 1
+      ? CONFERENCES.find(function (conf) { return conf.id === uniqueConferenceIds[0]; }) || null
+      : null;
+    var location = c.location || {};
+    var broadcaster = c.broadcasterName || c.network || '';
+    var id = c.contestId || c.gameID || c.id;
+    if (id === undefined || id === null || id === '') return null;
+    var week = c.week !== undefined && c.week !== null && c.week !== '' ? Number(c.week) : null;
+    return {
+      id: String(id),
+      date: ncaaIsoDate(c),
+      name: ncaaTeamName(away) + ' at ' + ncaaTeamName(home),
+      week: week && !isNaN(week) ? { number: week } : null,
+      source: 'ncaa',
+      provider: NCAA_COMMUNITY_BASE,
+      competitions: [{
+        id: String(id),
+        date: ncaaIsoDate(c),
+        neutralSite: !!c.neutralSite,
+        venue: location.venue ? { fullName: location.venue, address: { city: location.city, state: location.stateUsps } } : {},
+        broadcasts: broadcaster ? [{ names: [broadcaster] }] : [],
+        groups: group ? { id: group.id, shortName: group.short, name: group.name } : undefined,
+        status: {
+          type: {
+            state: state,
+            completed: state === 'post',
+            name: c.statusCodeDisplay || '',
+            description: c.finalMessage || c.currentPeriod || '',
+            shortDetail: c.finalMessage || c.currentPeriod || ''
+          },
+          period: ncaaPeriod(c.currentPeriod),
+          displayClock: c.contestClock || c.clock || '0:00'
+        },
+        competitors: [competitor(away, 'away'), competitor(home, 'home')]
+      }]
+    };
+  }
+
   function ncaaEventsOf(data) {
     var contests = data && data.data && data.data.contests;
-    if (!Array.isArray(contests)) return [];
-    return contests.map(function (c) {
-      var teams = Array.isArray(c.teams) ? c.teams : [];
-      var away = teams.find(function (t) { return t && t.isHome === false; });
-      var home = teams.find(function (t) { return t && t.isHome === true; });
-      if (!away || !home) return null;
-      var state = c.gameState === 'F' ? 'post' : c.gameState === 'I' ? 'in' : 'pre';
-      // The live NCAA response uses startDate=MM/DD/YYYY and startTimeEpoch.
-      // Epoch is the unambiguous value, so use it when present; this also
-      // preserves the correct Eastern day around midnight.
-      var iso = c.startTimeEpoch ? new Date(Number(c.startTimeEpoch) * 1000).toISOString() : '';
-      if (!iso && c.startDate) {
-        var md = String(c.startDate).match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-        if (md) iso = md[3] + '-' + md[1] + '-' + md[2] + 'T' + (c.startTime || '00:00') + ':00Z';
-      }
-      return { id: String(c.contestId || ''), date: iso, name: (away.nameShort || '?') + ' at ' + (home.nameShort || '?'),
-        competitions: [{ status: { type: { state: state, completed: state === 'post', description: c.finalMessage || '', shortDetail: c.finalMessage || '' }, period: Number(c.currentPeriod) || 0, displayClock: c.contestClock || '0:00' },
-          competitors: [{ homeAway: 'away', score: away.score, winner: !!away.isWinner, team: { abbreviation: away.name6Char || away.nameShort || '?', displayName: away.nameShort || '?', shortDisplayName: away.nameShort || '?' } },
-            { homeAway: 'home', score: home.score, winner: !!home.isWinner, team: { abbreviation: home.name6Char || home.nameShort || '?', displayName: home.nameShort || '?', shortDisplayName: home.nameShort || '?' } }] }] };
+    if (!Array.isArray(contests) && data && Array.isArray(data.contests)) contests = data.contests;
+    if (Array.isArray(contests)) {
+      return contests.map(function (c) { return makeNCAAEvent(c, null); }).filter(Boolean);
+    }
+    var games = data && data.games;
+    if (!Array.isArray(games)) return [];
+    return games.map(function (entry) {
+      var game = entry && entry.game ? entry.game : entry;
+      return makeNCAAEvent(game, game);
     }).filter(Boolean);
   }
 
   function eventsOf(data) {
-    return (data && data.events) || ncaaEventsOf(data);
+    if (data && Array.isArray(data.events)) return data.events;
+    return ncaaEventsOf(data);
+  }
+
+  function scoreboardItemsOf(data) {
+    if (data && Array.isArray(data.events)) return data.events;
+    if (data && data.data && Array.isArray(data.data.contests)) return data.data.contests;
+    if (data && Array.isArray(data.contests)) return data.contests;
+    if (data && Array.isArray(data.games)) return data.games.map(function (entry) { return entry && entry.game ? entry.game : entry; });
+    return null;
+  }
+
+  function scoreboardEventIsUsable(event) {
+    if (!event || event.id === undefined || event.id === null || event.id === '') return false;
+    var competitors = event.competitions && event.competitions[0] && event.competitions[0].competitors;
+    if (!Array.isArray(competitors) || competitors.length < 2) return false;
+    return competitors.some(function (c) { return c && c.homeAway === 'away'; }) &&
+      competitors.some(function (c) { return c && c.homeAway === 'home'; });
+  }
+
+  function validEventsOf(data) {
+    return eventsOf(data).filter(scoreboardEventIsUsable);
+  }
+
+  function scoreboardPayloadIsUsable(data) {
+    var items = scoreboardItemsOf(data);
+    if (!items) return false;
+    return items.length === 0 || validEventsOf(data).length > 0;
+  }
+
+  function eventMatchesGroups(event, groupIds) {
+    if (!groupIds || !groupIds.length) return true;
+    var wanted = groupIds.map(String);
+    var ids = [];
+    var comp = event && event.competitions && event.competitions[0];
+    if (comp && comp.groups && comp.groups.id !== undefined) ids.push(String(comp.groups.id));
+    ((comp && comp.competitors) || []).forEach(function (c) {
+      if (c && c.team && c.team.conferenceId !== undefined && c.team.conferenceId !== null) ids.push(String(c.team.conferenceId));
+      var nc = c && c.team && ncaaConferenceId(c.team);
+      if (nc) ids.push(String(nc));
+    });
+    return ids.some(function (id) { return wanted.indexOf(id) !== -1; });
+  }
+
+  function filterEventsForGroups(events, groupIds) {
+    return (events || []).filter(function (event) {
+      return scoreboardEventIsUsable(event) && eventMatchesGroups(event, groupIds);
+    });
   }
 
   // Group ranged-response events by the Eastern date they were played on —
@@ -363,10 +595,12 @@
     var addr = venue.address || {};
 
     return {
-      id: ev.id,
+      id: String(ev.id),
       date: ev.date || '',
       week: ev.week && ev.week.number !== undefined ? ev.week.number : null,
       name: ev.name || '',
+      source: ev.source || 'espn',
+      provider: ev.provider || API_BASE,
       neutralSite: !!comp.neutralSite,
       venueName: venue.fullName || '',
       venueCity: [addr.city, addr.state].filter(Boolean).join(', '),
@@ -403,12 +637,14 @@
         if (!existing) {
           map.set(e.id, e);
         } else {
-          e.conferences.forEach(function (c) {
-            if (!existing.conferences.some(function (x) { return x.id === c.id; })) existing.conferences.push(c);
+          var allConferences = existing.conferences.concat(e.conferences).filter(function (conf, i, all) {
+            return !all.slice(0, i).some(function (prior) { return prior.id === conf.id; });
           });
-          e.conferenceIds.forEach(function (id) {
-            if (existing.conferenceIds.indexOf(id) === -1) existing.conferenceIds.push(id);
+          var allConferenceIds = existing.conferenceIds.concat(e.conferenceIds).filter(function (id, i, all) {
+            return all.indexOf(id) === i;
           });
+          e.conferences = allConferences;
+          e.conferenceIds = allConferenceIds;
           if (JSON.stringify(e).length > JSON.stringify(existing).length) map.set(e.id, e);
         }
       });
@@ -597,6 +833,248 @@
     };
   }
 
+  /* ---------------- NCAA detail parsing ---------------- */
+
+  function ncaaContestOf(data) {
+    if (data && Array.isArray(data.contests) && data.contests[0]) return data.contests[0];
+    if (data && data.data && Array.isArray(data.data.contests) && data.data.contests[0]) return data.data.contests[0];
+    return null;
+  }
+
+  function ncaaDetailTeam(team, contest) {
+    var id = team && (team.teamId || team.id);
+    var isHome = !!(team && team.isHome);
+    return {
+      id: id === undefined || id === null ? null : String(id),
+      homeAway: isHome ? 'home' : 'away',
+      abbreviation: ncaaTeamAbbreviation(team),
+      displayName: ncaaTeamName(team),
+      logo: (team && team.logo) || null,
+      color: (team && team.color) || null,
+      order: isHome ? 2 : 1,
+      stats: []
+    };
+  }
+
+  function parseNCAAOverview(data) {
+    var c = ncaaContestOf(data);
+    if (!c || !Array.isArray(c.teams)) return null;
+    var teams = c.teams.map(function (team) { return ncaaDetailTeam(team, c); });
+    teams.sort(function (a, b) { return (a.homeAway === 'away' ? 0 : 1) - (b.homeAway === 'away' ? 0 : 1); });
+    // The general NCAA game response carries final/live scores and linescores
+    // on the contest, so use the same normalized event model for those fields.
+    var event = makeNCAAEvent(c, null);
+    if (event) {
+      var evTeams = event.competitions[0].competitors;
+      teams.forEach(function (team) {
+        var source = evTeams.find(function (x) { return x.homeAway === team.homeAway; });
+        if (source) {
+          team.score = source.score;
+          team.linescores = source.linescores;
+          team.winner = source.winner;
+          team.records = source.records.reduce(function (out, rec) { out[rec.type] = rec.summary; return out; }, {});
+          team.rank = source.curatedRank ? source.curatedRank.current : null;
+          if (!team.logo && source.team.logo) team.logo = source.team.logo;
+          if (!team.color && source.team.color) team.color = source.team.color;
+        }
+      });
+    }
+    return {
+      teams: teams,
+      players: [],
+      drives: [],
+      plays: [],
+      article: null,
+      rawKeys: Object.keys(data || {}).sort(),
+      headerDate: ncaaIsoDate(c) || null,
+      clock: c.clock || c.contestClock || null
+    };
+  }
+
+  function ncaaLabel(key) {
+    var special = {
+      firstDowns: 'First Downs',
+      thirdDowns: 'Third Downs',
+      fourthDowns: 'Fourth Downs',
+      teamYards: 'Total Yards',
+      teamPlays: 'Total Plays',
+      penaltyYards: 'Penalty Yards',
+      passingYards: 'Passing Yards',
+      rushingYards: 'Rushing Yards',
+      defenseInterceptions: 'Interceptions',
+      passingInterceptions: 'Interceptions',
+      fumblesLost: 'Fumbles Lost'
+    };
+    if (special[key]) return special[key];
+    return String(key || '').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, function (c) { return c.toUpperCase(); });
+  }
+
+  function ncaaLeafStats(value, out) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    Object.keys(value).forEach(function (key) {
+      if (key === '__typename') return;
+      var v = value[key];
+      if (v === undefined || v === null || v === '') return;
+      if (typeof v === 'object' && !Array.isArray(v)) ncaaLeafStats(v, out);
+      else if (typeof v !== 'function') out[key] = String(v);
+    });
+  }
+
+  function ncaaTeamBoxscoreEntries(data) {
+    return data && Array.isArray(data.teamBoxscore) ? data.teamBoxscore : [];
+  }
+
+  function attachNCAATeamStats(detail, data) {
+    ncaaTeamBoxscoreEntries(data).forEach(function (entry) {
+      var teamId = entry && entry.teamId !== undefined && entry.teamId !== null ? String(entry.teamId) : null;
+      var team = detail.teams.find(function (t) { return t.id === teamId; });
+      if (!team || !entry.teamStats) return;
+      var flat = {};
+      ncaaLeafStats(entry.teamStats, flat);
+      team.stats = Object.keys(flat).map(function (name) {
+        return { name: name, label: ncaaLabel(name), displayValue: flat[name], value: flat[name] };
+      });
+    });
+  }
+
+  function ncaaPlayerCategoryName(player) {
+    if (player.category) return String(player.category).toLowerCase();
+    var type = String(player.__typename || '').replace(/^PlayerStatsFootball/, '');
+    return (type || 'other').replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+  }
+
+  function ncaaPlayerStatKeys(player) {
+    return Object.keys(player || {}).filter(function (key) {
+      return ['__typename', 'firstName', 'lastName', 'number', 'position', 'category'].indexOf(key) === -1 &&
+        player[key] !== undefined && player[key] !== null && player[key] !== '' && typeof player[key] !== 'object';
+    });
+  }
+
+  function attachNCAAPlayers(detail, data) {
+    var byTeam = {};
+    ncaaTeamBoxscoreEntries(data).forEach(function (entry) {
+      var teamId = entry && entry.teamId !== undefined && entry.teamId !== null ? String(entry.teamId) : null;
+      if (!teamId || !Array.isArray(entry.playerStats)) return;
+      if (!byTeam[teamId]) byTeam[teamId] = {};
+      entry.playerStats.forEach(function (player) {
+        var category = ncaaPlayerCategoryName(player);
+        if (!byTeam[teamId][category]) {
+          var labels = ncaaPlayerStatKeys(player).map(ncaaLabel);
+          byTeam[teamId][category] = { name: category, title: ncaaLabel(category), labels: labels, descriptions: labels.slice(), athletes: [], totals: null };
+        }
+        var cat = byTeam[teamId][category];
+        var keys = ncaaPlayerStatKeys(player);
+        // A category can gain a field in a later row. Keep the table rectangular
+        // by extending labels and each existing row with a placeholder.
+        keys.forEach(function (key) {
+          if (cat.labels.indexOf(ncaaLabel(key)) === -1) {
+            cat.labels.push(ncaaLabel(key));
+            cat.descriptions.push(ncaaLabel(key));
+            cat.athletes.forEach(function (athlete) { athlete.stats.push('--'); });
+          }
+        });
+        var values = cat.labels.map(function (label) {
+          var key = keys.find(function (k) { return ncaaLabel(k) === label; });
+          var value = key ? player[key] : null;
+          return value === undefined || value === null || value === '' ? '--' : String(value);
+        });
+        cat.athletes.push({
+          name: [player.firstName, player.lastName].filter(Boolean).join(' ') || 'Unknown',
+          jersey: player.number === undefined || player.number === null ? '' : String(player.number),
+          stats: values
+        });
+      });
+    });
+    detail.teams.forEach(function (team) {
+      var cats = byTeam[team.id] || {};
+      var categories = Object.keys(cats).map(function (key) { return cats[key]; });
+      if (categories.length) detail.players.push({ teamId: team.id, categories: categories });
+    });
+  }
+
+  function ncaaPlayType(text) {
+    var s = String(text || '');
+    if (/touchdown/i.test(s)) return 'Touchdown';
+    if (/field goal/i.test(s)) return 'Field Goal';
+    if (/extra point|two.point conversion/i.test(s)) return 'Extra Point';
+    if (/kickoff/i.test(s)) return 'Kickoff';
+    if (/punt/i.test(s)) return /return/i.test(s) ? 'Punt Return' : 'Punt';
+    if (/penalty/i.test(s)) return 'Penalty';
+    if (/interception/i.test(s)) return 'Interception';
+    if (/fumble/i.test(s)) return 'Fumble';
+    if (/pass/i.test(s)) return 'Pass';
+    if (/rush/i.test(s)) return 'Rush';
+    if (/timeout/i.test(s)) return 'Timeout';
+    return 'Play';
+  }
+
+  function parseNCAAPlays(data) {
+    var periods = data && Array.isArray(data.periods) ? data.periods : [];
+    var plays = [];
+    var previous = { away: null, home: null };
+    periods.forEach(function (period) {
+      var periodNumber = ncaaPeriod(period.periodNumber || period.period);
+      (period.playbyplayStats || []).forEach(function (group) {
+        (group.plays || []).forEach(function (raw) {
+          var away = raw.visitorScore === undefined || raw.visitorScore === null ? null : Number(raw.visitorScore);
+          var home = raw.homeScore === undefined || raw.homeScore === null ? null : Number(raw.homeScore);
+          var text = raw.playText || raw.text || '';
+          var playTeamId = raw.teamId !== undefined && raw.teamId !== null ? raw.teamId : group.teamId;
+          var changed = away !== null && home !== null && (away !== previous.away || home !== previous.home);
+          var touchdown = /touchdown/i.test(text);
+          var fieldGoal = /field goal.*(good|made)|kick.*good/i.test(text);
+          var safety = /safety/i.test(text);
+          var scoringPlay = changed && (touchdown || fieldGoal || safety || /extra point|conversion|score/i.test(text));
+          if (touchdown || fieldGoal || safety || /extra point|conversion/i.test(text)) scoringPlay = true;
+          var scoringType = touchdown ? 'TD' : fieldGoal ? 'FG' : safety ? 'SF' : /extra point|conversion/i.test(text) ? 'PAT' : null;
+          plays.push({
+            id: 'ncaa-' + (data.contestId || 'game') + '-' + plays.length,
+            seq: plays.length + 1,
+            type: ncaaPlayType(text),
+            typeAbbr: '',
+            text: text,
+            period: periodNumber,
+            clock: raw.clock || '',
+            awayScore: away,
+            homeScore: home,
+            scoringPlay: scoringPlay,
+            isPenalty: /penalty/i.test(text),
+            isTurnover: /turnover|interception|fumble.*lost/i.test(text),
+            priority: scoringPlay,
+            yardage: (text.match(/for (\d+) yards/i) || [])[1] ? Number((text.match(/for (\d+) yards/i) || [])[1]) : 0,
+            offTeamId: playTeamId === undefined || playTeamId === null ? null : String(playTeamId),
+            defTeamId: null,
+            possessionTeamId: playTeamId === undefined || playTeamId === null ? null : String(playTeamId),
+            downDistance: raw.driveText || '',
+            possession: '',
+            scoringType: scoringType,
+            pointAfter: null,
+            driveId: null,
+            time: 0
+          });
+          if (away !== null) previous.away = away;
+          if (home !== null) previous.home = home;
+        });
+      });
+    });
+    return plays;
+  }
+
+  function parseNCAADetail(gameData, boxscoreData, pbpData, teamStatsData) {
+    var detail = parseNCAAOverview(gameData);
+    if (!detail) return null;
+    attachNCAATeamStats(detail, teamStatsData);
+    if (!detail.teams.some(function (team) { return team.stats.length; })) attachNCAATeamStats(detail, boxscoreData);
+    attachNCAAPlayers(detail, boxscoreData);
+    detail.plays = parseNCAAPlays(pbpData);
+    var keys = [];
+    [gameData, boxscoreData, pbpData, teamStatsData].forEach(function (payload) {
+      Object.keys(payload || {}).forEach(function (key) { if (keys.indexOf(key) === -1) keys.push(key); });
+    });
+    detail.rawKeys = keys.sort();
+    return detail;
+  }
+
   function lastPlayScore(detail) {
     if (!detail || !detail.plays.length) return { away: null, home: null };
     var p = detail.plays[detail.plays.length - 1];
@@ -667,17 +1145,22 @@
    * ================================================================ */
   if (typeof document === 'undefined') {
     return {
-      API_BASE: API_BASE, CONFERENCES: CONFERENCES, CORS_PROXIES: CORS_PROXIES,
+      API_BASE: API_BASE, ESPN_WEB_BASE: ESPN_WEB_BASE, NCAA_GRAPHQL_BASE: NCAA_GRAPHQL_BASE,
+      NCAA_COMMUNITY_BASE: NCAA_COMMUNITY_BASE, CONFERENCES: CONFERENCES, CORS_PROXIES: CORS_PROXIES,
       scoreboardUrl: scoreboardUrl, scoreboardRangeUrl: scoreboardRangeUrl,
-      ncaaScoreboardUrl: ncaaScoreboardUrl, summaryUrl: summaryUrl, proxiedUrl: proxiedUrl, proxyUrls: proxyUrls,
+      ncaaScoreboardUrl: ncaaScoreboardUrl, ncaaGameUrl: ncaaGameUrl,
+      ncaaBoxscoreUrl: ncaaBoxscoreUrl, ncaaPlayByPlayUrl: ncaaPlayByPlayUrl, ncaaTeamStatsUrl: ncaaTeamStatsUrl,
+      summaryUrl: summaryUrl, proxiedUrl: proxiedUrl, proxyUrls: proxyUrls, providerUrls: providerUrls,
       espnFetch: espnFetch, easternDateStr: easternDateStr, localDateStr: localDateStr, shiftDate: shiftDate,
       etDateFromWallclock: etDateFromWallclock, fmtDayLabel: fmtDayLabel,
-      eventsOf: eventsOf, groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
-      parseEvent: parseEvent,
+      eventsOf: eventsOf, validEventsOf: validEventsOf, scoreboardPayloadIsUsable: scoreboardPayloadIsUsable,
+      scoreboardEventIsUsable: scoreboardEventIsUsable, eventMatchesGroups: eventMatchesGroups,
+      filterEventsForGroups: filterEventsForGroups, groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
+      parseEvent: parseEvent, parseNCAAOverview: parseNCAAOverview, parseNCAADetail: parseNCAADetail,
       parseCompetitor: parseCompetitor, mergeEvents: mergeEvents, groupGames: groupGames,
       shouldOpenNextGameDay: shouldOpenNextGameDay, periodLabel: periodLabel, normalizePlay: normalizePlay, extractPlays: extractPlays,
       parseDrives: parseDrives, parseSummary: parseSummary, lastPlayScore: lastPlayScore,
-      teamStatRows: teamStatRows, statusVM: statusVM, lineColumns: lineColumns, fmtKickoff: fmtKickoff
+      teamStatRows: teamStatRows, statusVM: statusVM, lineColumns: lineColumns, fmtKickoff: fmtKickoff, weekForDate: weekForDate
     };
   }
 
@@ -692,6 +1175,8 @@
     lastUpdated: null,
     viaProxy: false,
     proxy: null,        // which CORS proxy is in use, when viaProxy is true
+    provider: null,     // concrete provider URL that supplied the current data
+    source: null,       // 'espn' or 'ncaa'
     weekLabel: '',
     seasonYear: null,
     league: null,       // leagues[0] of the loaded day (calendar for nearby windows)
@@ -701,6 +1186,7 @@
     // Set only for a clean first visit. Once a game day is found, normal date
     // navigation remains entirely under the visitor's control.
     defaultToNextGameDay: !location.hash,
+    autoAdvanceToNextGameDay: false,
     view: 'scoreboard',
     gameId: null,
     game: null,          // parsed scoreboard event for the open game
@@ -751,41 +1237,74 @@
     return CONFERENCES.filter(function (c) { return state.confs[c.id]; }).map(function (c) { return c.id; });
   }
 
-  // Fetch one day. Prefers a single combined request (groups=1,8,5,4,151 —
-  // union verified live 2026-08-25) and falls back to the old per-conference
-  // parallel requests if the combined call fails for any reason.
+  // Fetch one day. ESPN's comma-separated groups parameter currently returns
+  // syntactically valid placeholder `{}` events, so the normal path is one
+  // request per enabled conference. A no-group full-FBS request is the next
+  // fallback and is filtered locally by the same conference IDs.
   async function fetchDay(dateStr, groupIds) {
-    function unwrap(r) { return { lists: [r.data], viaProxy: r.viaProxy, proxy: r.proxy, errors: [] }; }
-    if (groupIds.length) {
-      try {
-        return unwrap(await espnFetch(scoreboardUrl(dateStr, groupIds.join(','))));
-      } catch (e) {
-        // Free NCAA.com-backed fallback. It is scoreboard-only; ESPN remains
-        // the source for game summaries and play-by-play.
-        try {
-          return unwrap(await espnFetch(ncaaScoreboardUrl(dateStr)));
-        } catch (ncaaError) {}
-        var errors = [String((e && e.message) || e)];
-        var lists = [];
-        var viaProxy = false;
-        var proxy = null;
-        var rs = await Promise.all(groupIds.map(function (gid) {
-          return espnFetch(scoreboardUrl(dateStr, gid)).then(
-            function (r) { return { ok: true, r: r }; },
-            function (err) { return { ok: false, err: String((err && err.message) || err) }; }
-          );
-        }));
-        rs.forEach(function (x) {
-          if (x.ok) {
-            lists.push(x.r.data);
-            if (x.r.viaProxy) { viaProxy = true; if (!proxy) proxy = x.r.proxy; }
-          } else errors.push(x.err);
-        });
-        return { lists: lists, viaProxy: viaProxy, proxy: proxy, errors: errors };
+    if (!groupIds.length) return { lists: [], unfiltered: false, viaProxy: false, proxy: null, provider: null, source: null, errors: [] };
+
+    var errors = [];
+    var lists = [];
+    var viaProxy = false;
+    var proxy = null;
+    var provider = null;
+    var invalidCount = 0;
+
+    var responses = await Promise.all(groupIds.map(function (gid) {
+      return espnFetch(scoreboardUrl(dateStr, gid)).then(
+        function (r) { return { ok: true, r: r, valid: scoreboardPayloadIsUsable(r.data) }; },
+        function (err) { return { ok: false, err: String((err && err.message) || err) }; }
+      );
+    }));
+    responses.forEach(function (result) {
+      if (!result.ok) {
+        errors.push(result.err);
+        return;
       }
+      if (!result.valid) {
+        invalidCount++;
+        errors.push('ESPN returned an unusable event payload for one conference');
+        return;
+      }
+      lists.push(result.r.data);
+      if (result.r.viaProxy) { viaProxy = true; if (!proxy) proxy = result.r.proxy; }
+      if (!provider) provider = result.r.provider;
+    });
+
+    // If every per-group response was a valid empty response, that is a real
+    // empty slate. If any response failed or contained placeholders, use the
+    // verified no-group endpoint to recover games from that conference.
+    if (invalidCount === 0 && lists.length === groupIds.length) {
+      return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'espn', errors: [] };
     }
-    // No conference selected: no request (matches the previous behavior).
-    return { lists: [], viaProxy: false, proxy: null, errors: [] };
+
+    try {
+      var all = await espnFetch(scoreboardUrl(dateStr));
+      if (scoreboardPayloadIsUsable(all.data)) {
+        return { lists: [all.data], unfiltered: true, viaProxy: all.viaProxy, proxy: all.proxy, provider: all.provider, source: 'espn', errors: [] };
+      }
+      errors.push('ESPN no-group response contained no usable events');
+    } catch (e) {
+      errors.push(String((e && e.message) || e));
+    }
+
+    // The current NCAA persisted query is independently verified and returns
+    // complete `data.contests[]` objects. It is a real scoreboard fallback,
+    // not the old malformed GraphQL request.
+    try {
+      var ncaa = await espnFetch(ncaaScoreboardUrl(dateStr));
+      if (scoreboardPayloadIsUsable(ncaa.data)) {
+        return { lists: [ncaa.data], unfiltered: false, viaProxy: ncaa.viaProxy, proxy: ncaa.proxy, provider: ncaa.provider, source: 'ncaa', errors: [] };
+      }
+      errors.push('NCAA returned no usable contests');
+    } catch (ncaaError) {
+      errors.push(String((ncaaError && ncaaError.message) || ncaaError));
+    }
+
+    // Keep any real per-group responses when the recovery paths also fail;
+    // partial scores are better than replacing them with a blank screen.
+    return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: lists.length ? 'espn' : null, errors: errors };
   }
 
   async function loadScoreboard(showSpinner) {
@@ -798,14 +1317,22 @@
       var out = await fetchDay(state.date, enabledGroupIds());
 
       var events = [];
+      var wantedGroups = enabledGroupIds();
+      state.league = null;
+      state.weekLabel = '';
+      state.seasonYear = out.source === 'ncaa'
+        ? (Number(state.date.slice(4, 6)) < 8 ? Number(state.date.slice(0, 4)) - 1 : Number(state.date.slice(0, 4)))
+        : null;
       out.lists.forEach(function (data) {
-        // Events are top-level on the scoreboard payload (verified live);
-        // leagues[0] is used only for season/week/calendar info.
-        events.push(eventsOf(data));
+        // ESPN events are top-level. NCAA fallback contests are normalized by
+        // eventsOf; both paths are validated before they reach the parser.
+        var rawEvents = validEventsOf(data);
+        rawEvents = filterEventsForGroups(rawEvents, wantedGroups);
+        events.push(rawEvents);
         var league = (data && data.leagues && data.leagues[0]) || null;
-        if (league && league.calendar && league.calendar.length && league.season) {
+        if (league && league.season) {
           state.seasonYear = league.season.year;
-          state.weekLabel = weekForDate(league.calendar, state.date);
+          state.weekLabel = weekForDate(league.calendar || [], state.date);
           state.league = league;
         }
       });
@@ -813,6 +1340,8 @@
       state.games = mergeEvents(events);
       state.viaProxy = out.viaProxy;
       state.proxy = out.proxy;
+      state.provider = out.provider;
+      state.source = out.source;
       state.error = out.errors.length ? out.errors.join('; ') : null;
       state.lastUpdated = new Date();
       state.loadedDate = state.date;
@@ -822,9 +1351,11 @@
     }
     state.loading = false;
     // A clean visit is useful even if today contains only final scores: open
-    // the next day that has a scheduled game instead. On any later navigation
-    // we preserve the selected day's normal scoreboard/nearby-results view.
-    var discoverNext = state.defaultToNextGameDay && shouldOpenNextGameDay(state.games);
+    // the next day that has a scheduled game instead. A day with a live or
+    // scheduled game is already the correct default and must not jump forward.
+    // On any later navigation we preserve the selected day's normal view.
+    state.autoAdvanceToNextGameDay = state.defaultToNextGameDay && shouldOpenNextGameDay(state.games);
+    state.defaultToNextGameDay = false;
     if (state.nearbyFor !== state.date && enabledGroupIds().length) {
       // Always look for the surrounding games, not only on empty days. This
       // keeps upcoming and recent results visible below a non-empty slate too.
@@ -882,22 +1413,66 @@
   async function findNearby() {
     var run = ++nearbyRun;
     var probeDate = state.date;
-    var g = enabledGroupIds().join(',');
+    var groupIds = enabledGroupIds();
     state.nearby = { loading: true, next: null, prev: null, error: null };
     render();
 
-    function probeDays(from, to) {
-      return espnFetch(scoreboardRangeUrl(from, to, g))
-        .then(function (r) { return groupByDay(eventsOf(r.data)); })
-        .catch(function () { return null; }); // null = request failed, [] = no games
-    }
-    function pickFirst(days) { return (days && days.length) ? days[0] : null; }
-    function pickLast(days) { return (days && days.length) ? days[days.length - 1] : null; }
+    // Range discovery intentionally starts without `groups=`. That endpoint
+    // was independently observed to return complete events, while the
+    // comma-separated groups form returns `{}` placeholders. Filter the
+    // complete response locally, then retry each group separately only if the
+    // no-group range fails.
+    async function probeDays(from, to) {
+      try {
+        var all = await espnFetch(scoreboardRangeUrl(from, to));
+        if (scoreboardPayloadIsUsable(all.data)) {
+          return {
+            days: groupByDay(filterEventsForGroups(validEventsOf(all.data), groupIds)),
+            failed: false,
+            viaProxy: all.viaProxy,
+            proxy: all.proxy,
+            provider: all.provider
+          };
+        }
+      } catch (e) {}
 
-    var fwd = await probeDays(shiftDate(probeDate, 1), shiftDate(probeDate, 14));
-    var back = await probeDays(shiftDate(probeDate, -14), shiftDate(probeDate, -1));
-    var next = pickFirst(fwd);
-    var prev = pickLast(back);
+      var responses = await Promise.all(groupIds.map(function (gid) {
+        return espnFetch(scoreboardRangeUrl(from, to, gid)).then(
+          function (r) { return { ok: scoreboardPayloadIsUsable(r.data), r: r }; },
+          function () { return { ok: false }; }
+        );
+      }));
+      var events = [];
+      var anyValid = false;
+      var viaProxy = false;
+      var proxy = null;
+      var provider = null;
+      responses.forEach(function (result) {
+        if (!result.ok) return;
+        anyValid = true;
+        events = events.concat(validEventsOf(result.r.data));
+        if (result.r.viaProxy) { viaProxy = true; if (!proxy) proxy = result.r.proxy; }
+        if (!provider) provider = result.r.provider;
+      });
+      return {
+        days: anyValid ? groupByDay(filterEventsForGroups(events, groupIds)) : [],
+        failed: !anyValid,
+        viaProxy: viaProxy,
+        proxy: proxy,
+        provider: provider
+      };
+    }
+    function pickFirst(result) { return result && result.days.length ? result.days[0] : null; }
+    function pickLast(result) { return result && result.days.length ? result.days[result.days.length - 1] : null; }
+
+    var results = await Promise.all([
+      probeDays(shiftDate(probeDate, 1), shiftDate(probeDate, 14)),
+      probeDays(shiftDate(probeDate, -14), shiftDate(probeDate, -1))
+    ]);
+    var fwdResult = results[0];
+    var backResult = results[1];
+    var next = pickFirst(fwdResult);
+    var prev = pickLast(backResult);
 
     if ((!next || !prev) && state.league) {
       var w = calendarProbeWindows(state.league, probeDate);
@@ -908,26 +1483,24 @@
     }
 
     // The user may have navigated away or changed the search while probing —
-    // drop stale results. Nearby data is useful on both empty and non-empty
-    // scoreboard days, so the presence of games is not a reason to discard it.
+    // drop stale results.
     if (run !== nearbyRun || state.view !== 'scoreboard' || state.loadedDate !== probeDate) return;
 
     state.nearby = {
       loading: false,
       next: next ? nearbyDay(next) : null,
       prev: prev ? nearbyDay(prev) : null,
-      error: (fwd === null || back === null) ? 'One or more nearby-games searches failed (network).' : null
+      error: (fwdResult.failed || backResult.failed) ? 'One or more nearby-games searches failed (network).' : null
     };
     state.nearbyIndex = {};
     [state.nearby.next, state.nearby.prev].forEach(function (day) {
       if (day) day.games.forEach(function (ev) { state.nearbyIndex[ev.id] = ev; });
     });
 
-    // Only the initial, hash-free visit auto-navigates. If discovery fails or
-    // ESPN has no forward event in the probed/calendar window, keep the date
-    // the visitor opened and show the normal nearby-results state instead.
-    if (state.defaultToNextGameDay) {
-      state.defaultToNextGameDay = false;
+    // Only a clean visit that started on an empty/completed-only slate
+    // auto-navigates. A live or scheduled game on the current day stays open.
+    if (state.autoAdvanceToNextGameDay) {
+      state.autoAdvanceToNextGameDay = false;
       if (state.nearby.next) {
         goScoreboard(state.nearby.next.date);
         return;
@@ -945,8 +1518,9 @@
       html += '<button class="chip' + (state.confs[c.id] ? ' on' : '') + '" data-conf="' + c.id + '">' + esc(c.short) + '</button>';
     });
     if (state.games.length) {
+      var sourceLabel = state.source === 'ncaa' ? 'NCAA fallback' : (state.viaProxy ? 'via ' + (state.proxy === 'server' ? 'server relay' : (state.proxy || 'CORS proxy')) : 'ESPN');
       html += '<span class="chip-count">' + state.games.length + ' game' + (state.games.length === 1 ? '' : 's') +
-        (state.viaProxy ? ' • via ' + (state.proxy || 'CORS proxy') : '') +
+        ' • ' + sourceLabel +
         (state.lastUpdated ? ' • updated ' + state.lastUpdated.toLocaleTimeString() : '') + '</span>';
     }
     subbar.innerHTML = html;
@@ -1082,12 +1656,65 @@
   }
 
   /* ---------------- Game detail view ---------------- */
+  function detailFromParsedGame(g) {
+    if (!g) return null;
+    function team(t, homeAway) {
+      return {
+        id: t.id,
+        homeAway: homeAway,
+        abbreviation: t.abbreviation,
+        displayName: t.displayName,
+        logo: t.logo,
+        color: t.color,
+        order: homeAway === 'away' ? 1 : 2,
+        rank: t.rank,
+        score: t.score,
+        linescores: t.linescores || [],
+        winner: t.winner,
+        records: t.records || {},
+        stats: []
+      };
+    }
+    return {
+      teams: [team(g.away, 'away'), team(g.home, 'home')],
+      players: [], drives: [], plays: [], article: null,
+      rawKeys: [], headerDate: g.date || null, clock: null
+    };
+  }
+
+  async function loadNCAAData(gameId) {
+    var overview = await espnFetch(ncaaGameUrl(gameId), 12000);
+    var contest = ncaaContestOf(overview.data);
+    if (!contest) throw new Error('NCAA game response contained no contest');
+
+    // Avoid the known 502 secondary routes for scheduled games. Completed/live
+    // contests advertise which optional routes exist; each is still isolated so
+    // one unavailable route cannot erase the overview scoreboard.
+    var requests = [];
+    if (contest.hasBoxscore) requests.push({ key: 'boxscore', url: ncaaBoxscoreUrl(gameId) });
+    if (contest.hasPbp) requests.push({ key: 'pbp', url: ncaaPlayByPlayUrl(gameId) });
+    if (contest.hasTeamStats) requests.push({ key: 'teamStats', url: ncaaTeamStatsUrl(gameId) });
+    var extras = await Promise.all(requests.map(function (request) {
+      return espnFetch(request.url, 12000).then(function (r) {
+        return { key: request.key, result: r };
+      }).catch(function () {
+        return { key: request.key, result: null };
+      });
+    }));
+    var payloads = { boxscore: null, pbp: null, teamStats: null };
+    extras.forEach(function (x) { if (x.result) payloads[x.key] = x.result.data; });
+    var detail = parseNCAADetail(overview.data, payloads.boxscore, payloads.pbp, payloads.teamStats);
+    if (!detail) throw new Error('NCAA game response could not be parsed');
+    return { overview: overview, detail: detail, payloads: payloads };
+  }
+
   async function loadGame(gameId, fromEvent) {
     stopPolling();
     state.view = 'game';
     state.gameId = String(gameId);
     state.game = fromEvent || null;
     state.detail = null;
+    state.error = null;
     state.seenPlayIds = {};
     freshIds = {};
     state.tab = 'pbp';
@@ -1095,17 +1722,53 @@
     state.playerTeam = 0;
     render();
     try {
-      var r = await espnFetch(summaryUrl(state.gameId));
-      state.detail = parseSummary(r.data);
-      state.viaProxy = r.viaProxy;
-      if (r.viaProxy) state.proxy = r.proxy;
-      state.detail.plays.forEach(function (p) { state.seenPlayIds[p.id] = true; });
-      if (!state.game) {
-        await resolveGameEvent();
+      if (state.game && state.game.source === 'ncaa') {
+        var ncaa = await loadNCAAData(state.gameId);
+        state.detail = ncaa.detail;
+        state.viaProxy = ncaa.overview.viaProxy;
+        state.proxy = ncaa.overview.proxy;
+        state.provider = ncaa.overview.provider;
+        state.source = 'ncaa';
+        if (!state.game) {
+          var ncaaEvent = eventsOf(ncaa.overview.data)[0];
+          if (ncaaEvent) state.game = parseEvent(ncaaEvent);
+        }
       } else {
-        syncScoresFromPlays();
+        try {
+          var r = await espnFetch(summaryUrl(state.gameId));
+          var parsedSummary = parseSummary(r.data);
+          if (!parsedSummary.teams.length) throw new Error('ESPN summary contained no teams');
+          state.detail = parsedSummary;
+          state.viaProxy = r.viaProxy;
+          state.proxy = r.proxy;
+          state.provider = r.provider;
+          state.source = 'espn';
+          if (!state.game) {
+            await resolveGameEvent();
+          } else {
+            syncScoresFromPlays();
+          }
+        } catch (espnError) {
+          // A deep link contains only an ID, so it may be an NCAA contest ID
+          // rather than an ESPN event ID. Try the verified NCAA overview before
+          // giving up; rows already carrying an ESPN event never take this path.
+          if (fromEvent) throw espnError;
+          var ncaaFallback = await loadNCAAData(state.gameId);
+          state.detail = ncaaFallback.detail;
+          state.game = parseEvent(eventsOf(ncaaFallback.overview.data)[0]);
+          state.viaProxy = ncaaFallback.overview.viaProxy;
+          state.proxy = ncaaFallback.overview.proxy;
+          state.provider = ncaaFallback.overview.provider;
+          state.source = 'ncaa';
+        }
       }
+      if (state.detail) state.detail.plays.forEach(function (p) { state.seenPlayIds[p.id] = true; });
+      state.lastUpdated = new Date();
     } catch (e) {
+      // The NCAA overview is useful even when its optional detail routes are
+      // down; use the clicked row as a visible fallback instead of a blank
+      // page. ESPN keeps its existing summary error behavior.
+      if (state.game && state.game.source === 'ncaa' && !state.detail) state.detail = detailFromParsedGame(state.game);
       state.error = 'Could not load game data: ' + ((e && e.message) || e);
     }
     render();
@@ -1133,7 +1796,7 @@
       // every live response: {"leagues":[...],"events":[...]}), not inside
       // leagues[0]. This was previously read from the wrong place, so deep
       // links never resolved the scoreboard event.
-      var events = (r.data && r.data.events) || [];
+      var events = validEventsOf(r.data);
       var ev = events.find(function (e) { return String(e.id) === state.gameId; });
       if (ev) {
         state.game = parseEvent(ev);
@@ -1144,6 +1807,7 @@
         if (r.viaProxy || state.viaProxy) {
           state.viaProxy = r.viaProxy || state.viaProxy;
           if (r.proxy) state.proxy = r.proxy;
+          if (r.provider) state.provider = r.provider;
         }
       }
     } catch (e) {
@@ -1159,16 +1823,56 @@
     if (s.home !== null) state.game.home.score = s.home;
   }
 
+  function updateGameFromNCAA(data) {
+    var event = eventsOf(data)[0];
+    if (!event) return false;
+    var fresh = parseEvent(event);
+    state.game = fresh;
+    if (state.detail) {
+      state.detail.teams.forEach(function (team) {
+        var source = fresh[team.homeAway];
+        if (!source) return;
+        team.score = source.score;
+        team.linescores = source.linescores;
+        team.winner = source.winner;
+      });
+      var comp = event.competitions && event.competitions[0];
+      state.detail.clock = comp && comp.status ? comp.status.displayClock : state.detail.clock;
+    }
+    return true;
+  }
+
+  function pollNCAAData() {
+    espnFetch(ncaaGameUrl(state.gameId), 12000).then(function (r) {
+      var oldState = state.game && state.game.status.state;
+      if (!updateGameFromNCAA(r.data)) return;
+      state.viaProxy = r.viaProxy || state.viaProxy;
+      if (r.proxy) state.proxy = r.proxy;
+      state.provider = r.provider || state.provider;
+      state.lastUpdated = new Date();
+      if (state.game.status.state !== oldState) {
+        if (state.game.status.state === 'post') stopPolling();
+        else if (state.game.status.state === 'in') {
+          stopPolling();
+          startGamePolling();
+        }
+      }
+      render();
+    }).catch(function () { /* retain the last verified scoreboard state */ });
+  }
+
   function pollGameSummary() {
+    if (state.game && state.game.source === 'ncaa') {
+      pollNCAAData();
+      return;
+    }
     espnFetch(summaryUrl(state.gameId)).then(function (r) {
       var prevIds = state.seenPlayIds;
-      var prevCount = Object.keys(prevIds).length;
       var hadDetail = !!state.detail;
       state.detail = parseSummary(r.data);
-      if (r.viaProxy || state.viaProxy) {
-        state.viaProxy = r.viaProxy || state.viaProxy;
-        if (r.proxy) state.proxy = r.proxy;
-      }
+      state.viaProxy = r.viaProxy || state.viaProxy;
+      if (r.proxy) state.proxy = r.proxy;
+      state.provider = r.provider || state.provider;
       var newPlayIds = [];
       state.detail.plays.forEach(function (p) {
         if (!prevIds[p.id]) {
@@ -1193,6 +1897,10 @@
 
   function pollGameStatus() {
     if (!state.game) return;
+    if (state.game.source === 'ncaa') {
+      pollNCAAData();
+      return;
+    }
     var ids = state.game.conferenceIds.filter(function (id) {
       return CONFERENCES.some(function (c) { return c.id === id; });
     });
@@ -1202,7 +1910,7 @@
     Promise.all(urls).then(function (datas) {
       var events = [];
       datas.forEach(function (d) {
-        if (d) events = events.concat(eventsOf(d)); // top-level events (verified)
+        if (d) events = events.concat(validEventsOf(d));
       });
       var ev = events.find(function (e) { return String(e.id) === state.gameId; });
       if (!ev) return;
@@ -1251,8 +1959,12 @@
     else return '';
     var away = teams[0], home = teams[1];
 
-    var score = d ? lastPlayScore(d) : { away: g.away.score, home: g.home.score };
-    var aS = score.away, hS = score.home;
+    var score = d ? lastPlayScore(d) : { away: null, home: null };
+    // NCAA detail routes can be unavailable even though the general game
+    // response has an authoritative final/live score. Do not replace a known
+    // scoreboard value with null merely because no play has been returned.
+    var aS = score.away !== null && score.away !== undefined ? score.away : (g ? g.away.score : null);
+    var hS = score.home !== null && score.home !== undefined ? score.home : (g ? g.home.score : null);
     var st;
     if (g) st = statusVM(g);
     else if (d && d.plays.length) {
@@ -1496,7 +2208,7 @@
       [['pbp', 'Play-by-Play'], ['team', 'Team Stats'], ['player', 'Player Stats']].map(function (t) {
         return '<button class="tab' + (state.tab === t[0] ? ' on' : '') + '" data-tab="' + t[0] + '">' + t[1] + '</button>';
       }).join('') +
-      (state.viaProxy ? '<span class="updated">via CORS proxy</span>' : '') +
+      (state.source === 'ncaa' ? '<span class="updated">NCAA fallback</span>' : (state.viaProxy ? '<span class="updated">via ' + esc(state.proxy === 'server' ? 'server relay' : (state.proxy || 'CORS proxy')) + '</span>' : '')) +
       (state.lastUpdated ? '<span class="updated">updated ' + state.lastUpdated.toLocaleTimeString() + '</span>' : '') +
       '</nav>';
     var panel;
@@ -1549,6 +2261,8 @@
         error: state.nearby.error || null
       } : null,
       lastUpdated: state.lastUpdated ? state.lastUpdated.toLocaleTimeString() : null,
+      source: state.source,
+      provider: state.provider,
       viaProxy: state.viaProxy,
       proxy: state.proxy,
       error: state.error
@@ -1682,12 +2396,20 @@
     CONFERENCES: CONFERENCES,
     CORS_PROXIES: CORS_PROXIES,
     API_BASE: API_BASE,
+    ESPN_WEB_BASE: ESPN_WEB_BASE,
+    NCAA_GRAPHQL_BASE: NCAA_GRAPHQL_BASE,
+    NCAA_COMMUNITY_BASE: NCAA_COMMUNITY_BASE,
     scoreboardUrl: scoreboardUrl,
     scoreboardRangeUrl: scoreboardRangeUrl,
     ncaaScoreboardUrl: ncaaScoreboardUrl,
+    ncaaGameUrl: ncaaGameUrl,
+    ncaaBoxscoreUrl: ncaaBoxscoreUrl,
+    ncaaPlayByPlayUrl: ncaaPlayByPlayUrl,
+    ncaaTeamStatsUrl: ncaaTeamStatsUrl,
     summaryUrl: summaryUrl,
     proxiedUrl: proxiedUrl,
     proxyUrls: proxyUrls,
+    providerUrls: providerUrls,
     espnFetch: espnFetch,
     easternDateStr: easternDateStr,
     localDateStr: localDateStr,
@@ -1695,9 +2417,16 @@
     etDateFromWallclock: etDateFromWallclock,
     fmtDayLabel: fmtDayLabel,
     eventsOf: eventsOf,
+    validEventsOf: validEventsOf,
+    scoreboardPayloadIsUsable: scoreboardPayloadIsUsable,
+    scoreboardEventIsUsable: scoreboardEventIsUsable,
+    eventMatchesGroups: eventMatchesGroups,
+    filterEventsForGroups: filterEventsForGroups,
     groupByDay: groupByDay,
     calendarProbeWindows: calendarProbeWindows,
     parseEvent: parseEvent,
+    parseNCAAOverview: parseNCAAOverview,
+    parseNCAADetail: parseNCAADetail,
     parseCompetitor: parseCompetitor,
     mergeEvents: mergeEvents,
     groupGames: groupGames,
