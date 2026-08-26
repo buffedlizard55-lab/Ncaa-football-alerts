@@ -2551,6 +2551,7 @@
       conferences: Object.keys(state.confs).filter(function (id) { return state.confs[id]; }),
       games: state.games.length,
       live: state.games.filter(function (g) { return g.status.state === 'in'; }).length,
+      staticDeployment: isStaticDeployment(),
       nearby: state.nearby ? {
         loading: state.nearby.loading,
         next: state.nearby.next ? state.nearby.next.date + ' (' + state.nearby.next.games.length + ')' : null,
