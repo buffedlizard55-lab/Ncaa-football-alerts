@@ -662,6 +662,19 @@
       var seasonStart = y + '0822';
       if (seasonStart > dateStr) out.fwd = [seasonStart, y + '0908'];
     }
+    // Never let a heuristic “back” window cross the selected date or a
+    // “forward” window begin before it. The normal ±14-day range is already
+    // directional, but these broad season probes must preserve that contract.
+    var yesterday = shiftDate(dateStr, -1);
+    if (out.back) {
+      out.back[1] = out.back[1] < yesterday ? out.back[1] : yesterday;
+      if (out.back[0] > out.back[1]) out.back = null;
+    }
+    var tomorrow = shiftDate(dateStr, 1);
+    if (out.fwd) {
+      out.fwd[0] = out.fwd[0] > tomorrow ? out.fwd[0] : tomorrow;
+      if (out.fwd[0] > out.fwd[1]) out.fwd = null;
+    }
     return out;
   }
 

@@ -375,6 +375,7 @@ function waitForPort(url, ms) {
     assert.deepStrictEqual(NB.fallbackProbeWindows('20260826'), { fwd: null, back: ['20260101', '20260131'] });
     assert.deepStrictEqual(NB.fallbackProbeWindows('20260715'), { fwd: ['20260822', '20260908'], back: ['20260101', '20260131'] });
     assert.deepStrictEqual(NB.fallbackProbeWindows('20260110'), { fwd: ['20260111', '20260131'], back: ['20251215', '20251231'] });
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260120'), { fwd: ['20260822', '20260908'], back: ['20260101', '20260119'] });
   });
 
   console.log('--- scoreboard parsing (real fixture) ---');
