@@ -20,6 +20,12 @@
   var ESPN_WEB_BASE = 'https://site.web.api.espn.com/apis/site/v2/sports/football/college-football';
   var NCAA_GRAPHQL_BASE = 'https://sdataprod.ncaa.com';
   var NCAA_COMMUNITY_BASE = 'https://ncaa-api.henrygd.me';
+  // Browser-safe last-resort transport. The Reader endpoint fetches the same
+  // public JSON URL server-side and returns its content as text/JSON. It is a
+  // transport fallback only — ESPN/NCAA remain the data providers. This is
+  // important in hosted previews where the app's Node relay may be unable to
+  // establish outbound TLS and the provider may not expose CORS.
+  var JINA_READER_BASE = 'https://r.jina.ai/';
 
   /* Conference group IDs for the scoreboard `groups=` filter.
    * Verified 2026-08-25 against live responses:
@@ -115,8 +121,56 @@
     return out;
   }
 
+  // Prepend the Reader host to a provider URL. Using an http target in the
+  // Reader path is intentional: it keeps the provider query string inside the
+  // target URL instead of making the target's `&` parameters look like query
+  // parameters of r.jina.ai itself. The Reader fetches the target over HTTPS
+  // when the target host redirects or requires it.
+  function readerUrl(url) {
+    var target = String(url || '').replace(/^https:\/\//i, 'http://');
+    // Reader caches URL contents. A short bucket keeps a live fallback fresh
+    // without creating a unique request on every render or poll.
+    target += (target.indexOf('?') >= 0 ? '&' : '?') + '_ncbs=' + Math.floor(Date.now() / 30000);
+    return JINA_READER_BASE + target;
+  }
+
+  function readerContentToData(content) {
+    if (content && typeof content === 'object') return content;
+    var text = String(content || '').trim();
+    if (!text) throw new Error('Reader returned an empty document');
+    var marker = text.indexOf('Markdown Content:');
+    if (marker >= 0) text = text.slice(marker + 'Markdown Content:'.length).trim();
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    try { return JSON.parse(text); } catch (firstError) {
+      // The text-mode Reader response can include a short title/URL prefix.
+      // Extract only a complete top-level JSON object/array in that case.
+      var firstObject = text.search(/[\[{]/);
+      var lastObject = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+      if (firstObject >= 0 && lastObject > firstObject) {
+        try { return JSON.parse(text.slice(firstObject, lastObject + 1)); } catch (secondError) {}
+      }
+      throw new Error('Reader did not return provider JSON');
+    }
+  }
+
+  // Reader supports both its documented JSON envelope (when Accept is
+  // application/json) and the plain text form observed from simple GETs.
+  // Normalize both forms before the normal provider payload validation runs.
+  function readerPayloadToData(text) {
+    var parsed;
+    try { parsed = JSON.parse(String(text || '')); } catch (ignore) { parsed = null; }
+    if (parsed && parsed.data && typeof parsed.data.content === 'string') {
+      return readerContentToData(parsed.data.content);
+    }
+    if (parsed && typeof parsed.data === 'string') {
+      return readerContentToData(parsed.data);
+    }
+    if (parsed && (parsed.events || parsed.contests || parsed.games || parsed.leagues || parsed.data)) return parsed;
+    return readerContentToData(text);
+  }
+
   // Prefer the app's same-origin server relay in the browser. This avoids
-  // depending on provider CORS headers or on a public proxy. Node tests do not
+  // depending on provider CORS policy or on a public proxy. Node tests do not
   // have `location`, so they exercise the direct provider path.
   function sameOriginProxyUrl(url) {
     if (typeof location === 'undefined' || !location.origin) return null;
@@ -144,12 +198,27 @@
         })
         .finally(function () { clearTimeout(timer); });
     }
+    function attemptReader(u) {
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, t);
+      return fetch(readerUrl(u), { signal: ctrl.signal, headers: { Accept: 'application/json' } })
+        .then(async function (res) {
+          if (!res.ok) {
+            var body = '';
+            try { body = await res.text(); } catch (ignore) {}
+            throw new Error('Reader HTTP ' + res.status + (body ? ': ' + body.slice(0, 120) : ''));
+          }
+          return readerPayloadToData(await res.text());
+        })
+        .finally(function () { clearTimeout(timer); });
+    }
 
     var lastErr = null;
     var candidates = providerUrls(url);
     // Each provider host gets the controlled same-origin route first, then a
-    // direct request. This makes the browser path work even when site.api is
-    // unreachable but site.web is healthy.
+    // direct request, then the browser-safe Reader transport. This makes the
+    // app work when the server relay cannot reach the provider and the direct
+    // request is blocked by browser CORS.
     for (var i = 0; i < candidates.length; i++) {
       var candidate = candidates[i];
       var relay = sameOriginProxyUrl(candidate);
@@ -161,11 +230,14 @@
       try {
         return { data: await attempt(candidate), viaProxy: false, proxy: null, provider: candidate };
       } catch (err2) { lastErr = err2; }
+      try {
+        return { data: await attemptReader(candidate), viaProxy: true, proxy: 'jina-reader', provider: candidate };
+      } catch (err3) { lastErr = err3; }
     }
 
-    // Direct/provider calls failed. Walk public proxies as a last resort. Use
-    // the originally requested URL first so this remains deterministic and so
-    // a proxy never silently changes providers.
+    // Direct/provider calls and the Reader transport failed. Walk the older
+    // public CORS proxies as a final fallback. They are not data providers and
+    // are intentionally last because their availability is inconsistent.
     for (var j = 0; j < CORS_PROXIES.length; j++) {
       try {
         var p = await attempt(CORS_PROXIES[j].build(url));
@@ -1146,11 +1218,13 @@
   if (typeof document === 'undefined') {
     return {
       API_BASE: API_BASE, ESPN_WEB_BASE: ESPN_WEB_BASE, NCAA_GRAPHQL_BASE: NCAA_GRAPHQL_BASE,
-      NCAA_COMMUNITY_BASE: NCAA_COMMUNITY_BASE, CONFERENCES: CONFERENCES, CORS_PROXIES: CORS_PROXIES,
+      NCAA_COMMUNITY_BASE: NCAA_COMMUNITY_BASE, JINA_READER_BASE: JINA_READER_BASE,
+      CONFERENCES: CONFERENCES, CORS_PROXIES: CORS_PROXIES,
       scoreboardUrl: scoreboardUrl, scoreboardRangeUrl: scoreboardRangeUrl,
       ncaaScoreboardUrl: ncaaScoreboardUrl, ncaaGameUrl: ncaaGameUrl,
       ncaaBoxscoreUrl: ncaaBoxscoreUrl, ncaaPlayByPlayUrl: ncaaPlayByPlayUrl, ncaaTeamStatsUrl: ncaaTeamStatsUrl,
       summaryUrl: summaryUrl, proxiedUrl: proxiedUrl, proxyUrls: proxyUrls, providerUrls: providerUrls,
+      readerUrl: readerUrl, readerContentToData: readerContentToData, readerPayloadToData: readerPayloadToData,
       espnFetch: espnFetch, easternDateStr: easternDateStr, localDateStr: localDateStr, shiftDate: shiftDate,
       etDateFromWallclock: etDateFromWallclock, fmtDayLabel: fmtDayLabel,
       eventsOf: eventsOf, validEventsOf: validEventsOf, scoreboardPayloadIsUsable: scoreboardPayloadIsUsable,
@@ -1237,10 +1311,11 @@
     return CONFERENCES.filter(function (c) { return state.confs[c.id]; }).map(function (c) { return c.id; });
   }
 
-  // Fetch one day. ESPN's comma-separated groups parameter currently returns
-  // syntactically valid placeholder `{}` events, so the normal path is one
-  // request per enabled conference. A no-group full-FBS request is the next
-  // fallback and is filtered locally by the same conference IDs.
+  // Fetch one day. The verified no-group ESPN request is the normal path: it
+  // is one network operation, returns the complete event objects, and is
+  // filtered locally by the enabled conference IDs. Do not use the combined
+  // `groups=1,8,5,4,151` form — ESPN has returned placeholder `{}` events for
+  // that form. Per-conference requests are a recovery path only.
   async function fetchDay(dateStr, groupIds) {
     if (!groupIds.length) return { lists: [], unfiltered: false, viaProxy: false, proxy: null, provider: null, source: null, errors: [] };
 
@@ -1249,8 +1324,20 @@
     var viaProxy = false;
     var proxy = null;
     var provider = null;
-    var invalidCount = 0;
 
+    try {
+      var all = await espnFetch(scoreboardUrl(dateStr));
+      if (scoreboardPayloadIsUsable(all.data)) {
+        return { lists: [all.data], unfiltered: true, viaProxy: all.viaProxy, proxy: all.proxy, provider: all.provider, source: 'espn', errors: [] };
+      }
+      errors.push('ESPN no-group response contained no usable events');
+    } catch (e) {
+      errors.push(String((e && e.message) || e));
+    }
+
+    // If the complete feed is unavailable or malformed, try each conference
+    // separately. This avoids losing a usable partial slate and also covers
+    // providers that only return conference events for filtered requests.
     var responses = await Promise.all(groupIds.map(function (gid) {
       return espnFetch(scoreboardUrl(dateStr, gid)).then(
         function (r) { return { ok: true, r: r, valid: scoreboardPayloadIsUsable(r.data) }; },
@@ -1263,7 +1350,6 @@
         return;
       }
       if (!result.valid) {
-        invalidCount++;
         errors.push('ESPN returned an unusable event payload for one conference');
         return;
       }
@@ -1272,21 +1358,8 @@
       if (!provider) provider = result.r.provider;
     });
 
-    // If every per-group response was a valid empty response, that is a real
-    // empty slate. If any response failed or contained placeholders, use the
-    // verified no-group endpoint to recover games from that conference.
-    if (invalidCount === 0 && lists.length === groupIds.length) {
-      return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'espn', errors: [] };
-    }
-
-    try {
-      var all = await espnFetch(scoreboardUrl(dateStr));
-      if (scoreboardPayloadIsUsable(all.data)) {
-        return { lists: [all.data], unfiltered: true, viaProxy: all.viaProxy, proxy: all.proxy, provider: all.provider, source: 'espn', errors: [] };
-      }
-      errors.push('ESPN no-group response contained no usable events');
-    } catch (e) {
-      errors.push(String((e && e.message) || e));
+    if (lists.length) {
+      return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'espn', errors: errors };
     }
 
     // The current NCAA persisted query is independently verified and returns
@@ -1295,16 +1368,14 @@
     try {
       var ncaa = await espnFetch(ncaaScoreboardUrl(dateStr));
       if (scoreboardPayloadIsUsable(ncaa.data)) {
-        return { lists: [ncaa.data], unfiltered: false, viaProxy: ncaa.viaProxy, proxy: ncaa.proxy, provider: ncaa.provider, source: 'ncaa', errors: [] };
+        return { lists: [ncaa.data], unfiltered: false, viaProxy: ncaa.viaProxy, proxy: ncaa.proxy, provider: ncaa.provider, source: 'ncaa', errors: errors };
       }
       errors.push('NCAA returned no usable contests');
     } catch (ncaaError) {
       errors.push(String((ncaaError && ncaaError.message) || ncaaError));
     }
 
-    // Keep any real per-group responses when the recovery paths also fail;
-    // partial scores are better than replacing them with a blank screen.
-    return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: lists.length ? 'espn' : null, errors: errors };
+    return { lists: [], unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: null, errors: errors };
   }
 
   async function loadScoreboard(showSpinner) {
@@ -1391,9 +1462,9 @@
     return '';
   }
 
-  /* ---------------- Nearby-games search (empty days) ----------------
-   * When the selected day has no games, look for the next upcoming games
-   * and the most recent results so the scoreboard is never a dead end:
+  /* ---------------- Nearby-games search ----------------
+   * For every selected day, look for the next upcoming games and the most
+   * recent results so the scoreboard is never a dead end:
    *   1. probe the next/previous 14 days (one ranged request each way —
    *      verified live: dates=FROM-TO returns every event in the span);
    *   2. if a direction is empty (deep offseason), use the season calendar
@@ -1454,12 +1525,54 @@
         if (result.r.viaProxy) { viaProxy = true; if (!proxy) proxy = result.r.proxy; }
         if (!provider) provider = result.r.provider;
       });
+      var days = anyValid ? groupByDay(filterEventsForGroups(events, groupIds)) : [];
+      if (days.length || anyValid) {
+        return {
+          days: days,
+          failed: !anyValid,
+          viaProxy: viaProxy,
+          proxy: proxy,
+          provider: provider,
+          source: 'espn'
+        };
+      }
+
+      // If ESPN's ranged endpoint and its per-group form are both
+      // unavailable, fall back to the official NCAA date query one day at a
+      // time. The query is date-based, so this remains correct across week,
+      // month, and season boundaries. This path is deliberately lazy: it is
+      // only used for adjacent-day discovery after ESPN has already failed.
+      var ncaaDates = [];
+      var cursor = from;
+      while (cursor <= to && ncaaDates.length < 31) {
+        ncaaDates.push(cursor);
+        cursor = shiftDate(cursor, 1);
+      }
+      var ncaaResults = await Promise.all(ncaaDates.map(function (date) {
+        return espnFetch(ncaaScoreboardUrl(date)).then(
+          function (r) { return { ok: scoreboardPayloadIsUsable(r.data), r: r }; },
+          function () { return { ok: false }; }
+        );
+      }));
+      var ncaaEvents = [];
+      var ncaaValid = false;
+      var ncaaViaProxy = false;
+      var ncaaProxy = null;
+      var ncaaProvider = null;
+      ncaaResults.forEach(function (result) {
+        if (!result.ok) return;
+        ncaaValid = true;
+        ncaaEvents = ncaaEvents.concat(validEventsOf(result.r.data));
+        if (result.r.viaProxy) { ncaaViaProxy = true; if (!ncaaProxy) ncaaProxy = result.r.proxy; }
+        if (!ncaaProvider) ncaaProvider = result.r.provider;
+      });
       return {
-        days: anyValid ? groupByDay(filterEventsForGroups(events, groupIds)) : [],
-        failed: !anyValid,
-        viaProxy: viaProxy,
-        proxy: proxy,
-        provider: provider
+        days: groupByDay(filterEventsForGroups(ncaaEvents, groupIds)),
+        failed: !ncaaValid,
+        viaProxy: ncaaViaProxy,
+        proxy: ncaaProxy,
+        provider: ncaaProvider,
+        source: 'ncaa'
       };
     }
     function pickFirst(result) { return result && result.days.length ? result.days[0] : null; }
@@ -2399,6 +2512,7 @@
     ESPN_WEB_BASE: ESPN_WEB_BASE,
     NCAA_GRAPHQL_BASE: NCAA_GRAPHQL_BASE,
     NCAA_COMMUNITY_BASE: NCAA_COMMUNITY_BASE,
+    JINA_READER_BASE: JINA_READER_BASE,
     scoreboardUrl: scoreboardUrl,
     scoreboardRangeUrl: scoreboardRangeUrl,
     ncaaScoreboardUrl: ncaaScoreboardUrl,
@@ -2410,6 +2524,9 @@
     proxiedUrl: proxiedUrl,
     proxyUrls: proxyUrls,
     providerUrls: providerUrls,
+    readerUrl: readerUrl,
+    readerContentToData: readerContentToData,
+    readerPayloadToData: readerPayloadToData,
     espnFetch: espnFetch,
     easternDateStr: easternDateStr,
     localDateStr: localDateStr,

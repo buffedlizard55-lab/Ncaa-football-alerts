@@ -7,9 +7,10 @@ A zero-dependency, dark-themed college-football scoreboard for:
 The app is intended to behave like a scoreboard rather than a single-day
 lookup:
 
-- A fresh visit starts on the current Eastern date, then moves to the next day
-  with an upcoming game when the current slate is empty or contains only final
-  games. A day with a live or scheduled game stays selected.
+- A fresh visit searches from the current Eastern date and opens the next
+  available game day. If the current date has a live or scheduled game, it is
+  kept open so a live/current scoreboard is not skipped; an empty or
+  final-only current date advances to the closest future slate.
 - The selected day is divided into **Live**, **Upcoming**, and **Final**.
 - Every selected day also gets an adjacent **Upcoming** slate and **Recent
   results** slate, including when the selected day itself is empty.
@@ -48,16 +49,44 @@ API key is required.
 | Game detail | `.../summary?event={eventId}` returned the box score, drives, plays, and recap for a completed game. The parameter is `event`; `gameId` is not interchangeable. |
 | Alternate host | `site.web.api.espn.com` was independently checked with the same scoreboard and summary paths and is tried if the primary ESPN host fails. |
 
-The loader intentionally makes one request per enabled conference in parallel.
-It does **not** rely on a comma-separated group list. During the live
-investigation, `groups=1,8,5,4,151` returned placeholder `{}` events even
-though the HTTP response was successful. The per-group responses are merged
-and deduplicated by event ID. If a per-group response fails or contains
-placeholders, the loader retries with the verified no-group day response and
-filters the complete events locally.
+The loader first makes one no-group request for the selected day and filters
+its complete FBS event list locally. This keeps the normal path to one network
+operation instead of five independent requests. It does **not** rely on a
+comma-separated group list. During the live investigation,
+`groups=1,8,5,4,151` returned placeholder `{}` events even though the HTTP
+response was successful. If the no-group request fails or contains only
+placeholders, the loader retries one conference at a time, merges and
+deduplicates usable events, and then falls back to NCAA.
 
 This distinction fixes the original blank-scoreboard behavior: an empty
-placeholder response is not treated as a legitimate no-games response.
+placeholder response is not treated as a legitimate no-games response. It also
+makes the first page faster and gives the UI a single, inspectable primary
+request.
+
+### Browser-safe Reader transport fallback
+
+The hosted preview can have two separate network failures: the Node relay may
+not be allowed to make outbound TLS connections, and a browser may reject a
+direct provider request because of CORS. After the same-origin relay and direct
+ESPN/NCAA host attempts, `app.js` tries the free Jina Reader transport:
+
+```text
+https://r.jina.ai/http://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=YYYYMMDD&limit=300
+```
+
+The Reader fetches that exact public provider URL and returns the provider JSON
+inside its documented response envelope (or its text-mode `Markdown Content`
+form); the adapter strips only that envelope and then runs the same strict
+ESPN/NCAA payload validation. A short cache bucket is added to the Reader target
+so a live fallback is not held indefinitely in Reader cache. The Reader is
+transport only — it does not invent games or replace ESPN/NCAA as the source of
+truth. The public Reader service is rate-limited, so it is deliberately after
+the app relay and direct provider requests, and polling remains conservative.
+
+Independent checks on 2026-08-26 fetched ESPN JSON through the Reader for the
+empty current date (`20260826`), the upcoming Aug. 29 slate, the Jan. 19 CFP
+final, the 14-day range used for adjacent-game discovery, and the pre-game
+summary endpoint. Those responses retained the provider's JSON structure.
 
 ### Verified free NCAA fallback
 
@@ -93,14 +122,29 @@ scoreboard/detail view model as ESPN data.
 
 ### Options investigated but not used as primary providers
 
+These were called directly rather than accepted from search-result marketing
+copy:
+
+- Big Balls Sports Data: `GET https://api.bigballsdata.com/v1/matches?sport=american_football&league=ncaaf`
+  returned HTTP JSON saying `missing API key`; the advertised free tier still
+  requires creating a key, so it cannot be embedded as a keyless source.
+- SportSRC: `GET https://api.sportsrc.org/?data=matches&category=american-football`
+  returned JSON, but the observed rows were streaming listings for mostly
+  Division II games with null team fields and no scores. Its `football`
+  category returned soccer, not American football. It is not suitable for this
+  FBS scoreboard.
 - CollegeFootballData advertises useful college-football data, but its bearer
   key is required; it is not a key-free scoreboard source.
 - API-Sports advertises NCAA coverage and a free quota, but account/API-key
   setup is required and was not used here.
+- CBS Sports and NCAA.com rendered scoreboard pages contain useful schedule
+  text, but neither was adopted as an HTML scraper when the structured ESPN
+  and NCAA JSON contracts were available.
 - Public CORS proxies were tested as network fallbacks. `api.allorigins.win`
-  returned a Cloudflare 522 during testing, and the other proxy paths are
-  third-party infrastructure with no reliability guarantee. They remain only
-  after the app's same-origin relay and direct provider-host attempts.
+  returned a server error, `corsproxy.io` explicitly refused the ESPN domain,
+  and `api.codetabs.com` returned a Cloudflare 522 in the direct checks. They
+  remain only after the app relay, direct provider hosts, and Reader transport;
+  they are third-party infrastructure, not the scoreboard's source of truth.
 
 ## Date and nearby-game behavior
 
@@ -111,9 +155,11 @@ scoreboard day.
 
 For each loaded date, nearby discovery requests the next and previous 14-day
 windows without `groups=` and filters the complete event objects locally. If a
-range fails, it retries one request per enabled conference. The current
-season calendar is also used for an offseason jump window when ESPN supplies
-one. Results are grouped by Eastern day and remain clickable.
+range fails, it retries one request per enabled conference; if those requests
+also fail, it lazily checks the same dates through the official NCAA date
+query. The current season calendar is also used for an offseason jump window
+when ESPN supplies one. Results are grouped by Eastern day and remain
+clickable.
 
 On a clean visit, the current day is kept if it contains a live or scheduled
 game. If it is empty or final-only, the closest future game day is selected
@@ -132,9 +178,11 @@ not an open proxy: it permits only the retained provider hosts and paths:
 
 Other hosts, protocols, methods, URL paths, and file traversal attempts are
 rejected. If the relay cannot reach a provider, the client tries the verified
-provider-host alternative, direct access, and finally the public proxy chain.
-Diagnostics identify the source, provider, relay/proxy status, counts, and
-last update.
+provider-host alternative, direct access, the browser-safe Reader transport,
+and finally the older public proxy chain. The Reader target is not added to the
+relay allowlist because it is a client-side transport fallback; the server
+relay itself remains restricted to the actual ESPN/NCAA hosts. Diagnostics
+identify the source, provider, relay/proxy status, counts, and last update.
 
 ## Repository review and verification
 
@@ -159,18 +207,27 @@ Current verification performed on **2026-08-26**:
 4. The NCAA-backed game overview and completed-game detail routes were called
    independently; optional-route failures are handled rather than assumed
    away.
-5. `npm test` passes **62 offline checks**, including syntax, URL construction,
-   ESPN response validation, NCAA scoreboard/detail parsing, conference
-   filtering, real ESPN fixtures, date boundaries, merge/deduplication, live
-   and final view models, and the running server's health/static/security
-   routes.
+5. The exact Reader URLs were called independently for the current empty
+   date, the Aug. 29 upcoming slate, the Jan. 19 final, the adjacent-game
+   range, and a pre-game summary. Both the Reader text form and its documented
+   JSON-envelope form were parsed in the adapter tests.
+6. The exact Big Balls Data, SportSRC, allorigins, corsproxy.io, and
+   api.codetabs.com candidates were called independently; their observed
+   authentication, coverage, or transport failures are recorded above rather
+   than treated as working providers.
+7. `npm test` passes **65 offline checks**, including syntax, URL construction,
+   Reader normalization/fallback behavior, ESPN response validation, NCAA
+   scoreboard/detail parsing, conference filtering, real ESPN fixtures, date
+   boundaries, merge/deduplication, live and final view models, and the
+   running server's health/static/security routes.
 
 The sandbox has no installed browser executable and its server-side outbound
-TLS path to ESPN is restricted, so a real browser CORS handshake and a full
-live-game watch cannot be proven by `npm test`. The live preview remains the
-place to observe browser delivery; the relay and diagnostics are designed to
-make a provider/network failure explicit instead of rendering an unexplained
-blank slate.
+TLS path to ESPN is restricted, so `npm test` cannot itself prove a remote
+browser's CORS handshake or a full live-game watch. The browser path now has
+three progressively independent ways to receive real provider data: the
+same-origin relay, direct provider fetch, and the documented Reader transport.
+The UI also shows source/provider diagnostics and an explicit network error
+instead of rendering an unexplained blank slate if all three are unavailable.
 
 ## Files
 

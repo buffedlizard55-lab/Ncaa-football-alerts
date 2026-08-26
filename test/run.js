@@ -7,9 +7,10 @@
  *    fixtures (see test/fixtures/*.json headers for provenance)
  *  - boots the actual server on a port and checks its routes
  *
- * The live-network path (fetching ESPN from the browser) is verified in the
- * live preview; see README.md "Verification" for what was checked against the
- * real API on 2026-08-26.
+ * Live provider contracts were independently probed on 2026-08-26; this
+ * offline runner does not pretend to prove a remote browser's network/CORS
+ * environment. Reader fallback parsing is covered with representative
+ * response envelopes.
  */
 const { execFileSync, spawn } = require('child_process');
 const path = require('path');
@@ -113,6 +114,17 @@ function waitForPort(url, ms) {
     ]);
     assert.deepStrictEqual(NB.providerUrls(NB.ncaaScoreboardUrl('20260829')), [NB.ncaaScoreboardUrl('20260829')]);
   });
+  test('Reader transport URL keeps the provider target and adds a short cache bucket', () => {
+    const reader = NB.readerUrl('https://site.api.espn.com/apis/x?a=1&b=2');
+    assert.ok(reader.startsWith('https://r.jina.ai/http://site.api.espn.com/apis/x?'));
+    assert.ok(reader.indexOf('a=1&b=2') !== -1);
+    assert.ok(/&_ncbs=\d+$/.test(reader));
+  });
+  test('Reader text and JSON-envelope responses normalize to provider data', () => {
+    assert.deepStrictEqual(NB.readerPayloadToData('Title: ESPN\n\nMarkdown Content:\n{"events":[]}'), { events: [] });
+    assert.deepStrictEqual(NB.readerPayloadToData(JSON.stringify({ code: 200, data: { content: '{"data":{"contests":[]}}' } })), { data: { contests: [] } });
+    assert.deepStrictEqual(NB.readerPayloadToData(JSON.stringify({ code: 200, data: '{"events":[]}' })), { events: [] });
+  });
   test('NCAA game detail URL builders stay on the retained public host', () => {
     assert.strictEqual(NB.ncaaGameUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979');
     assert.strictEqual(NB.ncaaBoxscoreUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/boxscore');
@@ -137,7 +149,30 @@ function waitForPort(url, ms) {
     // Every proxy URL must encode the raw & of the target (never send %2C).
     urls.forEach((u) => { assert.ok(u.indexOf('&b=2') === -1); });
   });
-  atest('espnFetch walks the proxy chain to the first working proxy', async () => {
+  await atest('espnFetch uses the Reader transport when provider/CORS requests fail', async () => {
+    const origFetch = global.fetch;
+    try {
+      const calls = [];
+      global.fetch = (u) => {
+        calls.push(String(u));
+        if (String(u).startsWith('https://r.jina.ai/')) {
+          return Promise.resolve({
+            ok: true,
+            text: async () => 'Title: ESPN\n\nMarkdown Content:\n{"events":[]}'
+          });
+        }
+        return Promise.reject(new Error('network unavailable'));
+      };
+      const r = await NB.espnFetch('https://site.api.espn.com/apis/x', 400);
+      assert.strictEqual(r.viaProxy, true);
+      assert.strictEqual(r.proxy, 'jina-reader');
+      assert.deepStrictEqual(r.data, { events: [] });
+      assert.ok(calls.some((u) => u.startsWith('https://r.jina.ai/http://site.api.espn.com/')));
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+  await atest('espnFetch walks the proxy chain to the first working proxy', async () => {
     const origFetch = global.fetch;
     try {
       let calls = [];
