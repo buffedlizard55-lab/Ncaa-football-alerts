@@ -1399,7 +1399,11 @@
         }
         var ncaaForEmpty = await tryNCAA();
         if (ncaaForEmpty) {
-          return { lists: [ncaaForEmpty.data], unfiltered: false, viaProxy: ncaaForEmpty.viaProxy, proxy: ncaaForEmpty.proxy, provider: ncaaForEmpty.provider, source: 'ncaa', errors: [] };
+          // Keep the valid ESPN envelope alongside NCAA. Empty ESPN day
+          // responses carry the league calendar used to jump across the
+          // offseason (for example, from late August back to the January CFP
+          // result); NCAA's exact date response carries the actual contests.
+          return { lists: [ncaaForEmpty.data, all.data], unfiltered: false, viaProxy: ncaaForEmpty.viaProxy, proxy: ncaaForEmpty.proxy, provider: ncaaForEmpty.provider, source: 'ncaa', errors: [] };
         }
         // Both sources returned an empty/unavailable fallback. The valid ESPN
         // empty response is still a legitimate no-games result; do not turn a
