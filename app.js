@@ -169,11 +169,24 @@
     return readerContentToData(text);
   }
 
-  // Prefer the app's same-origin server relay in the browser. This avoids
-  // depending on provider CORS policy or on a public proxy. Node tests do not
-  // have `location`, so they exercise the direct provider path.
+  // GitHub Pages is a static host: it serves these files but never runs
+  // server.js, so `/api/espn` is a Pages 404 rather than a relay. Detect the
+  // known Pages host and go straight to the browser-safe provider transports.
+  // Keep the predicate separate and pure so the deployment assumption is
+  // visible in tests and remains safe for a custom Pages domain.
+  function isGitHubPagesHost(hostname) {
+    return /(^|\.)github\.io$/i.test(String(hostname || '').trim());
+  }
+
+  function isStaticDeployment() {
+    return typeof location !== 'undefined' && isGitHubPagesHost(location.hostname);
+  }
+
+  // Prefer the app's same-origin server relay everywhere it exists. On the
+  // GitHub Pages deployment, skip the known-nonexistent relay so every request
+  // can use direct ESPN/NCAA CORS or the Reader fallback without a Pages 404.
   function sameOriginProxyUrl(url) {
-    if (typeof location === 'undefined' || !location.origin) return null;
+    if (typeof location === 'undefined' || !location.origin || isStaticDeployment()) return null;
     return '/api/espn?url=' + encodeURIComponent(url);
   }
 
@@ -1308,6 +1321,7 @@
       ncaaBoxscoreUrl: ncaaBoxscoreUrl, ncaaPlayByPlayUrl: ncaaPlayByPlayUrl, ncaaTeamStatsUrl: ncaaTeamStatsUrl,
       summaryUrl: summaryUrl, proxiedUrl: proxiedUrl, proxyUrls: proxyUrls, providerUrls: providerUrls,
       readerUrl: readerUrl, readerContentToData: readerContentToData, readerPayloadToData: readerPayloadToData,
+      isGitHubPagesHost: isGitHubPagesHost, isStaticDeployment: isStaticDeployment,
       espnFetch: espnFetch, easternDateStr: easternDateStr, localDateStr: localDateStr, shiftDate: shiftDate,
       etDateFromWallclock: etDateFromWallclock, fmtDayLabel: fmtDayLabel,
       eventsOf: eventsOf, validEventsOf: validEventsOf, eventIsCompleted: eventIsCompleted,
@@ -2697,6 +2711,8 @@
     readerUrl: readerUrl,
     readerContentToData: readerContentToData,
     readerPayloadToData: readerPayloadToData,
+    isGitHubPagesHost: isGitHubPagesHost,
+    isStaticDeployment: isStaticDeployment,
     espnFetch: espnFetch,
     easternDateStr: easternDateStr,
     localDateStr: localDateStr,

@@ -30,6 +30,22 @@ npm test           # offline tests; no API key or network is required
 The server requires Node 18 or newer, has no runtime dependencies, and binds to
 `0.0.0.0` on port 8000 by default. Set `PORT` to change the port.
 
+## GitHub Pages deployment
+
+The repository's published GitHub Pages site is a legacy **static** deployment
+from the configured branch. GitHub Pages serves `index.html`, `app.js`, and
+`styles.css`; it does not start `server.js`, so the same-origin `/api/espn`
+relay exists only when the Node server is running locally or on a separate
+backend.
+
+The client detects a `*.github.io` host and skips that known-nonexistent relay.
+It then tries the public ESPN/NCAA endpoint directly and uses the documented
+CORS-enabled Jina Reader transport as a browser fallback. This keeps the
+published static path separate from the local server path without turning the
+relay into an open proxy. A Pages deployment must contain the current static
+client files before its public URL can show the fallback behavior; changing
+`server.js` alone cannot update a legacy Pages site.
+
 ## Provider strategy
 
 The browser does not assume that a syntactically valid JSON response contains

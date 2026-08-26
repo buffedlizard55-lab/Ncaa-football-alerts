@@ -125,6 +125,15 @@ function waitForPort(url, ms) {
     assert.deepStrictEqual(NB.readerPayloadToData(JSON.stringify({ code: 200, data: { content: '{"data":{"contests":[]}}' } })), { data: { contests: [] } });
     assert.deepStrictEqual(NB.readerPayloadToData(JSON.stringify({ code: 200, data: '{"events":[]}' })), { events: [] });
   });
+  test('GitHub Pages is recognized as static and skips the server-only relay', () => {
+    assert.strictEqual(NB.isGitHubPagesHost('buffedlizard55-lab.github.io'), true);
+    assert.strictEqual(NB.isGitHubPagesHost('github.io'), true);
+    assert.strictEqual(NB.isGitHubPagesHost('www.github.com'), false);
+    assert.strictEqual(NB.isGitHubPagesHost('example.github.io.evil.test'), false);
+    // Node has no browser location, so the runtime detector must not claim that
+    // the offline test process is a static deployment.
+    assert.strictEqual(NB.isStaticDeployment(), false);
+  });
   test('NCAA game detail URL builders stay on the retained public host', () => {
     assert.strictEqual(NB.ncaaGameUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979');
     assert.strictEqual(NB.ncaaBoxscoreUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/boxscore');
