@@ -106,10 +106,13 @@ per period, `records[]`, `curatedRank`, `winner`), `broadcasts`, `venue`,
 `attendance`, `notes`, `groups` (conference name), `leaders` (game leaders),
 `headlines` (recap text).
 
-### Empty days: upcoming & recent results
+### Upcoming & recent results
 
-When a loaded day has **no games** for the enabled conferences, the app runs a
-nearby-games search and shows the results as clickable rows:
+For every loaded scoreboard date, the app also runs a nearby-games search and
+shows the closest upcoming slate and most recent completed slate as clickable
+rows below the selected day's games. On an empty date these sections are the
+main scoreboard content; on a date with games they remain visible below the
+current slate:
 
 1. One ranged request each for the next 14 days and the previous 14 days
    (`dates=FROM-TO`, combined `groups=`), grouped by Eastern date.
@@ -136,13 +139,31 @@ On 2026-08-25 (a Tuesday with no games) this surfaces: *Upcoming — Sat, Aug 29
   and kickoff/final transitions. Scheduled games wait for kickoff automatically.
 - Polling pauses while the browser tab is hidden.
 
+### Free NCAA.com fallback
+
+If ESPN cannot be reached, the day scoreboard tries the documented free NCAA.com
+GraphQL scoreboard source. It sends `sportCode: "MFB"`, FBS division `11`, the
+NCAA season year, and the selected `contestDate`, then normalizes the documented
+`data.contests[]` / `teams[]` fields into the scoreboard model. This fallback is
+for scoreboard rows only; ESPN remains required for the existing game summary,
+box score, and play-by-play views.
+
 ### CORS / fallback
 
-The page is served from this preview host and calls `site.api.espn.com`
-directly from your browser. If a network blocks that cross-origin call, the
-app transparently retries the same request through the public
-`api.allorigins.win` CORS proxy (the UI shows "via CORS proxy" when that path
-is used), and shows an error banner if both fail.
+The page is served from this preview host and first calls the server's
+same-origin `/api/espn?url=…` relay. The relay allowlists only
+`site.api.espn.com/apis/site/v2/`, avoiding browser CORS failures and keeping
+the ESPN request in one controlled place. If the relay cannot reach ESPN, the
+browser falls back to a direct request and then public CORS proxies —
+`api.allorigins.win`, `corsproxy.io`, and `api.codetabs.com`. The UI and
+diagnostics identify whether the server relay or a public proxy supplied the
+data. An error banner appears only if every path fails.
+
+The nearby-games discovery also runs when the day's own feed errors, so a
+transient single-day failure cannot dead-end the page: the surrounding-game
+search still gets a chance to surface upcoming and recent results. It runs for
+non-empty dates too, so the scoreboard always has clear context around the
+selected slate.
 
 ### Diagnostics
 
@@ -159,7 +180,7 @@ server.js     zero-dependency static server (0.0.0.0, PORT=8000 default)
 index.html    page shell
 styles.css    dark scoreboard theme (+ empty-day discovery panel)
 app.js        data layer (pure, testable) + browser app
-test/run.js   offline test runner (49 checks)
+test/run.js   offline test runner (56 checks)
 test/fixtures/ real API response fixtures (game 401752763, TA&M 38–17 MIZ,
                2025-11-08) with field-level provenance notes
 ```
@@ -173,7 +194,7 @@ test/fixtures/ real API response fixtures (game 401752763, TA&M 38–17 MIZ,
    boxscore teams & players, drives, plays, recap, standings).
 2. **Conference mapping** — each of the 5 conference IDs was confirmed with
    known teams (table above), matching published documentation.
-3. **Offline tests** — `npm test`: 49 passing checks covering syntax, URL
+3. **Offline tests** — `npm test`: 56 passing checks covering syntax, URL
    builders (single/combined/ranged), date/timezone math, event/summary
    parsing against the real fixtures (scores, line scores, leaders, drives,
    plays, player rows, merge/dedupe, live/final status logic), the top-level

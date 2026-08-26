@@ -17,6 +17,7 @@ const fs = require('fs');
 const assert = require('assert');
 
 const ROOT = path.join(__dirname, '..');
+const NCAA_SAMPLE_EPOCH = 1788019200; // observed from NCAA response for 2026-08-29
 let passed = 0;
 let failed = 0;
 
@@ -87,6 +88,13 @@ function waitForPort(url, ms) {
       'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260826-20260908&limit=500&groups=1,8'
     );
   });
+  test('free NCAA scoreboard URL uses documented contestDate variables', () => {
+    const u = NB.ncaaScoreboardUrl('20260829');
+    assert.ok(u.startsWith('https://sdataprod.ncaa.com/?extensions='));
+    assert.ok(decodeURIComponent(u).includes('"sportCode":"MFB"'));
+    assert.ok(decodeURIComponent(u).includes('"division":11'));
+    assert.ok(decodeURIComponent(u).includes('"contestDate":"2026-08-29"'));
+  });
   test('scoreboardRangeUrl without groups', () => {
     const u = NB.scoreboardRangeUrl('20260110', '20260131');
     assert.ok(u.endsWith('dates=20260110-20260131&limit=500'));
@@ -100,6 +108,39 @@ function waitForPort(url, ms) {
     assert.ok(p.startsWith('https://api.allorigins.win/raw?url='));
     assert.ok(p.indexOf('&b=2') === -1); // & must be encoded
     assert.ok(p.indexOf('a%3D1%26b%3D2') !== -1);
+  });
+  test('CORS proxy chain is ordered, allorigins first, and proxyUrls lists all', () => {
+    // allorigins.win stayed first (it is the documented fallback), then two
+    // independent public proxies so one outage doesn't kill the scoreboard.
+    assert.deepStrictEqual(NB.CORS_PROXIES.map((p) => p.id), ['allorigins', 'corsproxy.io', 'codetabs']);
+    const urls = NB.proxyUrls('https://site.api.espn.com/x?a=1&b=2');
+    assert.strictEqual(urls.length, 3);
+    assert.ok(urls[0].startsWith('https://api.allorigins.win/raw?url='));
+    assert.ok(urls[1].startsWith('https://corsproxy.io/?url='));
+    assert.ok(urls[2].startsWith('https://api.codetabs.com/v1/proxy?quest='));
+    // Every proxy URL must encode the raw & of the target (never send %2C).
+    urls.forEach((u) => { assert.ok(u.indexOf('&b=2') === -1); });
+  });
+  atest('espnFetch walks the proxy chain to the first working proxy', async () => {
+    const origFetch = global.fetch;
+    try {
+      let calls = [];
+      global.fetch = (u) => {
+        calls.push(u);
+        if (/api\.allorigins\.win/.test(u)) return Promise.reject(new Error('allorigins down'));
+        if (/corsproxy\.io/.test(u)) return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+        if (/api\.codetabs\.com/.test(u)) return Promise.resolve({ ok: true, json: async () => ({ ok: true }) });
+        return Promise.reject(new Error('direct down')); // the direct ESPN URL fails
+      };
+      const r = await NB.espnFetch('https://site.api.espn.com/apis/x', 400);
+      assert.strictEqual(r.viaProxy, true);
+      assert.strictEqual(r.proxy, 'corsproxy.io'); // allorigins failed -> next proxy used
+      assert.ok(calls.some((c) => /api\.allorigins\.win/.test(c))); // allorigins was attempted
+      assert.ok(calls.some((c) => /corsproxy\.io/.test(c))); // and then corsproxy.io
+      assert.strictEqual(calls[0], 'https://site.api.espn.com/apis/x'); // direct first
+    } finally {
+      global.fetch = origFetch;
+    }
   });
   test('conference table has the 5 required conferences', () => {
     const ids = NB.CONFERENCES.map((c) => c.id).sort();
@@ -151,6 +192,18 @@ function waitForPort(url, ms) {
     assert.deepStrictEqual(NB.eventsOf({ leagues: [{ id: '23', events: [{ id: 'wrong' }] }], events: [{ id: 'right' }] }), [{ id: 'right' }]);
     assert.deepStrictEqual(NB.eventsOf({}), []);
     assert.deepStrictEqual(NB.eventsOf(null), []);
+  });
+  test('eventsOf converts documented NCAA contests to scoreboard events', () => {
+    const data = { data: { contests: [{ contestId: 'n1', startDate: '08/29/2026', startTime: '12:00', startTimeEpoch: NCAA_SAMPLE_EPOCH, gameState: 'P', teams: [
+      { isHome: false, isWinner: false, nameShort: 'UNC', score: 0 },
+      { isHome: true, isWinner: false, nameShort: 'TCU', score: 0 }
+    ] }] } };
+    const ev = NB.eventsOf(data);
+    assert.strictEqual(ev.length, 1);
+    assert.strictEqual(ev[0].id, 'n1');
+    assert.strictEqual(ev[0].date, '2026-08-29T16:00:00.000Z');
+    assert.strictEqual(ev[0].competitions[0].competitors[0].team.displayName, 'UNC');
+    assert.strictEqual(ev[0].competitions[0].status.type.state, 'pre');
   });
   test('groupByDay groups by Eastern date, sorted', () => {
     const evs = [
@@ -451,7 +504,15 @@ function waitForPort(url, ms) {
     await atest('serves app.js and styles.css', async () => {
       const js = await (await fetch(base + '/app.js')).text();
       assert.ok(js.indexOf('CONFERENCES') !== -1);
+      assert.ok(js.indexOf('/api/espn?url=') !== -1);
       assert.ok((await (await fetch(base + '/styles.css')).text()).indexOf('.game-row') !== -1);
+    });
+    await atest('same-origin ESPN relay rejects non-ESPN targets', async () => {
+      const target = encodeURIComponent('https://example.com/not-espn');
+      const res = await fetch(base + '/api/espn?url=' + target);
+      assert.strictEqual(res.status, 400);
+      const body = await res.json();
+      assert.ok(body.error);
     });
     await atest('404 for unknown paths, no file escape via traversal', async () => {
       assert.strictEqual((await fetch(base + '/nope.js')).status, 404);
