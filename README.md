@@ -165,7 +165,9 @@ the near edge of the window and stops at the first matching day. A valid empty
 range is kept as a non-network-error result, but is still checked against NCAA
 so a provider disagreement cannot hide an upcoming or prior slate. The
 current season calendar is also used for an offseason jump window when ESPN
-supplies one. Results are grouped by Eastern day and remain clickable.
+supplies one; if it is unavailable, bounded season-boundary windows are probed
+through the exact NCAA date source instead. Results are grouped by Eastern day
+and remain clickable.
 
 On a clean visit, the current day is kept if it contains a live or scheduled
 game. If it is empty or final-only, the closest future game day is selected
@@ -221,7 +223,7 @@ Current verification performed on **2026-08-26**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-7. `npm test` passes **67 offline checks**, including syntax, URL construction,
+7. `npm test` passes **68 offline checks**, including syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final

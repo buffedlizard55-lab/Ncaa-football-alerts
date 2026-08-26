@@ -639,6 +639,32 @@
     return out;
   }
 
+  // If the ESPN day response failed completely, NCAA still supplies exact
+  // date-based contests but not ESPN's season calendar. These bounded windows
+  // cover the season boundaries where a 14-day nearby probe can miss the last
+  // result or the next opener. They are only search hints; every displayed row
+  // still comes from an actual NCAA/ESPN response and is filtered by date.
+  function fallbackProbeWindows(dateStr) {
+    var out = { fwd: null, back: null };
+    if (!/^\d{8}$/.test(String(dateStr))) return out;
+    var year = Number(String(dateStr).slice(0, 4));
+    var month = Number(String(dateStr).slice(4, 6));
+    var day = Number(String(dateStr).slice(6, 8));
+    var y = String(year);
+    if (month === 1 && day <= 10) {
+      out.back = [String(year - 1) + '1215', String(year - 1) + '1231'];
+      out.fwd = [y + '0111', y + '0131'];
+    } else if (month < 8) {
+      out.back = [y + '0101', y + '0131'];
+      out.fwd = [y + '0822', y + '0908'];
+    } else {
+      out.back = [y + '0101', y + '0131'];
+      var seasonStart = y + '0822';
+      if (seasonStart > dateStr) out.fwd = [seasonStart, y + '0908'];
+    }
+    return out;
+  }
+
   /* ---------------- Scoreboard parsing ---------------- */
 
   function parseCompetitor(c, rank) {
@@ -1275,7 +1301,7 @@
       scoreboardPayloadIsUsable: scoreboardPayloadIsUsable,
       scoreboardEventIsUsable: scoreboardEventIsUsable, eventMatchesGroups: eventMatchesGroups,
       filterEventsForGroups: filterEventsForGroups, filterEventsForDate: filterEventsForDate,
-      groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
+      groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows, fallbackProbeWindows: fallbackProbeWindows,
       parseEvent: parseEvent, parseNCAAOverview: parseNCAAOverview, parseNCAADetail: parseNCAADetail,
       parseCompetitor: parseCompetitor, mergeEvents: mergeEvents, groupGames: groupGames,
       shouldOpenNextGameDay: shouldOpenNextGameDay, periodLabel: periodLabel, normalizePlay: normalizePlay, extractPlays: extractPlays,
@@ -1711,8 +1737,8 @@
     var next = pickFirst(fwdResult);
     var prev = pickLast(backResult);
 
-    if ((!next || !prev) && state.league) {
-      var w = calendarProbeWindows(state.league, probeDate);
+    if (!next || !prev) {
+      var w = state.league ? calendarProbeWindows(state.league, probeDate) : fallbackProbeWindows(probeDate);
       var extra = [];
       if (!next && w.fwd) extra.push(probeDays(w.fwd[0], w.fwd[1], 1).then(pickFirst).then(function (d) { if (d) next = d; }));
       if (!prev && w.back) extra.push(probeDays(w.back[0], w.back[1], -1).then(pickLast).then(function (d) { if (d) prev = d; }));
@@ -2674,6 +2700,7 @@
     filterEventsForDate: filterEventsForDate,
     groupByDay: groupByDay,
     calendarProbeWindows: calendarProbeWindows,
+    fallbackProbeWindows: fallbackProbeWindows,
     parseEvent: parseEvent,
     parseNCAAOverview: parseNCAAOverview,
     parseNCAADetail: parseNCAADetail,

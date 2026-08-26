@@ -371,6 +371,11 @@ function waitForPort(url, ms) {
     assert.deepStrictEqual(w.back, ['20250111', '20250131']);
     assert.strictEqual(NB.calendarProbeWindows(null, '20260825').fwd, null);
   });
+  test('fallbackProbeWindows covers season boundaries without inventing games', () => {
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260826'), { fwd: null, back: ['20260101', '20260131'] });
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260715'), { fwd: ['20260822', '20260908'], back: ['20260101', '20260131'] });
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260110'), { fwd: ['20260111', '20260131'], back: ['20251215', '20251231'] });
+  });
 
   console.log('--- scoreboard parsing (real fixture) ---');
   const game = NB.parseEvent(sb);
