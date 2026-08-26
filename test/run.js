@@ -286,6 +286,17 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.eventMatchesGroups(upcoming, ['4']), true);
     assert.strictEqual(NB.eventMatchesGroups(upcoming, ['8']), false);
   });
+  test('single-day filtering keeps only the requested Eastern date', () => {
+    const events = NB.eventsOf(ncaaScoreboard);
+    assert.deepStrictEqual(NB.filterEventsForDate(events, '20260829').map((e) => e.id), ['6604316']);
+    assert.deepStrictEqual(NB.filterEventsForDate(events, '20260119').map((e) => e.id), ['6531855']);
+    assert.deepStrictEqual(NB.filterEventsForDate(events, '20260830'), []);
+  });
+  test('completed-event helper distinguishes final results from scheduled games', () => {
+    const events = NB.eventsOf(ncaaScoreboard);
+    assert.strictEqual(NB.eventIsCompleted(events.find((e) => e.id === '6531855')), true);
+    assert.strictEqual(NB.eventIsCompleted(events.find((e) => e.id === '6604316')), false);
+  });
   test('placeholder ESPN responses are rejected, while a real empty slate is valid', () => {
     assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [{}] }), false);
     assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [] }), true);

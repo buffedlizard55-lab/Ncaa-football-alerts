@@ -1,4 +1,5 @@
 {
+  "_fixture_note": "Field-exact NCAA-backed game overview for Army–Navy game 6458979 from https://ncaa-api.henrygd.me/game/6458979, verified live on 2026-08-26. Optional boxscore/play-by-play/team-stats payloads are covered by the test doubles.",
   "contests": [
     {
       "__typename": "Contest",

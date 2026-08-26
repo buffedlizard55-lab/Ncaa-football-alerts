@@ -1,4 +1,5 @@
 {
+  "_fixture_note": "Contest objects copied from real sdataprod.ncaa.com NCAA football scoreboard responses for 2026-08-29 and 2026-01-19, verified live on 2026-08-26. The two dates are intentionally combined here to exercise single-day filtering; production requests are date-specific.",
   "data": {
     "contests": [
       {

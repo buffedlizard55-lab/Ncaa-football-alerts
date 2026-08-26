@@ -177,6 +177,29 @@
     return '/api/espn?url=' + encodeURIComponent(url);
   }
 
+  // A provider outage must not multiply into dozens of identical relay/direct/
+  // proxy attempts for every conference and nearby date. Browser failures are
+  // kept short-lived so a transient outage can recover, while a failed
+  // transport is skipped for the other requests in the same refresh cycle.
+  // Keep this browser-only: the Node test runner intentionally exercises the
+  // raw transport order without sharing state between test cases.
+  var transportBackoffMs = 15000;
+  var transportUnavailableUntil = {};
+  function transportCall(key, fn) {
+    if (typeof window === 'undefined') return fn();
+    var now = Date.now();
+    if (transportUnavailableUntil[key] && transportUnavailableUntil[key] > now) {
+      return Promise.reject(new Error(key + ' temporarily unavailable'));
+    }
+    return Promise.resolve().then(fn).then(function (value) {
+      delete transportUnavailableUntil[key];
+      return value;
+    }, function (err) {
+      transportUnavailableUntil[key] = Date.now() + transportBackoffMs;
+      throw err;
+    });
+  }
+
   async function espnFetch(url, timeoutMs) {
     var t = timeoutMs || 12000;
     function attempt(u) {
@@ -215,24 +238,30 @@
 
     var lastErr = null;
     var candidates = providerUrls(url);
-    // Each provider host gets the controlled same-origin route first, then a
-    // direct request, then the browser-safe Reader transport. This makes the
-    // app work when the server relay cannot reach the provider and the direct
-    // request is blocked by browser CORS.
+    // The controlled same-origin route and direct provider hosts are tried for
+    // every verified provider candidate. Reader is intentionally tried only
+    // for the primary URL: it fetches that exact URL server-side, so repeating
+    // the same Reader request through ESPN's alternate hostname adds latency
+    // without adding an independent data source. If the primary host is down,
+    // the alternate direct/relay path still gets its chance before the older
+    // proxy chain.
     for (var i = 0; i < candidates.length; i++) {
       var candidate = candidates[i];
+      var host = new URL(candidate).hostname;
       var relay = sameOriginProxyUrl(candidate);
       if (relay) {
         try {
-          return { data: await attempt(relay), viaProxy: true, proxy: 'server', provider: candidate };
+          return { data: await transportCall('relay:' + host, function () { return attempt(relay); }), viaProxy: true, proxy: 'server', provider: candidate };
         } catch (err) { lastErr = err; }
       }
       try {
-        return { data: await attempt(candidate), viaProxy: false, proxy: null, provider: candidate };
+        return { data: await transportCall('direct:' + host, function () { return attempt(candidate); }), viaProxy: false, proxy: null, provider: candidate };
       } catch (err2) { lastErr = err2; }
-      try {
-        return { data: await attemptReader(candidate), viaProxy: true, proxy: 'jina-reader', provider: candidate };
-      } catch (err3) { lastErr = err3; }
+      if (i === 0) {
+        try {
+          return { data: await transportCall('reader:' + host, function () { return attemptReader(candidate); }), viaProxy: true, proxy: 'jina-reader', provider: candidate };
+        } catch (err3) { lastErr = err3; }
+      }
     }
 
     // Direct/provider calls and the Reader transport failed. Walk the older
@@ -240,7 +269,9 @@
     // are intentionally last because their availability is inconsistent.
     for (var j = 0; j < CORS_PROXIES.length; j++) {
       try {
-        var p = await attempt(CORS_PROXIES[j].build(url));
+        var p = await transportCall('cors:' + CORS_PROXIES[j].id, function () {
+          return attempt(CORS_PROXIES[j].build(url));
+        });
         return { data: p, viaProxy: true, proxy: CORS_PROXIES[j].id, provider: url };
       } catch (e) { lastErr = e; }
     }
@@ -514,6 +545,12 @@
     return eventsOf(data).filter(scoreboardEventIsUsable);
   }
 
+  function eventIsCompleted(event) {
+    var status = event && event.competitions && event.competitions[0] && event.competitions[0].status;
+    var type = status && status.type;
+    return !!(type && (type.state === 'post' || type.completed));
+  }
+
   function scoreboardPayloadIsUsable(data) {
     var items = scoreboardItemsOf(data);
     if (!items) return false;
@@ -537,6 +574,13 @@
   function filterEventsForGroups(events, groupIds) {
     return (events || []).filter(function (event) {
       return scoreboardEventIsUsable(event) && eventMatchesGroups(event, groupIds);
+    });
+  }
+
+  function filterEventsForDate(events, dateStr) {
+    return (events || []).filter(function (event) {
+      var date = event && event.date ? etDateFromWallclock(event.date) : null;
+      return date === dateStr;
     });
   }
 
@@ -1227,9 +1271,11 @@
       readerUrl: readerUrl, readerContentToData: readerContentToData, readerPayloadToData: readerPayloadToData,
       espnFetch: espnFetch, easternDateStr: easternDateStr, localDateStr: localDateStr, shiftDate: shiftDate,
       etDateFromWallclock: etDateFromWallclock, fmtDayLabel: fmtDayLabel,
-      eventsOf: eventsOf, validEventsOf: validEventsOf, scoreboardPayloadIsUsable: scoreboardPayloadIsUsable,
+      eventsOf: eventsOf, validEventsOf: validEventsOf, eventIsCompleted: eventIsCompleted,
+      scoreboardPayloadIsUsable: scoreboardPayloadIsUsable,
       scoreboardEventIsUsable: scoreboardEventIsUsable, eventMatchesGroups: eventMatchesGroups,
-      filterEventsForGroups: filterEventsForGroups, groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
+      filterEventsForGroups: filterEventsForGroups, filterEventsForDate: filterEventsForDate,
+      groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
       parseEvent: parseEvent, parseNCAAOverview: parseNCAAOverview, parseNCAADetail: parseNCAADetail,
       parseCompetitor: parseCompetitor, mergeEvents: mergeEvents, groupGames: groupGames,
       shouldOpenNextGameDay: shouldOpenNextGameDay, periodLabel: periodLabel, normalizePlay: normalizePlay, extractPlays: extractPlays,
@@ -1259,7 +1305,7 @@
     nearbyIndex: {},    // gameId -> parsed event (nearby rows are clickable)
     // Set only for a clean first visit. Once a game day is found, normal date
     // navigation remains entirely under the visitor's control.
-    defaultToNextGameDay: !location.hash,
+    defaultToNextGameDay: !location.hash || location.hash === '#' || location.hash === '#/',
     autoAdvanceToNextGameDay: false,
     view: 'scoreboard',
     gameId: null,
@@ -1325,9 +1371,39 @@
     var proxy = null;
     var provider = null;
 
+    // NCAA is a date-based fallback, so try it before fanning out to five
+    // conference requests. An ESPN empty response is also checked once: this
+    // covers a provider that says “no games” while the independently verified
+    // NCAA date feed has a real slate. A successful fallback is clean data, not
+    // an error banner about the provider that was skipped.
+    async function tryNCAA() {
+      try {
+        var ncaa = await espnFetch(ncaaScoreboardUrl(dateStr));
+        if (scoreboardPayloadIsUsable(ncaa.data)) return ncaa;
+        errors.push('NCAA returned no usable contests');
+      } catch (ncaaError) {
+        errors.push(String((ncaaError && ncaaError.message) || ncaaError));
+      }
+      return null;
+    }
+
     try {
       var all = await espnFetch(scoreboardUrl(dateStr));
       if (scoreboardPayloadIsUsable(all.data)) {
+        // A non-empty ESPN payload is authoritative for the selected date.
+        // Only cross-check a genuinely empty slate; this keeps the normal path
+        // at one request while preventing a false empty screen on a source
+        // disagreement.
+        if (validEventsOf(all.data).length) {
+          return { lists: [all.data], unfiltered: true, viaProxy: all.viaProxy, proxy: all.proxy, provider: all.provider, source: 'espn', errors: [] };
+        }
+        var ncaaForEmpty = await tryNCAA();
+        if (ncaaForEmpty) {
+          return { lists: [ncaaForEmpty.data], unfiltered: false, viaProxy: ncaaForEmpty.viaProxy, proxy: ncaaForEmpty.proxy, provider: ncaaForEmpty.provider, source: 'ncaa', errors: [] };
+        }
+        // Both sources returned an empty/unavailable fallback. The valid ESPN
+        // empty response is still a legitimate no-games result; do not turn a
+        // failed optional cross-check into a blocking error.
         return { lists: [all.data], unfiltered: true, viaProxy: all.viaProxy, proxy: all.proxy, provider: all.provider, source: 'espn', errors: [] };
       }
       errors.push('ESPN no-group response contained no usable events');
@@ -1335,9 +1411,17 @@
       errors.push(String((e && e.message) || e));
     }
 
-    // If the complete feed is unavailable or malformed, try each conference
-    // separately. This avoids losing a usable partial slate and also covers
-    // providers that only return conference events for filtered requests.
+    // If the complete feed is unavailable or malformed, use the exact NCAA
+    // contest-date query before retrying ESPN one conference at a time. This
+    // prevents a network outage from multiplying into five identical retries.
+    var ncaaFallback = await tryNCAA();
+    if (ncaaFallback) {
+      return { lists: [ncaaFallback.data], unfiltered: false, viaProxy: ncaaFallback.viaProxy, proxy: ncaaFallback.proxy, provider: ncaaFallback.provider, source: 'ncaa', errors: [] };
+    }
+
+    // If both complete feeds are unavailable, try each conference separately.
+    // This avoids losing a usable partial slate and also covers providers that
+    // only return conference events for filtered requests.
     var responses = await Promise.all(groupIds.map(function (gid) {
       return espnFetch(scoreboardUrl(dateStr, gid)).then(
         function (r) { return { ok: true, r: r, valid: scoreboardPayloadIsUsable(r.data) }; },
@@ -1359,20 +1443,8 @@
     });
 
     if (lists.length) {
-      return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'espn', errors: errors };
-    }
-
-    // The current NCAA persisted query is independently verified and returns
-    // complete `data.contests[]` objects. It is a real scoreboard fallback,
-    // not the old malformed GraphQL request.
-    try {
-      var ncaa = await espnFetch(ncaaScoreboardUrl(dateStr));
-      if (scoreboardPayloadIsUsable(ncaa.data)) {
-        return { lists: [ncaa.data], unfiltered: false, viaProxy: ncaa.viaProxy, proxy: ncaa.proxy, provider: ncaa.provider, source: 'ncaa', errors: errors };
-      }
-      errors.push('NCAA returned no usable contests');
-    } catch (ncaaError) {
-      errors.push(String((ncaaError && ncaaError.message) || ncaaError));
+      var hasEvents = lists.some(function (data) { return validEventsOf(data).length > 0; });
+      return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'espn', errors: hasEvents ? errors : [] };
     }
 
     return { lists: [], unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: null, errors: errors };
@@ -1399,6 +1471,11 @@
         // eventsOf; both paths are validated before they reach the parser.
         var rawEvents = validEventsOf(data);
         rawEvents = filterEventsForGroups(rawEvents, wantedGroups);
+        // Providers normally honor the single-day query. Keep the UI honest if
+        // a fallback response is cached, replayed, or accidentally contains a
+        // second date: selected-day rows must belong to the selected Eastern
+        // calendar date, not merely to the requested season.
+        rawEvents = filterEventsForDate(rawEvents, state.date);
         events.push(rawEvents);
         var league = (data && data.leagues && data.leagues[0]) || null;
         if (league && league.season) {
@@ -1413,7 +1490,8 @@
       state.proxy = out.proxy;
       state.provider = out.provider;
       state.source = out.source;
-      state.error = out.errors.length ? out.errors.join('; ') : null;
+      var uniqueErrors = out.errors.filter(function (message, index, all) { return message && all.indexOf(message) === index; });
+      state.error = uniqueErrors.length ? uniqueErrors.join('; ') : null;
       state.lastUpdated = new Date();
       state.loadedDate = state.date;
     } catch (e) {
@@ -1491,18 +1569,72 @@
     // Range discovery intentionally starts without `groups=`. That endpoint
     // was independently observed to return complete events, while the
     // comma-separated groups form returns `{}` placeholders. Filter the
-    // complete response locally, then retry each group separately only if the
-    // no-group range fails.
-    async function probeDays(from, to) {
+    // complete response locally, then use the exact NCAA date query only when
+    // the range has no matching day or is unusable.
+    async function probeNCAA(from, to, step) {
+      var direction = step < 0 ? -1 : 1;
+      var cursor = direction < 0 ? to : from;
+      var end = direction < 0 ? from : to;
+      var anyValid = false;
+      var viaProxy = false;
+      var proxy = null;
+      var provider = null;
+
+      // Nearby cards need only the closest matching day, not every date in the
+      // window. Scanning from the near edge and stopping at the first matching
+      // NCAA response avoids the old burst of up to 31 simultaneous requests
+      // and stays within the public provider's rate limit.
+      while ((direction > 0 && cursor <= end) || (direction < 0 && cursor >= end)) {
+        try {
+          var result = await espnFetch(ncaaScoreboardUrl(cursor), 8000);
+          if (scoreboardPayloadIsUsable(result.data)) {
+            anyValid = true;
+            viaProxy = viaProxy || result.viaProxy;
+            if (!proxy) proxy = result.proxy;
+            if (!provider) provider = result.provider;
+            var events = filterEventsForDate(
+              filterEventsForGroups(validEventsOf(result.data), groupIds),
+              cursor
+            );
+            if (direction < 0) events = events.filter(eventIsCompleted);
+            if (events.length) {
+              return { days: groupByDay(events), failed: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'ncaa' };
+            }
+          }
+        } catch (e) {}
+        cursor = shiftDate(cursor, direction);
+      }
+      return { days: [], failed: !anyValid, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'ncaa' };
+    }
+
+    async function probeDays(from, to, step) {
+      var direction = step < 0 ? -1 : 1;
       try {
         var all = await espnFetch(scoreboardRangeUrl(from, to));
         if (scoreboardPayloadIsUsable(all.data)) {
+          var rangeDays = groupByDay(filterEventsForGroups(validEventsOf(all.data), groupIds));
+          if (rangeDays.length) {
+            return {
+              days: rangeDays,
+              failed: false,
+              viaProxy: all.viaProxy,
+              proxy: all.proxy,
+              provider: all.provider,
+              source: 'espn'
+            };
+          }
+          // A valid empty ESPN range is not a network failure, but confirm it
+          // with the date-precise NCAA source so upcoming and prior cards are
+          // not lost when the providers disagree about an offseason slate.
+          var ncaaEmptyRange = await probeNCAA(from, to, direction);
+          if (ncaaEmptyRange.days.length) return ncaaEmptyRange;
           return {
-            days: groupByDay(filterEventsForGroups(validEventsOf(all.data), groupIds)),
+            days: [],
             failed: false,
             viaProxy: all.viaProxy,
             proxy: all.proxy,
-            provider: all.provider
+            provider: all.provider,
+            source: 'espn'
           };
         }
       } catch (e) {}
@@ -1526,10 +1658,10 @@
         if (!provider) provider = result.r.provider;
       });
       var days = anyValid ? groupByDay(filterEventsForGroups(events, groupIds)) : [];
-      if (days.length || anyValid) {
+      if (days.length) {
         return {
           days: days,
-          failed: !anyValid,
+          failed: false,
           viaProxy: viaProxy,
           proxy: proxy,
           provider: provider,
@@ -1537,50 +1669,38 @@
         };
       }
 
-      // If ESPN's ranged endpoint and its per-group form are both
-      // unavailable, fall back to the official NCAA date query one day at a
-      // time. The query is date-based, so this remains correct across week,
-      // month, and season boundaries. This path is deliberately lazy: it is
-      // only used for adjacent-day discovery after ESPN has already failed.
-      var ncaaDates = [];
-      var cursor = from;
-      while (cursor <= to && ncaaDates.length < 31) {
-        ncaaDates.push(cursor);
-        cursor = shiftDate(cursor, 1);
+      // If ESPN's ranged endpoint and its per-group form are both unavailable
+      // (or only returned valid empty payloads), fall back to the official NCAA
+      // date query one day at a time. The scan is directional and stops at the
+      // closest matching day, so a previous-result card cannot accidentally
+      // select the oldest event in the window.
+      var ncaaResult = await probeNCAA(from, to, direction);
+      if (ncaaResult.days.length || ncaaResult.failed || anyValid) {
+        if (!ncaaResult.failed || !anyValid) return ncaaResult;
+        return {
+          days: [],
+          failed: false,
+          viaProxy: viaProxy || ncaaResult.viaProxy,
+          proxy: proxy || ncaaResult.proxy,
+          provider: provider || ncaaResult.provider,
+          source: 'espn'
+        };
       }
-      var ncaaResults = await Promise.all(ncaaDates.map(function (date) {
-        return espnFetch(ncaaScoreboardUrl(date)).then(
-          function (r) { return { ok: scoreboardPayloadIsUsable(r.data), r: r }; },
-          function () { return { ok: false }; }
-        );
-      }));
-      var ncaaEvents = [];
-      var ncaaValid = false;
-      var ncaaViaProxy = false;
-      var ncaaProxy = null;
-      var ncaaProvider = null;
-      ncaaResults.forEach(function (result) {
-        if (!result.ok) return;
-        ncaaValid = true;
-        ncaaEvents = ncaaEvents.concat(validEventsOf(result.r.data));
-        if (result.r.viaProxy) { ncaaViaProxy = true; if (!ncaaProxy) ncaaProxy = result.r.proxy; }
-        if (!ncaaProvider) ncaaProvider = result.r.provider;
-      });
-      return {
-        days: groupByDay(filterEventsForGroups(ncaaEvents, groupIds)),
-        failed: !ncaaValid,
-        viaProxy: ncaaViaProxy,
-        proxy: ncaaProxy,
-        provider: ncaaProvider,
-        source: 'ncaa'
-      };
+      return ncaaResult;
     }
     function pickFirst(result) { return result && result.days.length ? result.days[0] : null; }
-    function pickLast(result) { return result && result.days.length ? result.days[result.days.length - 1] : null; }
+    function pickLast(result) {
+      if (!result || !result.days.length) return null;
+      for (var i = result.days.length - 1; i >= 0; i--) {
+        var completed = result.days[i].events.filter(eventIsCompleted);
+        if (completed.length) return { date: result.days[i].date, events: completed };
+      }
+      return null;
+    }
 
     var results = await Promise.all([
-      probeDays(shiftDate(probeDate, 1), shiftDate(probeDate, 14)),
-      probeDays(shiftDate(probeDate, -14), shiftDate(probeDate, -1))
+      probeDays(shiftDate(probeDate, 1), shiftDate(probeDate, 14), 1),
+      probeDays(shiftDate(probeDate, -14), shiftDate(probeDate, -1), -1)
     ]);
     var fwdResult = results[0];
     var backResult = results[1];
@@ -1590,8 +1710,8 @@
     if ((!next || !prev) && state.league) {
       var w = calendarProbeWindows(state.league, probeDate);
       var extra = [];
-      if (!next && w.fwd) extra.push(probeDays(w.fwd[0], w.fwd[1]).then(pickFirst).then(function (d) { if (d) next = d; }));
-      if (!prev && w.back) extra.push(probeDays(w.back[0], w.back[1]).then(pickLast).then(function (d) { if (d) prev = d; }));
+      if (!next && w.fwd) extra.push(probeDays(w.fwd[0], w.fwd[1], 1).then(pickFirst).then(function (d) { if (d) next = d; }));
+      if (!prev && w.back) extra.push(probeDays(w.back[0], w.back[1], -1).then(pickLast).then(function (d) { if (d) prev = d; }));
       if (extra.length) await Promise.all(extra);
     }
 
@@ -1671,12 +1791,15 @@
     var aScore = g.away.score, hScore = g.home.score;
     var showScore = done || live;
     var scoresHtml = showScore
-      ? '<span class="' + (done && g.away.winner ? 'winner' : '') + '">' + (aScore === null ? '0' : aScore) + '</span>' +
-        '<span class="' + (done && g.home.winner ? 'winner' : '') + '">' + (hScore === null ? '0' : hScore) + '</span>'
+      ? '<span class="' + (done && g.away.winner ? 'winner' : '') + '">' + (aScore === null ? '—' : aScore) + '</span>' +
+        '<span class="' + (done && g.home.winner ? 'winner' : '') + '">' + (hScore === null ? '—' : hScore) + '</span>'
       : '<span class="pending">–</span><span class="pending">–</span>';
 
     var linesHtml = '';
-    if (showScore) {
+    // Some NCAA scoreboard rows expose a final score but no per-period
+    // linescores. Do not render invented zeroes in that case; the final score
+    // remains visible and the detail view can provide linescores when available.
+    if (showScore && (g.away.linescores.length || g.home.linescores.length)) {
       var cols = lineColumns(g);
       function sideLine(t) {
         return cols.map(function (i) {
@@ -2120,11 +2243,12 @@
     }
     gh += side(away, 'away');
 
-    var lines = '<div class="gh-lines"><span></span>';
-    if (g) {
+    var lines = '';
+    if (g && (g.away.linescores.length || g.home.linescores.length)) {
+      lines = '<div class="gh-lines"><span></span>';
       var cols = lineColumns(g);
       cols.forEach(function (i) { lines += '<span class="hl-h">' + esc(periodLabel(i)) + '</span>'; });
-      lines += '<span class="hl-h">T</span></div>';
+      lines += '<span class="hl-h">T</span>';
       var aTotal = 0, hTotal = 0;
       lines += '<span>A</span>';
       cols.forEach(function (i) {
@@ -2132,18 +2256,21 @@
         aTotal += ls ? (Number(ls.value) || 0) : 0;
         lines += '<span>' + (ls ? esc(String(ls.value)) : '0') + '</span>';
       });
-      lines += '<span class="hl-h">' + (aS !== null ? aS : aTotal) + '</span></div>';
+      lines += '<span class="hl-h">' + (aS !== null && aS !== undefined ? esc(String(aS)) : aTotal) + '</span></div>';
       lines += '<span>H</span>';
       cols.forEach(function (i) {
         var ls2 = g.home.linescores.find(function (x) { return x.period === i; });
         hTotal += ls2 ? (Number(ls2.value) || 0) : 0;
         lines += '<span>' + (ls2 ? esc(String(ls2.value)) : '0') + '</span>';
       });
-      lines += '<span class="hl-h">' + (hS !== null ? hS : hTotal) + '</span></div>';
+      lines += '<span class="hl-h">' + (hS !== null && hS !== undefined ? esc(String(hS)) : hTotal) + '</span></div>';
+    } else if (g) {
+      // A scoreboard can provide a total without per-period detail. Leave the
+      // split empty rather than displaying fabricated zeroes.
+      lines = '<div class="gh-lines" aria-label="Per-period scores unavailable"></div>';
     } else {
-      lines += '<span></span><span></span><span></span><span></span><span></span></div>';
-      lines += '<span>A</span><span></span><span></span><span></span><span></span><span></span></div>';
-      lines += '<span>H</span><span></span><span></span><span></span><span></span><span></span></div>';
+      // Deep-link detail can render before its scoreboard event is resolved.
+      lines = '<div class="gh-lines" aria-label="Per-period scores unavailable"></div>';
     }
 
     var meta = [];
@@ -2535,10 +2662,12 @@
     fmtDayLabel: fmtDayLabel,
     eventsOf: eventsOf,
     validEventsOf: validEventsOf,
+    eventIsCompleted: eventIsCompleted,
     scoreboardPayloadIsUsable: scoreboardPayloadIsUsable,
     scoreboardEventIsUsable: scoreboardEventIsUsable,
     eventMatchesGroups: eventMatchesGroups,
     filterEventsForGroups: filterEventsForGroups,
+    filterEventsForDate: filterEventsForDate,
     groupByDay: groupByDay,
     calendarProbeWindows: calendarProbeWindows,
     parseEvent: parseEvent,

@@ -55,13 +55,17 @@ operation instead of five independent requests. It does **not** rely on a
 comma-separated group list. During the live investigation,
 `groups=1,8,5,4,151` returned placeholder `{}` events even though the HTTP
 response was successful. If the no-group request fails or contains only
-placeholders, the loader retries one conference at a time, merges and
-deduplicates usable events, and then falls back to NCAA.
+placeholders, the loader checks the exact NCAA contest-date query before
+retrying one conference at a time. If the fallback returns a usable NCAA
+slate, it is rendered directly; otherwise the per-conference ESPN recovery
+path still merges and deduplicates any usable events.
 
-This distinction fixes the original blank-scoreboard behavior: an empty
-placeholder response is not treated as a legitimate no-games response. It also
-makes the first page faster and gives the UI a single, inspectable primary
-request.
+A genuinely empty ESPN response is cross-checked once with NCAA as well. This
+covers a source disagreement without multiplying requests on the normal
+non-empty path. An empty placeholder response is never treated as a legitimate
+no-games response. These distinctions fix the original blank-scoreboard
+behavior and keep the first page's normal path to one inspectable request plus
+at most one exact fallback check.
 
 ### Browser-safe Reader transport fallback
 
@@ -155,11 +159,13 @@ scoreboard day.
 
 For each loaded date, nearby discovery requests the next and previous 14-day
 windows without `groups=` and filters the complete event objects locally. If a
-range fails, it retries one request per enabled conference; if those requests
-also fail, it lazily checks the same dates through the official NCAA date
-query. The current season calendar is also used for an offseason jump window
-when ESPN supplies one. Results are grouped by Eastern day and remain
-clickable.
+range returns no matching day or is unusable, it retries one request per
+enabled conference when possible, then scans the exact NCAA date query from
+the near edge of the window and stops at the first matching day. A valid empty
+range is kept as a non-network-error result, but is still checked against NCAA
+so a provider disagreement cannot hide an upcoming or prior slate. The
+current season calendar is also used for an offseason jump window when ESPN
+supplies one. Results are grouped by Eastern day and remain clickable.
 
 On a clean visit, the current day is kept if it contains a live or scheduled
 game. If it is empty or final-only, the closest future game day is selected
@@ -215,19 +221,29 @@ Current verification performed on **2026-08-26**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-7. `npm test` passes **65 offline checks**, including syntax, URL construction,
+7. `npm test` passes **67 offline checks**, including syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
-   scoreboard/detail parsing, conference filtering, real ESPN fixtures, date
-   boundaries, merge/deduplication, live and final view models, and the
-   running server's health/static/security routes.
+   scoreboard/detail parsing, conference filtering, single-day date filtering,
+   real ESPN fixtures, date boundaries, merge/deduplication, live and final
+   view models, and the running server's health/static/security routes.
 
-The sandbox has no installed browser executable and its server-side outbound
-TLS path to ESPN is restricted, so `npm test` cannot itself prove a remote
-browser's CORS handshake or a full live-game watch. The browser path now has
-three progressively independent ways to receive real provider data: the
+A real Chromium browser was also executed against the running local app using
+an extracted Chromium binary and its bundled NSS/NSPR libraries. The actual
+page rendered without a `pageerror`, and the browser captured the same-origin
+relay, direct-provider, Reader, and public-proxy attempts. In this sandbox,
+all live upstream requests were blocked or reset, so that run honestly showed
+`games: 0` and the visible network error. It proves the browser shell and
+failure state, not successful live data delivery.
+
+A separate real-browser smoke run intercepted the provider requests with
+known response bodies and rendered the NCAA fallback's live/upcoming/final
+rows, the adjacent upcoming/recent cards, and the fresh-visit next-game-day
+navigation. That proves the end-to-end DOM path with a browser, but it is not a
+live-provider proof. The browser path has three progressively independent ways
+to receive real provider data in an environment with outbound access: the
 same-origin relay, direct provider fetch, and the documented Reader transport.
-The UI also shows source/provider diagnostics and an explicit network error
-instead of rendering an unexplained blank slate if all three are unavailable.
+The UI shows source/provider diagnostics and an explicit network error instead
+of rendering an unexplained blank slate if all are unavailable.
 
 ## Files
 
