@@ -57,10 +57,48 @@
     return API_BASE + '/summary?event=' + encodeURIComponent(gameId);
   }
 
-  // Fallback route for browsers whose network blocks direct cross-origin
-  // calls (CORS). Only used when the direct fetch fails.
+  // Free NCAA.com scoreboard source. Its documented GraphQL scoreboard uses
+  // contestDate rather than ESPN's dates parameter. The operation hash and
+  // field names below come from the ncaa-api source, not an invented schema.
+  var NCAA_SCOREBOARD_HASH = '7287cda610a9326931931080cb3a604828febe6fe3c9016a7e4a36db99efdb7c';
+  function ncaaScoreboardUrl(dateStr) {
+    var y = Number(String(dateStr).slice(0, 4));
+    var month = Number(String(dateStr).slice(4, 6));
+    var seasonYear = month < 8 ? y - 1 : y;
+    var variables = { sportCode: 'MFB', division: 11, seasonYear: seasonYear, contestDate: dateStr.slice(0, 4) + '-' + dateStr.slice(4, 6) + '-' + dateStr.slice(6, 8) };
+    return 'https://sdataprod.ncaa.com/?extensions=' + encodeURIComponent(JSON.stringify({ persistedQuery: { version: 1, sha256Hash: NCAA_SCOREBOARD_HASH } })) + '&variables=' + encodeURIComponent(JSON.stringify(variables));
+  }
+
+  // Fallback routes for browsers whose network blocks direct cross-origin
+  // calls (CORS). The direct call to site.api.espn.com is always tried first;
+  // if it fails we walk this list of public CORS proxies in order. The original
+  // allorigins.win entry stays first (it is the documented fallback and the one
+  // the tests cover). If a single third-party proxy is down — exactly the
+  // failure the README observed on 2026-08-25 (allorigins returned Cloudflare
+  // 522) — the next proxy is still tried, so the site does not silently die.
+  var CORS_PROXIES = [
+    { id: 'allorigins',   build: function (url) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url); } },
+    { id: 'corsproxy.io', build: function (url) { return 'https://corsproxy.io/?url=' + encodeURIComponent(url); } },
+    { id: 'codetabs',     build: function (url) { return 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url); } }
+  ];
+
+  // Every proxy URL for a given ESPN URL, in priority order.
+  function proxyUrls(url) {
+    return CORS_PROXIES.map(function (p) { return p.build(url); });
+  }
+
+  // Backward-compatible single-proxy builder (the historical name used by the
+  // test suite; returns the first/primary proxy).
   function proxiedUrl(url) {
-    return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url);
+    return CORS_PROXIES[0].build(url);
+  }
+
+  // Prefer the app's same-origin server relay in the browser. This avoids
+  // depending on ESPN's browser CORS headers or on a public proxy. Node tests
+  // do not have `location`, so they continue to exercise the direct path.
+  function sameOriginProxyUrl(url) {
+    if (typeof location === 'undefined' || !location.origin) return null;
+    return '/api/espn?url=' + encodeURIComponent(url);
   }
 
   async function espnFetch(url, timeoutMs) {
@@ -69,19 +107,37 @@
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, t);
       return fetch(u, { signal: ctrl.signal, headers: { Accept: 'application/json' } })
-        .then(function (res) {
-          if (!res.ok) throw new Error('HTTP ' + res.status);
+        .then(async function (res) {
+          if (!res.ok) {
+            var body = '';
+            try { body = await res.text(); } catch (ignore) {}
+            var detail = '';
+            try { detail = (JSON.parse(body).detail || JSON.parse(body).error || ''); } catch (ignore2) {}
+            throw new Error('HTTP ' + res.status + (detail ? ': ' + detail : ''));
+          }
           return res.json();
         })
         .finally(function () { clearTimeout(timer); });
     }
+    var lastErr = null;
+    var relay = sameOriginProxyUrl(url);
+    if (relay) {
+      try {
+        return { data: await attempt(relay), viaProxy: true, proxy: 'server' };
+      } catch (err) { lastErr = err; }
+    }
     try {
       var data = await attempt(url);
-      return { data: data, viaProxy: false };
-    } catch (err) {
-      var p = await attempt(proxiedUrl(url));
-      return { data: p, viaProxy: true };
+      return { data: data, viaProxy: false, proxy: null };
+    } catch (err2) { lastErr = err2; }
+    // Direct call failed. Walk the public proxy chain as a last resort.
+    for (var i = 0; i < CORS_PROXIES.length; i++) {
+      try {
+        var p = await attempt(CORS_PROXIES[i].build(url));
+        return { data: p, viaProxy: true, proxy: CORS_PROXIES[i].id };
+      } catch (e) { lastErr = e; }
     }
+    throw lastErr;
   }
 
   /* ---------------- Date helpers ---------------- */
@@ -152,8 +208,32 @@
   // Scoreboard events live at the TOP level of the response —
   // {"leagues":[...],"events":[...]} — verified in every live dump
   // (2026-08-25). They are NOT inside leagues[0].
+  function ncaaEventsOf(data) {
+    var contests = data && data.data && data.data.contests;
+    if (!Array.isArray(contests)) return [];
+    return contests.map(function (c) {
+      var teams = Array.isArray(c.teams) ? c.teams : [];
+      var away = teams.find(function (t) { return t && t.isHome === false; });
+      var home = teams.find(function (t) { return t && t.isHome === true; });
+      if (!away || !home) return null;
+      var state = c.gameState === 'F' ? 'post' : c.gameState === 'I' ? 'in' : 'pre';
+      // The live NCAA response uses startDate=MM/DD/YYYY and startTimeEpoch.
+      // Epoch is the unambiguous value, so use it when present; this also
+      // preserves the correct Eastern day around midnight.
+      var iso = c.startTimeEpoch ? new Date(Number(c.startTimeEpoch) * 1000).toISOString() : '';
+      if (!iso && c.startDate) {
+        var md = String(c.startDate).match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+        if (md) iso = md[3] + '-' + md[1] + '-' + md[2] + 'T' + (c.startTime || '00:00') + ':00Z';
+      }
+      return { id: String(c.contestId || ''), date: iso, name: (away.nameShort || '?') + ' at ' + (home.nameShort || '?'),
+        competitions: [{ status: { type: { state: state, completed: state === 'post', description: c.finalMessage || '', shortDetail: c.finalMessage || '' }, period: Number(c.currentPeriod) || 0, displayClock: c.contestClock || '0:00' },
+          competitors: [{ homeAway: 'away', score: away.score, winner: !!away.isWinner, team: { abbreviation: away.name6Char || away.nameShort || '?', displayName: away.nameShort || '?', shortDisplayName: away.nameShort || '?' } },
+            { homeAway: 'home', score: home.score, winner: !!home.isWinner, team: { abbreviation: home.name6Char || home.nameShort || '?', displayName: home.nameShort || '?', shortDisplayName: home.nameShort || '?' } }] }] };
+    }).filter(Boolean);
+  }
+
   function eventsOf(data) {
-    return (data && data.events) || [];
+    return (data && data.events) || ncaaEventsOf(data);
   }
 
   // Group ranged-response events by the Eastern date they were played on —
@@ -587,9 +667,9 @@
    * ================================================================ */
   if (typeof document === 'undefined') {
     return {
-      API_BASE: API_BASE, CONFERENCES: CONFERENCES,
+      API_BASE: API_BASE, CONFERENCES: CONFERENCES, CORS_PROXIES: CORS_PROXIES,
       scoreboardUrl: scoreboardUrl, scoreboardRangeUrl: scoreboardRangeUrl,
-      summaryUrl: summaryUrl, proxiedUrl: proxiedUrl,
+      ncaaScoreboardUrl: ncaaScoreboardUrl, summaryUrl: summaryUrl, proxiedUrl: proxiedUrl, proxyUrls: proxyUrls,
       espnFetch: espnFetch, easternDateStr: easternDateStr, localDateStr: localDateStr, shiftDate: shiftDate,
       etDateFromWallclock: etDateFromWallclock, fmtDayLabel: fmtDayLabel,
       eventsOf: eventsOf, groupByDay: groupByDay, calendarProbeWindows: calendarProbeWindows,
@@ -611,6 +691,7 @@
     error: null,
     lastUpdated: null,
     viaProxy: false,
+    proxy: null,        // which CORS proxy is in use, when viaProxy is true
     weekLabel: '',
     seasonYear: null,
     league: null,       // leagues[0] of the loaded day (calendar for nearby windows)
@@ -674,14 +755,20 @@
   // union verified live 2026-08-25) and falls back to the old per-conference
   // parallel requests if the combined call fails for any reason.
   async function fetchDay(dateStr, groupIds) {
-    function unwrap(r) { return { lists: [r.data], viaProxy: r.viaProxy, errors: [] }; }
+    function unwrap(r) { return { lists: [r.data], viaProxy: r.viaProxy, proxy: r.proxy, errors: [] }; }
     if (groupIds.length) {
       try {
         return unwrap(await espnFetch(scoreboardUrl(dateStr, groupIds.join(','))));
       } catch (e) {
+        // Free NCAA.com-backed fallback. It is scoreboard-only; ESPN remains
+        // the source for game summaries and play-by-play.
+        try {
+          return unwrap(await espnFetch(ncaaScoreboardUrl(dateStr)));
+        } catch (ncaaError) {}
         var errors = [String((e && e.message) || e)];
         var lists = [];
         var viaProxy = false;
+        var proxy = null;
         var rs = await Promise.all(groupIds.map(function (gid) {
           return espnFetch(scoreboardUrl(dateStr, gid)).then(
             function (r) { return { ok: true, r: r }; },
@@ -689,14 +776,16 @@
           );
         }));
         rs.forEach(function (x) {
-          if (x.ok) { lists.push(x.r.data); if (x.r.viaProxy) viaProxy = true; }
-          else errors.push(x.err);
+          if (x.ok) {
+            lists.push(x.r.data);
+            if (x.r.viaProxy) { viaProxy = true; if (!proxy) proxy = x.r.proxy; }
+          } else errors.push(x.err);
         });
-        return { lists: lists, viaProxy: viaProxy, errors: errors };
+        return { lists: lists, viaProxy: viaProxy, proxy: proxy, errors: errors };
       }
     }
     // No conference selected: no request (matches the previous behavior).
-    return { lists: [], viaProxy: false, errors: [] };
+    return { lists: [], viaProxy: false, proxy: null, errors: [] };
   }
 
   async function loadScoreboard(showSpinner) {
@@ -723,23 +812,24 @@
 
       state.games = mergeEvents(events);
       state.viaProxy = out.viaProxy;
+      state.proxy = out.proxy;
       state.error = out.errors.length ? out.errors.join('; ') : null;
       state.lastUpdated = new Date();
       state.loadedDate = state.date;
     } catch (e) {
       state.error = 'Could not load the scoreboard: ' + ((e && e.message) || e) +
-        (state.viaProxy ? ' (direct and proxy requests both failed)' : '');
+        (state.viaProxy ? ' (direct and CORS-proxy requests both failed)' : '');
     }
     state.loading = false;
     // A clean visit is useful even if today contains only final scores: open
     // the next day that has a scheduled game instead. On any later navigation
     // we preserve the selected day's normal scoreboard/nearby-results view.
     var discoverNext = state.defaultToNextGameDay && shouldOpenNextGameDay(state.games);
-    if (state.games.length && !discoverNext) {
-      state.nearby = null;
-      state.nearbyIndex = {};
-      state.nearbyFor = null;
-    } else if (!state.error && state.nearbyFor !== state.date && enabledGroupIds().length) {
+    if (state.nearbyFor !== state.date && enabledGroupIds().length) {
+      // Always look for the surrounding games, not only on empty days. This
+      // keeps upcoming and recent results visible below a non-empty slate too.
+      // It also means a single-day failure (or a transient one) cannot
+      // dead-end the scoreboard into an empty page.
       state.nearbyFor = state.date;
       findNearby(); // async; renders itself when done
     }
@@ -818,8 +908,9 @@
     }
 
     // The user may have navigated away or changed the search while probing —
-    // drop stale results.
-    if (run !== nearbyRun || state.view !== 'scoreboard' || state.loadedDate !== probeDate || state.games.length) return;
+    // drop stale results. Nearby data is useful on both empty and non-empty
+    // scoreboard days, so the presence of games is not a reason to discard it.
+    if (run !== nearbyRun || state.view !== 'scoreboard' || state.loadedDate !== probeDate) return;
 
     state.nearby = {
       loading: false,
@@ -855,7 +946,7 @@
     });
     if (state.games.length) {
       html += '<span class="chip-count">' + state.games.length + ' game' + (state.games.length === 1 ? '' : 's') +
-        (state.viaProxy ? ' • via CORS proxy' : '') +
+        (state.viaProxy ? ' • via ' + (state.proxy || 'CORS proxy') : '') +
         (state.lastUpdated ? ' • updated ' + state.lastUpdated.toLocaleTimeString() : '') + '</span>';
     }
     subbar.innerHTML = html;
@@ -983,6 +1074,9 @@
         html += '<div class="grouplabel' + (i === 0 ? ' first' : '') + '">' + esc(s.label) + ' (' + s.games.length + ')</div>';
         s.games.forEach(function (g) { html += gameRowHtml(g, state.date); });
       });
+      // Keep the adjacent upcoming slate and latest completed slate visible
+      // even when the selected date itself has games.
+      html += nearbyHtml();
     }
     main.innerHTML = html;
   }
@@ -1004,6 +1098,7 @@
       var r = await espnFetch(summaryUrl(state.gameId));
       state.detail = parseSummary(r.data);
       state.viaProxy = r.viaProxy;
+      if (r.viaProxy) state.proxy = r.proxy;
       state.detail.plays.forEach(function (p) { state.seenPlayIds[p.id] = true; });
       if (!state.game) {
         await resolveGameEvent();
@@ -1046,7 +1141,10 @@
         state.weekLabel = weekForDate(league.calendar || [], et);
         state.date = et;
         state.loadedDate = et;
-        state.viaProxy = r.viaProxy || state.viaProxy;
+        if (r.viaProxy || state.viaProxy) {
+          state.viaProxy = r.viaProxy || state.viaProxy;
+          if (r.proxy) state.proxy = r.proxy;
+        }
       }
     } catch (e) {
       // Non-fatal: the header still renders from summary data.
@@ -1067,7 +1165,10 @@
       var prevCount = Object.keys(prevIds).length;
       var hadDetail = !!state.detail;
       state.detail = parseSummary(r.data);
-      state.viaProxy = r.viaProxy || state.viaProxy;
+      if (r.viaProxy || state.viaProxy) {
+        state.viaProxy = r.viaProxy || state.viaProxy;
+        if (r.proxy) state.proxy = r.proxy;
+      }
       var newPlayIds = [];
       state.detail.plays.forEach(function (p) {
         if (!prevIds[p.id]) {
@@ -1449,6 +1550,7 @@
       } : null,
       lastUpdated: state.lastUpdated ? state.lastUpdated.toLocaleTimeString() : null,
       viaProxy: state.viaProxy,
+      proxy: state.proxy,
       error: state.error
     };
     if (state.detail) {
@@ -1578,11 +1680,14 @@
   return {
     state: state,
     CONFERENCES: CONFERENCES,
+    CORS_PROXIES: CORS_PROXIES,
     API_BASE: API_BASE,
     scoreboardUrl: scoreboardUrl,
     scoreboardRangeUrl: scoreboardRangeUrl,
+    ncaaScoreboardUrl: ncaaScoreboardUrl,
     summaryUrl: summaryUrl,
     proxiedUrl: proxiedUrl,
+    proxyUrls: proxyUrls,
     espnFetch: espnFetch,
     easternDateStr: easternDateStr,
     localDateStr: localDateStr,

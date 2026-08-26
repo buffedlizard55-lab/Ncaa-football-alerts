@@ -4,6 +4,7 @@
  * Binds to 0.0.0.0 so it works inside the preview proxy.
  */
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
@@ -35,6 +36,42 @@ const server = http.createServer((req, res) => {
   if (pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, service: 'ncaa-football-scoreboard' }));
+  }
+
+  // Same-origin data relay. The browser calls this route instead of making a
+  // cross-origin request, so provider CORS policy cannot blank the scoreboard.
+  // Keep both provider targets allowlisted; this must never become an open proxy.
+  if (pathname === '/api/espn') {
+    let target;
+    try {
+      const rawTarget = new URL(req.url, 'http://localhost').searchParams.get('url');
+      target = new URL(rawTarget || 'invalid:');
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'A valid ESPN API URL is required' }));
+    }
+    const allowedEspn = target.hostname === 'site.api.espn.com' && target.pathname.startsWith('/apis/site/v2/');
+    const allowedNcaa = target.hostname === 'sdataprod.ncaa.com' && target.pathname === '/';
+    if (target.protocol !== 'https:' || (!allowedEspn && !allowedNcaa)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Only the ESPN site API is allowed' }));
+    }
+    const upstream = https.get(target, {
+      headers: { Accept: 'application/json', 'User-Agent': 'ncaa-football-scoreboard' },
+      timeout: 15000,
+    }, (up) => {
+      res.writeHead(up.statusCode || 502, {
+        'Content-Type': up.headers['content-type'] || 'application/json',
+        'Cache-Control': 'no-store',
+      });
+      up.pipe(res);
+    });
+    upstream.on('timeout', () => upstream.destroy(new Error('ESPN request timed out')));
+    upstream.on('error', (err) => {
+      if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
+      if (!res.writableEnded) res.end(JSON.stringify({ error: 'ESPN relay failed', detail: err.message }));
+    });
+    return;
   }
 
   if (pathname === '/') pathname = '/index.html';
