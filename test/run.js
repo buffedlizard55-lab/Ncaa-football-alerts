@@ -7,9 +7,10 @@
  *    fixtures (see test/fixtures/*.json headers for provenance)
  *  - boots the actual server on a port and checks its routes
  *
- * The live-network path (fetching ESPN from the browser) is verified in the
- * live preview; see README.md "Verification" for what was checked against the
- * real API on 2026-08-25.
+ * Live provider contracts were independently probed on 2026-08-27; this
+ * offline runner does not pretend to prove a remote browser's network/CORS
+ * environment. Reader fallback parsing is covered with representative
+ * response envelopes.
  */
 const { execFileSync, spawn } = require('child_process');
 const path = require('path');
@@ -67,6 +68,8 @@ function waitForPort(url, ms) {
   const NB = require(path.join(ROOT, 'app.js'));
   const sb = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'scoreboard-event.json'), 'utf8'));
   const sum = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'summary.json'), 'utf8'));
+  const ncaaScoreboard = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ncaa-scoreboard.json'), 'utf8'));
+  const ncaaGame = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ncaa-game.json'), 'utf8'));
 
   console.log('--- URL builders ---');
   test('scoreboardUrl single date', () => {
@@ -76,8 +79,9 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.scoreboardUrl('20260829', '8'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300&groups=8');
   });
   test('scoreboardUrl combined groups keep raw commas (verified form)', () => {
-    // groups=8,5 on 2025-11-08 returned the union (11 events) when called
-    // live with raw commas — %2C has not been verified, so never encode them.
+    // The builder remains available for diagnostics, but the live loader
+    // deliberately never sends this combined form because current responses
+    // contain placeholder events for comma-separated groups.
     const u = NB.scoreboardUrl('20251108', '1,8,5,4,151');
     assert.ok(u.endsWith('&groups=1,8,5,4,151'));
     assert.ok(u.indexOf('%2C') === -1);
@@ -103,6 +107,39 @@ function waitForPort(url, ms) {
   test('summaryUrl uses event= (not gameId=)', () => {
     assert.strictEqual(NB.summaryUrl('401752763'), 'https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401752763');
   });
+  test('provider fallback uses the independently verified ESPN web host', () => {
+    assert.deepStrictEqual(NB.providerUrls(NB.scoreboardUrl('20260829')), [
+      'https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300',
+      'https://site.web.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829&limit=300'
+    ]);
+    assert.deepStrictEqual(NB.providerUrls(NB.ncaaScoreboardUrl('20260829')), [NB.ncaaScoreboardUrl('20260829')]);
+  });
+  test('Reader transport URL keeps the provider target and adds a short cache bucket', () => {
+    const reader = NB.readerUrl('https://site.api.espn.com/apis/x?a=1&b=2');
+    assert.ok(reader.startsWith('https://r.jina.ai/http://site.api.espn.com/apis/x?'));
+    assert.ok(reader.indexOf('a=1&b=2') !== -1);
+    assert.ok(/&_ncbs=\d+$/.test(reader));
+  });
+  test('Reader text and JSON-envelope responses normalize to provider data', () => {
+    assert.deepStrictEqual(NB.readerPayloadToData('Title: ESPN\n\nMarkdown Content:\n{"events":[]}'), { events: [] });
+    assert.deepStrictEqual(NB.readerPayloadToData(JSON.stringify({ code: 200, data: { content: '{"data":{"contests":[]}}' } })), { data: { contests: [] } });
+    assert.deepStrictEqual(NB.readerPayloadToData(JSON.stringify({ code: 200, data: '{"events":[]}' })), { events: [] });
+  });
+  test('GitHub Pages is recognized as static and skips the server-only relay', () => {
+    assert.strictEqual(NB.isGitHubPagesHost('buffedlizard55-lab.github.io'), true);
+    assert.strictEqual(NB.isGitHubPagesHost('github.io'), true);
+    assert.strictEqual(NB.isGitHubPagesHost('www.github.com'), false);
+    assert.strictEqual(NB.isGitHubPagesHost('example.github.io.evil.test'), false);
+    // Node has no browser location, so the runtime detector must not claim that
+    // the offline test process is a static deployment.
+    assert.strictEqual(NB.isStaticDeployment(), false);
+  });
+  test('NCAA game detail URL builders stay on the retained public host', () => {
+    assert.strictEqual(NB.ncaaGameUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979');
+    assert.strictEqual(NB.ncaaBoxscoreUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/boxscore');
+    assert.strictEqual(NB.ncaaPlayByPlayUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/play-by-play');
+    assert.strictEqual(NB.ncaaTeamStatsUrl('6458979'), 'https://ncaa-api.henrygd.me/game/6458979/team-stats');
+  });
   test('proxiedUrl wraps and encodes', () => {
     const p = NB.proxiedUrl('https://site.api.espn.com/x?a=1&b=2');
     assert.ok(p.startsWith('https://api.allorigins.win/raw?url='));
@@ -121,7 +158,30 @@ function waitForPort(url, ms) {
     // Every proxy URL must encode the raw & of the target (never send %2C).
     urls.forEach((u) => { assert.ok(u.indexOf('&b=2') === -1); });
   });
-  atest('espnFetch walks the proxy chain to the first working proxy', async () => {
+  await atest('espnFetch uses the Reader transport when provider/CORS requests fail', async () => {
+    const origFetch = global.fetch;
+    try {
+      const calls = [];
+      global.fetch = (u) => {
+        calls.push(String(u));
+        if (String(u).startsWith('https://r.jina.ai/')) {
+          return Promise.resolve({
+            ok: true,
+            text: async () => 'Title: ESPN\n\nMarkdown Content:\n{"events":[]}'
+          });
+        }
+        return Promise.reject(new Error('network unavailable'));
+      };
+      const r = await NB.espnFetch('https://site.api.espn.com/apis/x', 400);
+      assert.strictEqual(r.viaProxy, true);
+      assert.strictEqual(r.proxy, 'jina-reader');
+      assert.deepStrictEqual(r.data, { events: [] });
+      assert.ok(calls.some((u) => u.startsWith('https://r.jina.ai/http://site.api.espn.com/')));
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+  await atest('espnFetch walks the proxy chain to the first working proxy', async () => {
     const origFetch = global.fetch;
     try {
       let calls = [];
@@ -205,6 +265,75 @@ function waitForPort(url, ms) {
     assert.strictEqual(ev[0].competitions[0].competitors[0].team.displayName, 'UNC');
     assert.strictEqual(ev[0].competitions[0].status.type.state, 'pre');
   });
+  test('NCAA community scoreboard games[] shape is also normalized', () => {
+    const data = { games: [{ game: {
+      gameID: 'g1', startDate: '12/13/2025', startTimeEpoch: 1765656000, gameState: 'final', finalMessage: 'FINAL',
+      away: { score: '16', winner: false, names: { char6: 'ARMY', short: 'Army West Point' }, conferences: [{ conferenceSeo: 'american' }] },
+      home: { score: '17', winner: true, names: { char6: 'NAVY', short: 'Navy' }, conferences: [{ conferenceSeo: 'american' }] }
+    } }] };
+    const event = NB.eventsOf(data)[0];
+    assert.strictEqual(event.id, 'g1');
+    assert.strictEqual(NB.parseEvent(event).status.state, 'post');
+    assert.strictEqual(NB.parseEvent(event).away.abbreviation, 'ARMY');
+    assert.strictEqual(NB.parseEvent(event).home.score, 17);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable(data), true);
+    assert.strictEqual(NB.eventsOf(ncaaGame).length, 1); // game/{id} uses root contests[]
+  });
+  test('NCAA fallback validates contests, preserves isHome, status, scores, and conference IDs', () => {
+    const events = NB.eventsOf(ncaaScoreboard);
+    assert.strictEqual(events.length, 2);
+    const upcoming = events.find((e) => e.id === '6604316');
+    const final = events.find((e) => e.id === '6531855');
+    assert.ok(upcoming && final);
+    assert.strictEqual(upcoming.source, 'ncaa');
+    assert.strictEqual(upcoming.competitions[0].status.type.state, 'pre');
+    assert.strictEqual(upcoming.competitions[0].competitors.find((c) => c.homeAway === 'home').team.abbreviation, 'UNC');
+    assert.deepStrictEqual(NB.parseEvent(upcoming).conferenceIds.sort(), ['1', '4']);
+    assert.strictEqual(NB.parseEvent(final).away.score, 21);
+    assert.strictEqual(NB.parseEvent(final).home.score, 27);
+    assert.strictEqual(NB.parseEvent(final).status.state, 'post');
+    assert.strictEqual(NB.eventMatchesGroups(upcoming, ['4']), true);
+    assert.strictEqual(NB.eventMatchesGroups(upcoming, ['8']), false);
+  });
+  test('single-day filtering keeps only the requested Eastern date', () => {
+    const events = NB.eventsOf(ncaaScoreboard);
+    assert.deepStrictEqual(NB.filterEventsForDate(events, '20260829').map((e) => e.id), ['6604316']);
+    assert.deepStrictEqual(NB.filterEventsForDate(events, '20260119').map((e) => e.id), ['6531855']);
+    assert.deepStrictEqual(NB.filterEventsForDate(events, '20260830'), []);
+  });
+  test('completed-event helper distinguishes final results from scheduled games', () => {
+    const events = NB.eventsOf(ncaaScoreboard);
+    assert.strictEqual(NB.eventIsCompleted(events.find((e) => e.id === '6531855')), true);
+    assert.strictEqual(NB.eventIsCompleted(events.find((e) => e.id === '6604316')), false);
+  });
+  test('placeholder ESPN responses are rejected, while a real empty slate is valid', () => {
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [{}] }), false);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [] }), true);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [], error: 'upstream failed' }), false);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ error: 'upstream failed' }), false);
+    assert.strictEqual(NB.validEventsOf({ events: [{}] }).length, 0);
+  });
+  test('NCAA game overview/detail parsing keeps fallback scores and optional stats/PBP', () => {
+    const boxscore = { teamBoxscore: [
+      { teamId: 1356, teamStats: { firstDowns: '17' }, playerStats: [
+        { firstName: 'Blake', lastName: 'Horvath', number: 11, category: 'rushing', rushingAttempts: '34', rushingYards: '107' }
+      ] },
+      { teamId: 2352, teamStats: { firstDowns: '11' }, playerStats: [] }
+    ] };
+    const pbp = { contestId: 6458979, periods: [{ periodNumber: 1, playbyplayStats: [
+      { teamId: 1356, plays: [{ playText: 'Horvath rush for 5 yards.', driveText: '1 and 10 at 25', clock: '07:00', homeScore: 7, visitorScore: 0 }] }
+    ] }] };
+    const detail = NB.parseNCAADetail(ncaaGame, boxscore, pbp, boxscore);
+    assert.strictEqual(detail.teams[0].abbreviation, 'ARMY');
+    assert.strictEqual(detail.teams[1].abbreviation, 'NAVY');
+    assert.strictEqual(detail.teams[0].score, 16);
+    assert.strictEqual(detail.teams[1].score, 17);
+    assert.strictEqual(detail.teams[1].stats.find((s) => s.name === 'firstDowns').displayValue, '17');
+    assert.strictEqual(detail.players[0].teamId, '1356');
+    assert.strictEqual(detail.players[0].categories[0].athletes[0].name, 'Blake Horvath');
+    assert.strictEqual(detail.plays[0].offTeamId, '1356');
+    assert.strictEqual(detail.plays[0].type, 'Rush');
+  });
   test('groupByDay groups by Eastern date, sorted', () => {
     const evs = [
       { id: 'a', date: '2026-08-29T16:00Z' },  // Sat Aug 29, 12:00 ET
@@ -219,6 +348,14 @@ function waitForPort(url, ms) {
   test('groupByDay skips malformed events', () => {
     const days = NB.groupByDay([{ id: 'x' }, null, { id: 'y', date: 'not-a-date' }, { date: '2026-08-29T16:00Z' }]);
     assert.strictEqual(days.length, 0);
+  });
+  test('range filtering excludes provider events outside the requested window', () => {
+    const events = [
+      { id: 'before', date: '2026-08-26T23:00Z' },
+      { id: 'inside', date: '2026-08-29T16:00Z' },
+      { id: 'after', date: '2026-09-09T05:00Z' }
+    ];
+    assert.deepStrictEqual(NB.filterEventsForRange(events, '20260827', '20260908').map((e) => e.id), ['inside']);
   });
   test('calendarProbeWindows: back window spans the previous league-year end', () => {
     // Real 2026-season calendar values (verbatim from the live API,
@@ -251,6 +388,16 @@ function waitForPort(url, ms) {
     assert.strictEqual(w.fwd, null);
     assert.deepStrictEqual(w.back, ['20250111', '20250131']);
     assert.strictEqual(NB.calendarProbeWindows(null, '20260825').fwd, null);
+  });
+  test('calendarProbeWindows clips a future back window to the selected date', () => {
+    const league = { calendarStartDate: '2025-02-01T08:00Z', calendar: [] };
+    assert.deepStrictEqual(NB.calendarProbeWindows(league, '20250115').back, ['20250111', '20250114']);
+  });
+  test('fallbackProbeWindows covers season boundaries without inventing games', () => {
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260826'), { fwd: null, back: ['20260101', '20260131'] });
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260715'), { fwd: ['20260822', '20260908'], back: ['20260101', '20260131'] });
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260110'), { fwd: ['20260111', '20260131'], back: ['20251215', '20251231'] });
+    assert.deepStrictEqual(NB.fallbackProbeWindows('20260120'), { fwd: ['20260822', '20260908'], back: ['20260101', '20260119'] });
   });
 
   console.log('--- scoreboard parsing (real fixture) ---');
@@ -505,14 +652,22 @@ function waitForPort(url, ms) {
       const js = await (await fetch(base + '/app.js')).text();
       assert.ok(js.indexOf('CONFERENCES') !== -1);
       assert.ok(js.indexOf('/api/espn?url=') !== -1);
+      assert.ok(js.indexOf('site.web.api.espn.com') !== -1);
+      assert.ok(js.indexOf('sdataprod.ncaa.com') !== -1);
       assert.ok((await (await fetch(base + '/styles.css')).text()).indexOf('.game-row') !== -1);
     });
-    await atest('same-origin ESPN relay rejects non-ESPN targets', async () => {
+    await atest('same-origin provider relay rejects arbitrary targets', async () => {
       const target = encodeURIComponent('https://example.com/not-espn');
       const res = await fetch(base + '/api/espn?url=' + target);
       assert.strictEqual(res.status, 400);
       const body = await res.json();
       assert.ok(body.error);
+    });
+    await atest('same-origin provider relay rejects credentials and alternate ports', async () => {
+      const credentialed = encodeURIComponent('https://user:pass@site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829');
+      const alternatePort = encodeURIComponent('https://site.api.espn.com:444/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829');
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + credentialed)).status, 400);
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + alternatePort)).status, 400);
     });
     await atest('404 for unknown paths, no file escape via traversal', async () => {
       assert.strictEqual((await fetch(base + '/nope.js')).status, 404);

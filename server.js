@@ -40,7 +40,7 @@ const server = http.createServer((req, res) => {
 
   // Same-origin data relay. The browser calls this route instead of making a
   // cross-origin request, so provider CORS policy cannot blank the scoreboard.
-  // Keep both provider targets allowlisted; this must never become an open proxy.
+  // Keep every retained provider target explicitly allowlisted; this must never become an open proxy.
   if (pathname === '/api/espn') {
     let target;
     try {
@@ -48,13 +48,24 @@ const server = http.createServer((req, res) => {
       target = new URL(rawTarget || 'invalid:');
     } catch (e) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'A valid ESPN API URL is required' }));
+      return res.end(JSON.stringify({ error: 'A valid allowlisted provider URL is required' }));
     }
-    const allowedEspn = target.hostname === 'site.api.espn.com' && target.pathname.startsWith('/apis/site/v2/');
-    const allowedNcaa = target.hostname === 'sdataprod.ncaa.com' && target.pathname === '/';
-    if (target.protocol !== 'https:' || (!allowedEspn && !allowedNcaa)) {
+    const allowedEspnHost = target.hostname === 'site.api.espn.com' || target.hostname === 'site.web.api.espn.com';
+    const allowedEspnPath = /^\/apis\/site\/v2\/sports\/football\/college-football\/(?:scoreboard|summary)$/.test(target.pathname);
+    const allowedEspn = allowedEspnHost && allowedEspnPath;
+    const allowedNcaaGraphql = target.hostname === 'sdataprod.ncaa.com' && target.pathname === '/';
+    const allowedNcaaCommunity = target.hostname === 'ncaa-api.henrygd.me' && (
+      /^\/scoreboard\/football\/fbs\/\d{4}\/\d{1,3}\/all-conf$/.test(target.pathname) ||
+      /^\/game\/\d+(?:\/(?:boxscore|play-by-play|team-stats|scoring-summary))?$/.test(target.pathname)
+    );
+    if (req.method !== 'GET') {
+      res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET' });
+      return res.end(JSON.stringify({ error: 'Only GET requests are allowed' }));
+    }
+    const safeTarget = !target.username && !target.password && (!target.port || target.port === '443');
+    if (target.protocol !== 'https:' || !safeTarget || (!allowedEspn && !allowedNcaaGraphql && !allowedNcaaCommunity)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Only the ESPN site API is allowed' }));
+      return res.end(JSON.stringify({ error: 'Only allowlisted ESPN and NCAA provider URLs are allowed' }));
     }
     const upstream = https.get(target, {
       headers: { Accept: 'application/json', 'User-Agent': 'ncaa-football-scoreboard' },
@@ -66,10 +77,10 @@ const server = http.createServer((req, res) => {
       });
       up.pipe(res);
     });
-    upstream.on('timeout', () => upstream.destroy(new Error('ESPN request timed out')));
+    upstream.on('timeout', () => upstream.destroy(new Error('Provider request timed out')));
     upstream.on('error', (err) => {
       if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json' });
-      if (!res.writableEnded) res.end(JSON.stringify({ error: 'ESPN relay failed', detail: err.message }));
+      if (!res.writableEnded) res.end(JSON.stringify({ error: 'Provider relay failed', detail: err.message }));
     });
     return;
   }
