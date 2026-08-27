@@ -756,9 +756,21 @@
   // parallel requests if the combined call fails for any reason.
   async function fetchDay(dateStr, groupIds) {
     function unwrap(r) { return { lists: [r.data], viaProxy: r.viaProxy, proxy: r.proxy, errors: [] }; }
+    function hasEvents(data) { return eventsOf(data).length > 0; }
     if (groupIds.length) {
       try {
-        return unwrap(await espnFetch(scoreboardUrl(dateStr, groupIds.join(','))));
+        var primary = await espnFetch(scoreboardUrl(dateStr, groupIds.join(',')));
+        // A successful HTTP response is not enough: an empty/partial ESPN
+        // response is a common failure mode during schedule publication. Ask
+        // NCAA's own public scoreboard for the same date before rendering a
+        // misleading "no games" slate. ESPN stays preferred whenever it has
+        // events, while NCAA supplies a real, normalized scoreboard fallback.
+        if (hasEvents(primary.data)) return unwrap(primary);
+        try {
+          var ncaaEmptyDay = await espnFetch(ncaaScoreboardUrl(dateStr));
+          if (hasEvents(ncaaEmptyDay.data)) return unwrap(ncaaEmptyDay);
+        } catch (ignoreEmptyFallback) {}
+        return unwrap(primary);
       } catch (e) {
         // Free NCAA.com-backed fallback. It is scoreboard-only; ESPN remains
         // the source for game summaries and play-by-play.
@@ -888,7 +900,25 @@
 
     function probeDays(from, to) {
       return espnFetch(scoreboardRangeUrl(from, to, g))
-        .then(function (r) { return groupByDay(eventsOf(r.data)); })
+        .then(async function (r) {
+          var ranged = groupByDay(eventsOf(r.data));
+          if (ranged.length) return ranged;
+          // ESPN range endpoints can legitimately return an empty payload but
+          // still have a schedule in NCAA's feed. Probe the individual dates
+          // through fetchDay so the same NCAA fallback used by the main slate
+          // also powers Upcoming and Recent results.
+          var dates = [];
+          for (var cursor = from; cursor <= to; cursor = shiftDate(cursor, 1)) dates.push(cursor);
+          var daily = await Promise.all(dates.map(function (date) {
+            return fetchDay(date, enabledGroupIds()).catch(function () { return null; });
+          }));
+          var all = [];
+          daily.forEach(function (day) {
+            if (!day) return;
+            day.lists.forEach(function (data) { all = all.concat(eventsOf(data)); });
+          });
+          return groupByDay(all);
+        })
         .catch(function () { return null; }); // null = request failed, [] = no games
     }
     function pickFirst(days) { return (days && days.length) ? days[0] : null; }

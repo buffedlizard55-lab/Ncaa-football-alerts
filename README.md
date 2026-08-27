@@ -141,12 +141,16 @@ On 2026-08-25 (a Tuesday with no games) this surfaces: *Upcoming — Sat, Aug 29
 
 ### Free NCAA.com fallback
 
-If ESPN cannot be reached, the day scoreboard tries the documented free NCAA.com
-GraphQL scoreboard source. It sends `sportCode: "MFB"`, FBS division `11`, the
-NCAA season year, and the selected `contestDate`, then normalizes the documented
-`data.contests[]` / `teams[]` fields into the scoreboard model. This fallback is
-for scoreboard rows only; ESPN remains required for the existing game summary,
-box score, and play-by-play views.
+If ESPN cannot be reached **or returns an empty response**, the day scoreboard
+tries NCAA's public scoreboard GraphQL source. The persisted query was tested
+against the live endpoint on 2026-08-27 for 2026-08-29 and returned the 2026
+opening-day contests (including TCU–North Carolina). It sends `sportCode: "MFB"`,
+FBS division `11`, the NCAA season year, and the selected `contestDate`, then
+normalizes the documented `data.contests[]` / `teams[]` fields into the
+scoreboard model. The server relay allowlists this host alongside ESPN, so a
+browser CORS policy cannot hide the fallback. This source is for scoreboard rows
+only; ESPN remains required for the existing game summary, box score, and
+play-by-play views.
 
 ### CORS / fallback
 

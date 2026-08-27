@@ -51,10 +51,14 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ error: 'A valid ESPN API URL is required' }));
     }
     const allowedEspn = target.hostname === 'site.api.espn.com' && target.pathname.startsWith('/apis/site/v2/');
+    // NCAA's public scoreboard GraphQL endpoint is a useful independent
+    // fallback when ESPN is unavailable. Keep it allowlisted just like ESPN;
+    // this route must never become an open proxy.
     const allowedNcaa = target.hostname === 'sdataprod.ncaa.com' && target.pathname === '/';
-    if (target.protocol !== 'https:' || (!allowedEspn && !allowedNcaa)) {
+    const allowedNcaaApi = target.hostname === 'ncaa-api.henrygd.me' && target.pathname.startsWith('/scoreboard/football/fbs/');
+    if (target.protocol !== 'https:' || (!allowedEspn && !allowedNcaa && !allowedNcaaApi)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
-      return res.end(JSON.stringify({ error: 'Only the ESPN site API is allowed' }));
+      return res.end(JSON.stringify({ error: 'Only allowlisted ESPN or NCAA scoreboard URLs are allowed' }));
     }
     const upstream = https.get(target, {
       headers: { Accept: 'application/json', 'User-Agent': 'ncaa-football-scoreboard' },
