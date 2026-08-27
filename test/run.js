@@ -7,7 +7,7 @@
  *    fixtures (see test/fixtures/*.json headers for provenance)
  *  - boots the actual server on a port and checks its routes
  *
- * Live provider contracts were independently probed on 2026-08-26; this
+ * Live provider contracts were independently probed on 2026-08-27; this
  * offline runner does not pretend to prove a remote browser's network/CORS
  * environment. Reader fallback parsing is covered with representative
  * response envelopes.
@@ -309,6 +309,7 @@ function waitForPort(url, ms) {
   test('placeholder ESPN responses are rejected, while a real empty slate is valid', () => {
     assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [{}] }), false);
     assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [] }), true);
+    assert.strictEqual(NB.scoreboardPayloadIsUsable({ events: [], error: 'upstream failed' }), false);
     assert.strictEqual(NB.scoreboardPayloadIsUsable({ error: 'upstream failed' }), false);
     assert.strictEqual(NB.validEventsOf({ events: [{}] }).length, 0);
   });
@@ -348,6 +349,14 @@ function waitForPort(url, ms) {
     const days = NB.groupByDay([{ id: 'x' }, null, { id: 'y', date: 'not-a-date' }, { date: '2026-08-29T16:00Z' }]);
     assert.strictEqual(days.length, 0);
   });
+  test('range filtering excludes provider events outside the requested window', () => {
+    const events = [
+      { id: 'before', date: '2026-08-26T23:00Z' },
+      { id: 'inside', date: '2026-08-29T16:00Z' },
+      { id: 'after', date: '2026-09-09T05:00Z' }
+    ];
+    assert.deepStrictEqual(NB.filterEventsForRange(events, '20260827', '20260908').map((e) => e.id), ['inside']);
+  });
   test('calendarProbeWindows: back window spans the previous league-year end', () => {
     // Real 2026-season calendar values (verbatim from the live API,
     // 2026-08-25). League year starts 2026-02-01, so the last games of the
@@ -379,6 +388,10 @@ function waitForPort(url, ms) {
     assert.strictEqual(w.fwd, null);
     assert.deepStrictEqual(w.back, ['20250111', '20250131']);
     assert.strictEqual(NB.calendarProbeWindows(null, '20260825').fwd, null);
+  });
+  test('calendarProbeWindows clips a future back window to the selected date', () => {
+    const league = { calendarStartDate: '2025-02-01T08:00Z', calendar: [] };
+    assert.deepStrictEqual(NB.calendarProbeWindows(league, '20250115').back, ['20250111', '20250114']);
   });
   test('fallbackProbeWindows covers season boundaries without inventing games', () => {
     assert.deepStrictEqual(NB.fallbackProbeWindows('20260826'), { fwd: null, back: ['20260101', '20260131'] });
@@ -649,6 +662,12 @@ function waitForPort(url, ms) {
       assert.strictEqual(res.status, 400);
       const body = await res.json();
       assert.ok(body.error);
+    });
+    await atest('same-origin provider relay rejects credentials and alternate ports', async () => {
+      const credentialed = encodeURIComponent('https://user:pass@site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829');
+      const alternatePort = encodeURIComponent('https://site.api.espn.com:444/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829');
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + credentialed)).status, 400);
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + alternatePort)).status, 400);
     });
     await atest('404 for unknown paths, no file escape via traversal', async () => {
       assert.strictEqual((await fetch(base + '/nope.js')).status, 404);

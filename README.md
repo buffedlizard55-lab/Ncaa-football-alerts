@@ -103,10 +103,12 @@ transport only — it does not invent games or replace ESPN/NCAA as the source o
 truth. The public Reader service is rate-limited, so it is deliberately after
 the app relay and direct provider requests, and polling remains conservative.
 
-Independent checks on 2026-08-26 fetched ESPN JSON through the Reader for the
-empty current date (`20260826`), the upcoming Aug. 29 slate, the Jan. 19 CFP
-final, the 14-day range used for adjacent-game discovery, and the pre-game
-summary endpoint. Those responses retained the provider's JSON structure.
+Initial independent checks on 2026-08-26 fetched ESPN JSON through the
+Reader for the empty current date (`20260826`), the upcoming Aug. 29 slate,
+the Jan. 19 CFP final, the 14-day range used for adjacent-game discovery, and
+the pre-game summary endpoint. Those responses retained the provider's JSON
+structure; the endpoint contracts and current-date NCAA response were repeated
+on 2026-08-27.
 
 ### Verified free NCAA fallback
 
@@ -216,30 +218,38 @@ normalization, date math, merge/deduplication, rendering, hash routing, deep
 links, live polling, detail parsing, server allowlisting, path confinement,
 and the offline test runner.
 
-Current verification performed on **2026-08-26**:
+Current verification performed on **2026-08-27**:
 
-1. ESPN no-group ranges for `20260827-20260909` and `20260110-20260131`
+1. The live ESPN no-group scoreboard for `20260827` returned a valid empty
+   slate with its 2026 season calendar, while `20260829` returned complete
+   upcoming events. The live ESPN range `20260110-20260131` returned the CFP
+   event at `2026-01-20T00:30Z`, which the app correctly groups as the Eastern
+   date `20260119`.
+2. The live NCAA persisted query for `20260827` returned a valid empty
+   `data.contests` array; the same query for `20260829` returned the upcoming
+   FBS contests and for `20260119` returned the completed CFP contest.
+3. ESPN no-group ranges for `20260827-20260909` and `20260110-20260131`
    returned complete events; single-group requests for `groups=1` and `5`
    returned the January 20 championship event; comma-separated group requests
    returned placeholder events and are rejected by the app.
-2. ESPN event `401856766` was verified as North Carolina at TCU on
+4. ESPN event `401856766` was verified as North Carolina at TCU on
    `2026-08-29T16:00Z`, with venue Aviva Stadium. Its summary returned a valid
    pre-game shape with teams and a scheduled header date.
-3. The exact current NCAA persisted query above returned `data.contests` for
+5. The exact current NCAA persisted query above returned `data.contests` for
    both `contestDate` and `week` variables. FBS division `11` and football
    code `MFB` were confirmed from the current public adapter contract.
-4. The NCAA-backed game overview and completed-game detail routes were called
+6. The NCAA-backed game overview and completed-game detail routes were called
    independently; optional-route failures are handled rather than assumed
    away.
-5. The exact Reader URLs were called independently for the current empty
+7. The exact Reader URLs were called independently for the current empty
    date, the Aug. 29 upcoming slate, the Jan. 19 final, the adjacent-game
    range, and a pre-game summary. Both the Reader text form and its documented
    JSON-envelope form were parsed in the adapter tests.
-6. The exact Big Balls Data, SportSRC, allorigins, corsproxy.io, and
+8. The exact Big Balls Data, SportSRC, allorigins, corsproxy.io, and
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-7. `npm test` passes **68 offline checks**, including syntax, URL construction,
+9. `npm test` passes **72 offline checks**, including syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final
@@ -253,15 +263,22 @@ all live upstream requests were blocked or reset, so that run honestly showed
 `games: 0` and the visible network error. It proves the browser shell and
 failure state, not successful live data delivery.
 
-A separate real-browser smoke run intercepted the provider requests with
-known response bodies and rendered the NCAA fallback's live/upcoming/final
-rows, the adjacent upcoming/recent cards, and the fresh-visit next-game-day
-navigation. That proves the end-to-end DOM path with a browser, but it is not a
-live-provider proof. The browser path has three progressively independent ways
-to receive real provider data in an environment with outbound access: the
-same-origin relay, direct provider fetch, and the documented Reader transport.
-The UI shows source/provider diagnostics and an explicit network error instead
-of rendering an unexplained blank slate if all are unavailable.
+Separate real-browser smoke runs also covered both deployment paths. With
+controlled response bodies, a fresh visit to a local server advanced from the
+empty `20260827` slate to `20260829` and rendered live/upcoming/final rows,
+adjacent upcoming/recent cards, and a game detail view. A second run used a
+real Chromium origin mapped to the GitHub Pages hostname; it made no
+`/api/espn` request, fell through to the Reader transport, and rendered the
+same scoreboard with `staticDeployment: true` and `proxy: jina-reader`. Those
+controlled-response runs prove the end-to-end DOM and static-host paths, but
+are not live-provider proofs. An un-intercepted Chromium run against the local
+app and an un-intercepted Pages-shaped origin made the real relay/direct/
+Reader/public-proxy attempts; all upstream requests were blocked or reset in
+this sandbox, so those honest runs showed `games: 0` and the visible network
+error rather than inventing data. The browser path has three progressively
+independent ways to receive real provider data in an environment with outbound
+access: the same-origin relay, direct provider fetch, and the documented Reader
+transport.
 
 ## Files
 

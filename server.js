@@ -62,7 +62,8 @@ const server = http.createServer((req, res) => {
       res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'GET' });
       return res.end(JSON.stringify({ error: 'Only GET requests are allowed' }));
     }
-    if (target.protocol !== 'https:' || (!allowedEspn && !allowedNcaaGraphql && !allowedNcaaCommunity)) {
+    const safeTarget = !target.username && !target.password && (!target.port || target.port === '443');
+    if (target.protocol !== 'https:' || !safeTarget || (!allowedEspn && !allowedNcaaGraphql && !allowedNcaaCommunity)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'Only allowlisted ESPN and NCAA provider URLs are allowed' }));
     }
