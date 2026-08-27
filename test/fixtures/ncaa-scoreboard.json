@@ -1,0 +1,41 @@
+{
+  "_fixture_note": "Contest objects copied from real sdataprod.ncaa.com NCAA football scoreboard responses for 2026-08-29 and 2026-01-19, verified live on 2026-08-26. The two dates are intentionally combined here to exercise single-day filtering; production requests are date-specific.",
+  "data": {
+    "contests": [
+      {
+        "contestId": 6604316,
+        "url": "/game/6604316",
+        "gameState": "P",
+        "statusCodeDisplay": "pre",
+        "currentPeriod": "",
+        "contestClock": "",
+        "finalMessage": "",
+        "startTimeEpoch": 1788019200,
+        "startTime": "12:00",
+        "startDate": "08/29/2026",
+        "hasStartTime": true,
+        "teams": [
+          { "isHome": true, "seoname": "north-carolina", "nameShort": "North Carolina", "name6Char": "UNC", "teamRank": null, "score": null, "isWinner": false, "conferenceSeo": "acc" },
+          { "isHome": false, "seoname": "tcu", "nameShort": "TCU", "name6Char": "TCU", "teamRank": null, "score": null, "isWinner": false, "conferenceSeo": "big-12" }
+        ]
+      },
+      {
+        "contestId": 6531855,
+        "url": "/game/6531855",
+        "gameState": "F",
+        "statusCodeDisplay": "final",
+        "currentPeriod": "FINAL",
+        "contestClock": "",
+        "finalMessage": "FINAL",
+        "startTimeEpoch": 1768869000,
+        "startTime": "19:30",
+        "startDate": "01/19/2026",
+        "hasStartTime": true,
+        "teams": [
+          { "isHome": true, "seoname": "indiana", "nameShort": "Indiana", "name6Char": "IND", "teamRank": null, "score": 27, "isWinner": true, "conferenceSeo": "big-ten" },
+          { "isHome": false, "seoname": "miami-fl", "nameShort": "Miami (FL)", "name6Char": "MIAMI", "teamRank": null, "score": 21, "isWinner": false, "conferenceSeo": "acc" }
+        ]
+      }
+    ]
+  }
+}
