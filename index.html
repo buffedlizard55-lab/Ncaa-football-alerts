@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>NCAA Football Scoreboard</title>
   <meta name="description" content="Live college football scoreboard for the ACC, SEC, Big Ten, Big 12 and American. Scores, upcoming games, previous results, play-by-play and stats from ESPN with verified NCAA.com and browser-safe Reader fallbacks. No videos.">
-  <link rel="stylesheet" href="styles.css">
+  <!-- Versioned static assets prevent a legacy GitHub Pages CDN/browser cache
+       from reusing the pre-scoreboard client after a deployment. -->
+  <link rel="stylesheet" href="styles.css?v=20260827-scoreboard">
   <link rel="icon" href="data:,">
 </head>
 <body>
@@ -40,6 +42,6 @@
     </details>
   </footer>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=20260827-scoreboard"></script>
 </body>
 </html>
