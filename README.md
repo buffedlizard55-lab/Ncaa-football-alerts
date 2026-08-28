@@ -62,7 +62,8 @@ API key is required.
 | Single-day scoreboard | `https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=YYYYMMDD&limit=300` returned complete event objects. |
 | One conference | The same URL with one `groups=` value. The configured IDs are ACC `1`, SEC `8`, Big Ten `5`, Big 12 `4`, and American `151`. |
 | Nearby discovery | A no-group range such as `dates=20260827-20260909&limit=500` returned complete events and is filtered locally by team `conferenceId`. |
-| Game detail | `.../summary?event={eventId}` returned the box score, drives, plays, and recap for a completed game. The parameter is `event`; `gameId` is not interchangeable. |
+| Game detail | `.../summary?event={eventId}` returned the box score, drives, plays, and recap for a completed game. The parameter is `event`; `gameId` is not interchangeable. Its `drives` section arrives in at least two live shapes — a plain array, and `{"previous": [...]}`; both are parsed (see “Historical game backfill”). |
+| Historical play-by-play index | `https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/{eventId}/competitions/{eventId}/plays?limit=400[&page=N]` returned the full paginated play collection for the same event id (168 plays for event 401769074), with items shaped like summary plays. Used only as a backfill when the summary document has no usable plays or cannot be transported. |
 | Alternate host | `site.web.api.espn.com` was independently checked with the same scoreboard and summary paths and is tried if the primary ESPN host fails. |
 
 The loader first makes one no-group request for the selected day and filters
@@ -142,6 +143,44 @@ return 502 or be unavailable, so each optional request is isolated and a
 usable overview still renders. NCAA detail data is normalized into the same
 scoreboard/detail view model as ESPN data.
 
+### Historical game backfill (2025-season and older games)
+
+Old games are not stored anywhere by this app — they are re-fetched on demand,
+and the providers still serve them (the 2025 season was re-verified on
+2026-08-28; see the verification list). Getting a past game's play-by-play to
+render is a retrieval problem in three independent places, and each is now
+covered by an explicit fallback:
+
+1. **Summary shape variance.** `summary?event=` does not serve one `drives`
+   shape. A 2025-11-08 regular-season summary (event 401752763) returns
+   `drives: [...]`, while a 2026-01-09 CFP semifinal summary (event 401769074)
+   returns `drives: {"previous": [...]}`. Reading only the array form hid
+   every play of the postseason game even though the provider returned all of
+   them ("no pbp data" on an old game). `summaryDrivesOf` accepts both
+   envelope forms plus the optional `drives.current` of a live game, and the
+   extractor also drops provider re-issues (the same play listed twice in one
+   drive under one sequence number, observed live in event 401769074).
+2. **Summary transport failure / trimmed summaries.** The summary document for
+   a completed game is several hundred KB. When it parses but carries no
+   plays — or every transport allowed in the visitor's environment fails on
+   it — the app backfills PBP from the much smaller, paginated ESPN Core API
+   plays collection for the same event id (168 plays were indexed for event
+   401769074). The game view is badged "ESPN Core backfill" and the
+   diagnostics footer records `detailSource`.
+3. **Different id namespaces.** ESPN event ids and NCAA contest ids are
+   unrelated namespaces, but a game is uniquely identified by its Eastern
+   date and both teams. If the ESPN detail cannot be retrieved at all, the
+   app cross-walks the clicked game to the same-day NCAA contest
+   (conservative team-name matching on both the away and the home side; a
+   miss is preferred over a wrong match) and serves the verified NCAA detail
+   pipeline (overview, play-by-play, boxscore, team stats). Verified: ESPN
+   event 401769074 ↔ NCAA contest 6531853 (Oregon at Indiana, 2026-01-09).
+
+The NCAA detail normalizer also learned two facts from the live 6531853
+feed: play texts repeat the quarter clock as a `"(MM:SS)"` prefix (now
+stripped like ESPN rows), and an NCAA PAT is rendered `"… kick attempt good"`
+— it must be tagged `PAT`, not mistaken for a field goal.
+
 ### Options investigated but not used as primary providers
 
 These were called directly rather than accepted from search-result marketing
@@ -198,6 +237,8 @@ The page calls the same-origin `/api/espn?url=...` route first. The relay is
 not an open proxy: it permits only the retained provider hosts and paths:
 
 - ESPN `site.api.espn.com` and `site.web.api.espn.com` scoreboard/summary paths
+- the ESPN Core API plays collection on `sports.core.api.espn.com` (numeric
+  event/competition ids only — the historical PBP backfill index)
 - NCAA GraphQL root on `sdataprod.ncaa.com`
 - the documented NCAA-backed scoreboard and game-detail paths on
   `ncaa-api.henrygd.me`
@@ -249,11 +290,35 @@ Current verification performed on **2026-08-27**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-9. `npm test` passes **72 offline checks**, including syntax, URL construction,
+9. `npm test` passes **83 offline checks**, including syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final
-   view models, and the running server's health/static/security routes.
+   view models, the historical-backfill fixtures below, and the running
+   server's health/static/security routes.
+
+Additional verification on **2026-08-28** (the reported 2025-season case):
+
+10. `summary?event=401769074` (Oregon at Indiana, CFP Peach Bowl semifinal,
+    2026-01-09) was fetched in full. It returned the complete box score and a
+    `drives: {"previous": [...]}` envelope — the shape that previously
+    produced an empty play-by-play tab. Drive `4017690742` lists one
+    interception touchdown twice (`sequenceNumber: "2"` with play ids
+    `40176907417` and `401769074763`); the parser now renders it once. The
+    same-day scoreboard (`dates=20260109`) returned the complete final event.
+11. The Core API plays collection for that event
+    (`sports.core.api.espn.com/.../events/401769074/competitions/401769074/plays`)
+    reported `count: 168` over 34 default pages; its items carry the same
+    fields the summary play normalizer consumes (confirmed verbatim in the
+    backfill fixtures).
+12. The NCAA persisted query for `contestDate 2026-01-09, seasonYear 2025`
+    returned contest `6531853` (Indiana 56, Oregon 22, `hasPbp: true`), and
+    `ncaa-api.henrygd.me/game/6531853[/play-by-play]` returned the overview
+    and full play-by-play — the inputs of the cross-provider backfill.
+13. The ESPN single-day scoreboards for 2026-08-22, 2026-08-23, and
+    2026-08-28 each returned a valid empty slate with the 2026 season
+    calendar attached (no games before the Aug 29 opener weekend —
+    confirmed, not an error state).
 
 A real Chromium browser was also executed against the running local app using
 an extracted Chromium binary and its bundled NSS/NSPR libraries. The actual
@@ -288,8 +353,11 @@ index.html                        scoreboard shell and diagnostics footer
 styles.css                        responsive dark scoreboard/detail UI
 app.js                            provider clients, parsers, UI, routing, polling
 test/run.js                       zero-dependency offline test runner
-test/fixtures/scoreboard-event.json  verified ESPN final-game fixture
-test/fixtures/summary.json           verified ESPN summary/PBP/stats fixture
-test/fixtures/ncaa-scoreboard.json   verified NCAA contest-shape fixture
-test/fixtures/ncaa-game.json          verified NCAA game-shape fixture
+test/fixtures/scoreboard-event.json       verified ESPN final-game fixture
+test/fixtures/summary.json                verified ESPN summary/PBP/stats fixture
+test/fixtures/ncaa-scoreboard.json        verified NCAA contest-shape fixture
+test/fixtures/ncaa-game.json              verified NCAA game-shape fixture
+test/fixtures/summary-401769074.json      verified {previous}-envelope postseason summary
+test/fixtures/espn-core-plays.json        verified ESPN Core API plays items
+test/fixtures/ncaa-scoreboard-20260109.json  verified NCAA feed for the crosswalk case
 ```

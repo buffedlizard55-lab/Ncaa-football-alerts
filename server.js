@@ -53,6 +53,10 @@ const server = http.createServer((req, res) => {
     const allowedEspnHost = target.hostname === 'site.api.espn.com' || target.hostname === 'site.web.api.espn.com';
     const allowedEspnPath = /^\/apis\/site\/v2\/sports\/football\/college-football\/(?:scoreboard|summary)$/.test(target.pathname);
     const allowedEspn = allowedEspnHost && allowedEspnPath;
+    // ESPN Core API plays collection — the verified historical PBP backfill
+    // index (numeric event/competition ids only, never list endpoints).
+    const allowedEspnCore = target.hostname === 'sports.core.api.espn.com' &&
+      /^\/v2\/sports\/football\/leagues\/college-football\/events\/\d+\/competitions\/\d+\/plays$/.test(target.pathname);
     const allowedNcaaGraphql = target.hostname === 'sdataprod.ncaa.com' && target.pathname === '/';
     const allowedNcaaCommunity = target.hostname === 'ncaa-api.henrygd.me' && (
       /^\/scoreboard\/football\/fbs\/\d{4}\/\d{1,3}\/all-conf$/.test(target.pathname) ||
@@ -63,7 +67,7 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ error: 'Only GET requests are allowed' }));
     }
     const safeTarget = !target.username && !target.password && (!target.port || target.port === '443');
-    if (target.protocol !== 'https:' || !safeTarget || (!allowedEspn && !allowedNcaaGraphql && !allowedNcaaCommunity)) {
+    if (target.protocol !== 'https:' || !safeTarget || (!allowedEspn && !allowedEspnCore && !allowedNcaaGraphql && !allowedNcaaCommunity)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({ error: 'Only allowlisted ESPN and NCAA provider URLs are allowed' }));
     }

@@ -68,6 +68,19 @@
     return API_BASE + '/summary?event=' + encodeURIComponent(gameId);
   }
 
+  // ESPN Core API plays collection for an event. A completed game's summary
+  // normally carries PBP inside drives[].plays, but ESPN serves that section
+  // in at least two shapes (plain array and {"previous": [...]} — see
+  // summaryDrivesOf) and omits it entirely for some legacy summaries. The
+  // Core API still indexes every play for the same event id in a smaller,
+  // paginated payload (verified live 2026-08-28 for event 401769074: 168
+  // plays, count/pageCount envelope, items shaped like summary plays).
+  var ESPN_CORE_BASE = 'https://sports.core.api.espn.com/v2/sports/football/leagues/college-football';
+  function espnCorePlaysUrl(eventId) {
+    if (!/^\d+$/.test(String(eventId))) return null;
+    return ESPN_CORE_BASE + '/events/' + encodeURIComponent(eventId) + '/competitions/' + encodeURIComponent(eventId) + '/plays?limit=400';
+  }
+
   // Free NCAA.com scoreboard source. Its documented GraphQL scoreboard uses
   // contestDate rather than ESPN's dates parameter. The operation hash and
   // field names below come from the ncaa-api source, not an invented schema.
@@ -920,11 +933,30 @@
     };
   }
 
+  // ESPN serves the summary "drives" section in at least two live shapes:
+  //   summary.drives = [drive, ...]                 — e.g. event 401752763
+  //     (Texas A&M at Missouri, 2025-11-08; fixture verified 2026-08-25)
+  //   summary.drives = { previous: [drive, ...] }   — e.g. event 401769074
+  //     (Oregon at Indiana, CFP semifinal 2026-01-09; verified 2026-08-28)
+  // Reading only the array form produced an empty play-by-play tab for
+  // completed postseason games even though the provider returned every play.
+  // A live game can additionally carry a drives.current drive.
+  function summaryDrivesOf(summary) {
+    var d = summary && summary.drives;
+    if (Array.isArray(d)) return d;
+    if (d && Array.isArray(d.previous)) {
+      var drives = d.previous.slice();
+      if (d.current && Array.isArray(d.current.plays)) drives.push(d.current);
+      return drives;
+    }
+    return [];
+  }
+
   // PBP strategy: prefer the top-level `plays` array when present, otherwise
   // flatten `drives[].plays` (drives contain every play — verified: kickoffs,
   // timeouts and end-of-quarter markers all appear inside drives).
   function extractPlays(summary) {
-    var drivesRaw = Array.isArray(summary.drives) ? summary.drives : [];
+    var drivesRaw = summaryDrivesOf(summary);
     var flatRaw = Array.isArray(summary.plays) ? summary.plays : [];
     var plays;
     if (flatRaw.length) {
@@ -936,6 +968,18 @@
       });
     }
     plays = plays.filter(Boolean);
+    // The provider occasionally re-issues the same play with a new id under
+    // the same sequence number (verified live 2026-08-28: drive 4017690742
+    // lists one interception touchdown twice at sequence "2"). Keep the first
+    // occurrence of each period+sequence pair so rows never double.
+    var seenSeq = {};
+    plays = plays.filter(function (p) {
+      var key = p.seq ? String(p.period) + ':' + p.seq : null;
+      if (!key) return true;
+      if (seenSeq[key]) return false;
+      seenSeq[key] = true;
+      return true;
+    });
     plays.sort(function (a, b) {
       return (a.period - b.period) || (a.seq - b.seq) || (a.time - b.time);
     });
@@ -943,8 +987,7 @@
   }
 
   function parseDrives(summary) {
-    if (!Array.isArray(summary.drives)) return [];
-    return summary.drives.map(function (d) {
+    return summaryDrivesOf(summary).map(function (d) {
       return {
         id: d.id,
         description: d.description || '',
@@ -1024,6 +1067,21 @@
       headerDate: (s.header && s.header.competitions && s.header.competitions[0] && s.header.competitions[0].date) || null,
       clock: null // live scoreboard clock (attached while polling)
     };
+  }
+
+  /* ---------------- ESPN Core API plays (historical backfill) ---------------- */
+
+  // Core API play items share the summary play field shape (sequenceNumber,
+  // period, clock, teamParticipants, start/end, wallclock — verified verbatim
+  // 2026-08-28 for event 401769074), so the existing normalizer applies
+  // unchanged. The collection envelope carries count/pageCount for pagination.
+  function extractCorePlays(data) {
+    var items = data && Array.isArray(data.items) ? data.items : [];
+    var plays = items.map(function (p) { return normalizePlay(p, null); }).filter(Boolean);
+    plays.sort(function (a, b) {
+      return (a.period - b.period) || (a.seq - b.seq) || (a.time - b.time);
+    });
+    return plays;
   }
 
   /* ---------------- NCAA detail parsing ---------------- */
@@ -1212,14 +1270,28 @@
           var away = raw.visitorScore === undefined || raw.visitorScore === null ? null : Number(raw.visitorScore);
           var home = raw.homeScore === undefined || raw.homeScore === null ? null : Number(raw.homeScore);
           var text = raw.playText || raw.text || '';
+          // NCAA rows often repeat the clock inside the text ("(06:35) Shotgun
+          // …" — verified in the live 6531853 feed). raw.clock already carries
+          // the quarter clock, so drop the duplicated prefix, matching the
+          // normalization applied to ESPN rows.
+          var clockPrefix = String(text).match(/^\((\d{1,2}:\d{2})\)\s*/);
+          var playClock = raw.clock || (clockPrefix ? clockPrefix[1] : '');
+          if (clockPrefix) text = text.slice(clockPrefix[0].length);
           var playTeamId = raw.teamId !== undefined && raw.teamId !== null ? raw.teamId : group.teamId;
           var changed = away !== null && home !== null && (away !== previous.away || home !== previous.home);
+          // Scoring classification from the verified NCAA row texts. A PAT is
+          // rendered as "kick attempt good" (not "extra point"), so it must be
+          // checked before field goals — the open-ended "kick.*good" pattern
+          // previously mistagged PATs as FGs. "NO GOOD"/missed tries are not
+          // scores even though the word "good" appears in the text.
           var touchdown = /touchdown/i.test(text);
-          var fieldGoal = /field goal.*(good|made)|kick.*good/i.test(text);
-          var safety = /safety/i.test(text);
-          var scoringPlay = changed && (touchdown || fieldGoal || safety || /extra point|conversion|score/i.test(text));
-          if (touchdown || fieldGoal || safety || /extra point|conversion/i.test(text)) scoringPlay = true;
-          var scoringType = touchdown ? 'TD' : fieldGoal ? 'FG' : safety ? 'SF' : /extra point|conversion/i.test(text) ? 'PAT' : null;
+          var extraPoint = /extra point|two[- ]point conversion|kick attempt|conversion/i.test(text);
+          var fieldGoal = !extraPoint && /field goal/i.test(text) && /good|made|successful/i.test(text) &&
+            !/no\s*good|miss|wide|blocked/i.test(text);
+          var safety = !touchdown && /safety/i.test(text);
+          var scoringPlay = (changed && (touchdown || fieldGoal || safety || /score/i.test(text))) ||
+            touchdown || fieldGoal || safety || extraPoint;
+          var scoringType = touchdown ? 'TD' : fieldGoal ? 'FG' : safety ? 'SF' : extraPoint ? 'PAT' : null;
           plays.push({
             id: 'ncaa-' + (data.contestId || 'game') + '-' + plays.length,
             seq: plays.length + 1,
@@ -1227,7 +1299,7 @@
             typeAbbr: '',
             text: text,
             period: periodNumber,
-            clock: raw.clock || '',
+            clock: playClock,
             awayScore: away,
             homeScore: home,
             scoringPlay: scoringPlay,
@@ -1266,6 +1338,57 @@
     });
     detail.rawKeys = keys.sort();
     return detail;
+  }
+
+  /* ---------------- Historical backfill: cross-provider matchup ----------------
+   * ESPN event ids and NCAA contest ids are unrelated namespaces, but a game
+   * is uniquely identified by its Eastern date and the two teams. When an ESPN
+   * game's own detail cannot be retrieved, the verified NCAA date feed can
+   * still provide it (verified 2026-08-28: ESPN event 401769074 ↔ NCAA contest
+   * 6531853, Oregon at Indiana, 2026-01-09). Matching is conservative on
+   * purpose: it may miss a matchup, but it must never attach the wrong game.
+   */
+  function normalizeTeamKey(value) {
+    return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  function espnSideMatchesNCAATeam(side, team) {
+    var espnShort = normalizeTeamKey(side && side.name);
+    var espnFull = normalizeTeamKey(side && side.displayName);
+    var ncaaShort = normalizeTeamKey(team && (team.nameShort || (team.names && team.names.short)));
+    var ncaaFull = normalizeTeamKey(team && (team.nameFull || (team.names && team.names.full)));
+    if (!espnShort && !espnFull) return false;
+    // ESPN "Oregon" (short) / "Oregon Ducks" (full) vs NCAA nameShort "Oregon".
+    if (ncaaShort && ((espnShort && espnShort === ncaaShort) || (espnFull && espnFull.indexOf(ncaaShort) === 0))) return true;
+    // NCAA nameFull "Indiana University, Bloomington" vs ESPN "Indiana".
+    if (ncaaFull && espnShort && ncaaFull.indexOf(espnShort) === 0) return true;
+    return false;
+  }
+
+  function ncaaContestsOf(data) {
+    if (data && data.data && Array.isArray(data.data.contests)) return data.data.contests;
+    if (data && Array.isArray(data.contests)) return data.contests;
+    return [];
+  }
+
+  // A contest matches only when BOTH the away and the home side match the
+  // clicked game. Same-day rematches of one team against different opponents
+  // cannot false-positive through this rule.
+  function findNCAAContestForGame(contests, game) {
+    var list = Array.isArray(contests) ? contests : [];
+    if (!game) return null;
+    for (var i = 0; i < list.length; i++) {
+      var teams = Array.isArray(list[i] && list[i].teams) ? list[i].teams : [];
+      var away = null;
+      var home = null;
+      teams.forEach(function (t) {
+        if (t && t.isHome === true) home = t;
+        else if (t && t.isHome === false) away = t;
+      });
+      if (!away || !home) continue;
+      if (espnSideMatchesNCAATeam(game.away, away) && espnSideMatchesNCAATeam(game.home, home)) return list[i];
+    }
+    return null;
   }
 
   function lastPlayScore(detail) {
@@ -1358,7 +1481,10 @@
       parseCompetitor: parseCompetitor, mergeEvents: mergeEvents, groupGames: groupGames,
       shouldOpenNextGameDay: shouldOpenNextGameDay, periodLabel: periodLabel, normalizePlay: normalizePlay, extractPlays: extractPlays,
       parseDrives: parseDrives, parseSummary: parseSummary, lastPlayScore: lastPlayScore,
-      teamStatRows: teamStatRows, statusVM: statusVM, lineColumns: lineColumns, fmtKickoff: fmtKickoff, weekForDate: weekForDate
+      teamStatRows: teamStatRows, statusVM: statusVM, lineColumns: lineColumns, fmtKickoff: fmtKickoff, weekForDate: weekForDate,
+      ESPN_CORE_BASE: ESPN_CORE_BASE, espnCorePlaysUrl: espnCorePlaysUrl, summaryDrivesOf: summaryDrivesOf,
+      extractCorePlays: extractCorePlays, normalizeTeamKey: normalizeTeamKey, espnSideMatchesNCAATeam: espnSideMatchesNCAATeam,
+      ncaaContestsOf: ncaaContestsOf, findNCAAContestForGame: findNCAAContestForGame
     };
   }
 
@@ -1375,6 +1501,7 @@
     proxy: null,        // which CORS proxy is in use, when viaProxy is true
     provider: null,     // concrete provider URL that supplied the current data
     source: null,       // 'espn' or 'ncaa'
+    detailSource: null, // game view only: 'espn-core' when PBP was backfilled
     weekLabel: '',
     seasonYear: null,
     league: null,       // leagues[0] of the loaded day (calendar for nearby windows)
@@ -2076,6 +2203,59 @@
     return { overview: overview, detail: detail, payloads: payloads };
   }
 
+  // Historical PBP backfill from the verified ESPN Core API plays collection.
+  // It needs only the event id, and the plays are paginated in much smaller
+  // chunks than the summary document — so this still retrieves old games when
+  // a transport that choked on the multi-hundred-KB summary is the only one a
+  // browser allows. Pagination follows the envelope's pageCount (bounded).
+  async function fetchCorePlays(eventId) {
+    var url = espnCorePlaysUrl(eventId);
+    if (!url) return null;
+    var rawItems = [];
+    var viaProxy = false;
+    var proxy = null;
+    var provider = null;
+    var page = 1;
+    var pages = 1;
+    while (page <= pages) {
+      var r = await espnFetch(url + '&page=' + page);
+      var items = r.data && Array.isArray(r.data.items) ? r.data.items : [];
+      if (page === 1 && !items.length) return null;
+      rawItems = rawItems.concat(items);
+      viaProxy = viaProxy || r.viaProxy;
+      if (!proxy) proxy = r.proxy;
+      if (!provider) provider = r.provider;
+      var pageCount = Number(r.data && r.data.pageCount) || 1;
+      pages = Math.min(Math.max(pageCount, 1), 6);
+      page += 1;
+    }
+    var plays = extractCorePlays({ items: rawItems });
+    return plays.length ? { plays: plays, viaProxy: viaProxy, proxy: proxy, provider: provider } : null;
+  }
+
+  // Cross-provider backfill for a clicked ESPN game whose own detail could
+  // not be retrieved: find the same matchup in the verified NCAA date feed
+  // (the date comes from the game itself, never guessed) and reuse the full
+  // NCAA detail pipeline — overview, play-by-play, boxscore, team stats.
+  async function tryNCAABackfill() {
+    var g = state.game;
+    if (!g || g.source !== 'espn') return null;
+    var day = g.date ? etDateFromWallclock(g.date) : null;
+    if (!day && /^\d{8}$/.test(state.date)) day = state.date;
+    if (!day) return null;
+    try {
+      var dayResult = await espnFetch(ncaaScoreboardUrl(day));
+      if (!scoreboardPayloadIsUsable(dayResult.data)) return null;
+      var contest = findNCAAContestForGame(ncaaContestsOf(dayResult.data), g);
+      if (!contest) return null;
+      var id = contest.contestId || contest.id;
+      if (id === undefined || id === null || id === '') return null;
+      return await loadNCAAData(String(id));
+    } catch (e) {
+      return null;
+    }
+  }
+
   var gameRun = 0;
 
   function gameLoadIsCurrent(run, requestedId) {
@@ -2096,6 +2276,7 @@
     state.proxy = null;
     state.provider = null;
     state.source = state.game ? state.game.source : null;
+    state.detailSource = null;
     state.seenPlayIds = {};
     freshIds = {};
     state.tab = 'pbp';
@@ -2126,6 +2307,21 @@
           state.proxy = r.proxy;
           state.provider = r.provider;
           state.source = 'espn';
+          // Historical backfill: a summary can parse cleanly yet carry no
+          // drives/plays (older trimmed summaries). Reuse the verified Core
+          // API plays index for the same event id before ever showing an
+          // empty play-by-play tab for a game that has one.
+          if (!state.detail.plays.length) {
+            var core = await fetchCorePlays(requestedId).catch(function () { return null; });
+            if (!gameLoadIsCurrent(run, requestedId)) return;
+            if (core) {
+              state.detail.plays = core.plays;
+              state.detailSource = 'espn-core';
+              state.viaProxy = state.viaProxy || core.viaProxy;
+              if (!state.proxy) state.proxy = core.proxy;
+              if (!state.provider) state.provider = core.provider;
+            }
+          }
           if (!state.game) {
             await resolveGameEvent(run, requestedId);
             if (!gameLoadIsCurrent(run, requestedId)) return;
@@ -2133,19 +2329,62 @@
             syncScoresFromPlays();
           }
         } catch (espnError) {
-          // A deep link contains only an ID, so it may be an NCAA contest ID
-          // rather than an ESPN event ID. Try the verified NCAA overview before
-          // giving up; rows already carrying an ESPN event never take this path.
-          if (fromEvent) throw espnError;
-          var ncaaFallback = await loadNCAAData(requestedId);
+          // The summary transport itself failed (e.g. the only browser path to
+          // the multi-hundred-KB summary document was blocked). Backfill the
+          // historical detail from the verified indexes, in order:
+          //   1. ESPN Core API plays for the same event id (small payloads);
+          //   2. the NCAA contest for the same date and teams (own id space);
+          //   3. for bare deep links, the legacy NCAA-contest-id reading.
+          var coreBackfill = await fetchCorePlays(requestedId).catch(function () { return null; });
           if (!gameLoadIsCurrent(run, requestedId)) return;
-          state.detail = ncaaFallback.detail;
-          var fallbackEvent = eventsOf(ncaaFallback.overview.data)[0];
-          state.game = fallbackEvent ? parseEvent(fallbackEvent) : null;
-          state.viaProxy = ncaaFallback.overview.viaProxy;
-          state.proxy = ncaaFallback.overview.proxy;
-          state.provider = ncaaFallback.overview.provider;
-          state.source = 'ncaa';
+          if (coreBackfill) {
+            state.detail = state.game ? detailFromParsedGame(state.game) : {
+              teams: [], players: [], drives: [], plays: [], article: null,
+              rawKeys: [], headerDate: null, clock: null
+            };
+            state.detail.plays = coreBackfill.plays;
+            state.detailSource = 'espn-core';
+            state.source = 'espn';
+            state.viaProxy = coreBackfill.viaProxy;
+            state.proxy = coreBackfill.proxy;
+            state.provider = coreBackfill.provider;
+            if (!state.game) {
+              // The plays carry wall clocks and a date-precise scoreboard
+              // request is far smaller than the summary, so the header can
+              // usually still be resolved even when the summary could not.
+              await resolveGameEvent(run, requestedId);
+              if (!gameLoadIsCurrent(run, requestedId)) return;
+            } else {
+              syncScoresFromPlays();
+            }
+          } else {
+            var crosswalk = await tryNCAABackfill();
+            if (!gameLoadIsCurrent(run, requestedId)) return;
+            if (crosswalk) {
+              state.detail = crosswalk.detail;
+              state.viaProxy = crosswalk.overview.viaProxy;
+              state.proxy = crosswalk.overview.proxy;
+              state.provider = crosswalk.overview.provider;
+              state.source = 'ncaa';
+              state.detailSource = 'ncaa-backfill';
+              var crosswalkEvent = eventsOf(crosswalk.overview.data)[0];
+              if (crosswalkEvent) state.game = parseEvent(crosswalkEvent);
+            } else {
+              // A deep link contains only an ID, so it may be an NCAA contest ID
+              // rather than an ESPN event ID. Try the verified NCAA overview before
+              // giving up; rows already carrying an ESPN event never take this path.
+              if (fromEvent) throw espnError;
+              var ncaaFallback = await loadNCAAData(requestedId);
+              if (!gameLoadIsCurrent(run, requestedId)) return;
+              state.detail = ncaaFallback.detail;
+              var fallbackEvent = eventsOf(ncaaFallback.overview.data)[0];
+              state.game = fallbackEvent ? parseEvent(fallbackEvent) : null;
+              state.viaProxy = ncaaFallback.overview.viaProxy;
+              state.proxy = ncaaFallback.overview.proxy;
+              state.provider = ncaaFallback.overview.provider;
+              state.source = 'ncaa';
+            }
+          }
         }
       }
       if (!gameLoadIsCurrent(run, requestedId)) return;
@@ -2153,10 +2392,11 @@
       state.lastUpdated = new Date();
     } catch (e) {
       if (!gameLoadIsCurrent(run, requestedId)) return;
-      // The NCAA overview is useful even when its optional detail routes are
-      // down; use the clicked row as a visible fallback instead of a blank
-      // page. ESPN keeps its existing summary error behavior.
-      if (state.game && state.game.source === 'ncaa' && !state.detail) state.detail = detailFromParsedGame(state.game);
+      // A clicked row is useful even when every detail source is down; render
+      // the scoreboard data the visitor already saw instead of a blank page
+      // (the NCAA overview previously had this fallback; extend it to ESPN
+      // rows now that historical backfills can still narrow the error).
+      if (state.game && !state.detail) state.detail = detailFromParsedGame(state.game);
       state.error = 'Could not load game data: ' + ((e && e.message) || e);
     }
     if (!gameLoadIsCurrent(run, requestedId)) return;
@@ -2611,11 +2851,15 @@
   }
 
   function gameViewHtml() {
+    var sourceBadge = state.detailSource === 'espn-core'
+      ? '<span class="updated">ESPN Core backfill</span>'
+      : (state.source === 'ncaa' ? '<span class="updated">NCAA fallback</span>'
+        : (state.viaProxy ? '<span class="updated">via ' + esc(state.proxy === 'server' ? 'server relay' : (state.proxy || 'CORS proxy')) + '</span>' : ''));
     var tabs = '<nav class="tabs">' +
       [['pbp', 'Play-by-Play'], ['team', 'Team Stats'], ['player', 'Player Stats']].map(function (t) {
         return '<button class="tab' + (state.tab === t[0] ? ' on' : '') + '" data-tab="' + t[0] + '">' + t[1] + '</button>';
       }).join('') +
-      (state.source === 'ncaa' ? '<span class="updated">NCAA fallback</span>' : (state.viaProxy ? '<span class="updated">via ' + esc(state.proxy === 'server' ? 'server relay' : (state.proxy || 'CORS proxy')) + '</span>' : '')) +
+      sourceBadge +
       (state.lastUpdated ? '<span class="updated">updated ' + state.lastUpdated.toLocaleTimeString() + '</span>' : '') +
       '</nav>';
     var panel;
@@ -2677,6 +2921,7 @@
     };
     if (state.detail) {
       info.gameId = state.gameId;
+      info.detailSource = state.detailSource || (state.source === 'ncaa' ? 'ncaa' : 'espn-summary');
       info.summaryTopLevelKeys = state.detail.rawKeys;
       info.plays = state.detail.plays.length;
       info.drives = state.detail.drives.length;
@@ -2868,6 +3113,14 @@
     statusVM: statusVM,
     lineColumns: lineColumns,
     fmtKickoff: fmtKickoff,
-    weekForDate: weekForDate
+    weekForDate: weekForDate,
+    ESPN_CORE_BASE: ESPN_CORE_BASE,
+    espnCorePlaysUrl: espnCorePlaysUrl,
+    summaryDrivesOf: summaryDrivesOf,
+    extractCorePlays: extractCorePlays,
+    normalizeTeamKey: normalizeTeamKey,
+    espnSideMatchesNCAATeam: espnSideMatchesNCAATeam,
+    ncaaContestsOf: ncaaContestsOf,
+    findNCAAContestForGame: findNCAAContestForGame
   };
 });
