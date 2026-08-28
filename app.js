@@ -929,7 +929,42 @@
       scoringType: p.scoringType ? (p.scoringType.abbreviation || p.scoringType.name) : null,
       pointAfter: p.pointAfterAttempt ? (p.pointAfterAttempt.text || '') : null,
       driveId: driveId || null,
-      time: p.wallclock ? Date.parse(p.wallclock) : 0
+      time: p.wallclock ? Date.parse(p.wallclock) : 0,
+      // Position fields used only by the live booth (flags & reviews). They
+      // are read straight from the verified ESPN play objects (start.yardsToEndzone,
+      // start.downDistanceText, start.possessionText, penalty.yards, penalty.type.text
+      // — all verified present on college-football plays, see README). They are
+      // optional: NCAA-fallback plays (parseNCAAPlays) do not carry them, and the
+      // booth must never invent a field position.
+      start: p.start
+        ? {
+          yardsToEndzone: p.start.yardsToEndzone !== undefined && p.start.yardsToEndzone !== null ? Number(p.start.yardsToEndzone) : null,
+          downDistanceText: p.start.downDistanceText || '',
+          possessionText: p.start.possessionText || '',
+          yardLine: p.start.yardLine !== undefined && p.start.yardLine !== null ? Number(p.start.yardLine) : null,
+          teamId: (p.start.team && p.start.team.id != null) ? String(p.start.team.id) : null
+        }
+        : null,
+      end: p.end
+        ? {
+          yardsToEndzone: p.end.yardsToEndzone !== undefined && p.end.yardsToEndzone !== null ? Number(p.end.yardsToEndzone) : null,
+          downDistanceText: p.end.downDistanceText || '',
+          possessionText: p.end.possessionText || '',
+          yardLine: p.end.yardLine !== undefined && p.end.yardLine !== null ? Number(p.end.yardLine) : null,
+          teamId: (p.end.team && p.end.team.id != null) ? String(p.end.team.id) : null
+        }
+        : null,
+      penalty: p.penalty
+        ? {
+          yards: p.penalty.yards !== undefined && p.penalty.yards !== null ? Number(p.penalty.yards) : null,
+          typeText: (p.penalty.type && p.penalty.type.text) || ''
+        }
+        : null,
+      penaltyText: p.penalty
+        ? ((p.penalty.yards != null ? p.penalty.yards + '-yard ' : '') +
+           ((p.penalty.type && p.penalty.type.text) || 'Penalty'))
+        : '',
+      scoreValue: p.scoreValue !== undefined && p.scoreValue !== null ? Number(p.scoreValue) : null
     };
   }
 
@@ -1315,7 +1350,17 @@
             scoringType: scoringType,
             pointAfter: null,
             driveId: null,
-            time: 0
+            time: 0,
+            // NCAA-fallback play rows carry no field position / penalty objects
+            // (only playText, driveText, clock, scores). Leave them null so the
+            // booth never guesses a red-zone or penalty detail.
+            start: null,
+            end: null,
+            penalty: null,
+            penaltyText: /penalty/i.test(text)
+              ? ((text.match(/penalty/i) ? '' : '') + 'Penalty')
+              : '',
+            scoreValue: null
           });
           if (away !== null) previous.away = away;
           if (home !== null) previous.home = home;
@@ -1422,6 +1467,527 @@
     return rows;
   }
 
+  /* ================================================================
+   * LIVE BOOTH — flags & reviews (dark side of the game)
+   *
+   * A chat-style feed of every flag, coach's challenge, replay review
+   * and under-review play from a game (and, at the day level, from every
+   * game of the selected day). It tracks the running score before →
+   * during → after a score is taken off the board and flags the nullified
+   * scoring plays (TD, FG, PAT and 2-pt conversion only) plus the red-zone
+   * subset of those.
+   *
+   * Everything here is a pure reshape of the verified ESPN college-football
+   * play objects (same text / type.text / isPenalty / penalty / start.* /
+   * awayScore-homeScore running score shape the app already normalizes in
+   * normalizePlay). Nothing is fetched and nothing is guessed: an unknown
+   * field position or an unrisked nullification is never invented.
+   *
+   * NCAA wording: the college-football feed shares ESPN's play-by-play
+   * writer with the NFL, but the referee announcements differ. As of the
+   * 2025 season NCAA replay results are announced only as "upheld" or
+   * "overturned" (the old "confirmed"/"stands" language was removed — see
+   * the NCAA Football Rules Committee 2025 report and the Instant Replay
+   * Rule 12 announcements). Accepted fouls wipe a down with "No Play" and
+   * NCAA Rule 10 says the "play is nullified". The classifiers here match
+   * BOTH the new NCAA language and the older NFL/ESPN wording so old and
+   * new games are handled.
+   * ================================================================ */
+
+  // Kinds and labels are shared by the day feed, the game Flags & Reviews
+  // tab and the Red Zone tab.
+  var BOOTH_KINDS = ['penalty', 'challenge', 'replay', 'review'];
+  var BOOTH_KIND_LABEL = {
+    penalty: 'Flag',
+    challenge: 'Challenge',
+    replay: 'Replay',
+    review: 'Under review'
+  };
+  var BOOTH_RESULT_LABEL = {
+    pending: 'In progress',
+    overturned: 'Overturned',
+    upheld: 'Upheld',
+    confirmed: 'Confirmed',
+    stands: 'Stands',
+    declined: 'Declined',
+    offsetting: 'Offsetting'
+  };
+  // One shared filter row for the day feed, the game Flags & Reviews tab and
+  // the Red Zone tab. "Nullified" selects the events that took a score off
+  // the board. The day feed adds a "Red zone" cut on top.
+  var BOOTH_FILTERS = [
+    ['all', 'All'],
+    ['penalty', 'Flags'],
+    ['challenge', 'Challenges'],
+    ['replay', 'Replay'],
+    ['review', 'Under review'],
+    ['nullified', 'Nullified']
+  ];
+  var DAY_BOOTH_FILTERS = BOOTH_FILTERS.concat([['redzone', 'Red zone']]);
+
+  // The score on each play (away/home) as a comparable pair.
+  function boothScore(play) {
+    return {
+      away: (play && play.awayScore != null) ? Number(play.awayScore) : 0,
+      home: (play && play.homeScore != null) ? Number(play.homeScore) : 0
+    };
+  }
+
+  function boothHasExplicitScore(play) {
+    return !!(play && (play.awayScore != null || play.homeScore != null));
+  }
+
+  function boothPlayText(p) { return (p && p.text) || ''; }
+  function boothPlayType(p) { return (p && p.type) || ''; }
+
+  // A score word is any touchdown field goal extra point / two-point
+  // conversion / safety / PAT. Used to decide whether text is reporting a
+  // score coming off the board (never on an ordinary play).
+  var SCORE_WORDS = /\btouchdown\b|\bfield goal\b|\bextra point\b|\btwo[- ]point\b|\b2[- ]point\b|\bconversion\b|\bsafety\b|\bPAT\b|\btd\b/i;
+  function boothMentionsScore(text) {
+    return SCORE_WORDS.test(String(text || ''));
+  }
+
+  function boothIsNoGood(text) {
+    var t = String(text || '').toLowerCase();
+    return /\bno good\b/.test(t) || /\bblocked\b/.test(t) || /\bmissed\b/.test(t) ||
+      /\bwide\b/.test(t) || /\bfailed\b/.test(t) || /\bincomplete\b/.test(t);
+  }
+
+  // True when a play's own description reports a score being wiped out. This
+  // is the official "nullified" wording AND the two other shapes the feed uses:
+  //   a) "<score> ... NULLIFIED" (explicit),
+  //   b) an accepted foul that wipes the down ("- No Play" / "no play") on a
+  //      scoring play,
+  //   c) a replay verdict that OVERTURNED / REVERSED a scoring play.
+  // NCAA 2025+ announces "upheld"/"overturned"; older games used the same
+  // "nullified"/"No Play" wording. "void the score" / "erased" / "wiped"
+  // appear in the rulebook and in ESPN write-ups, so they are matched too, but
+  // only when the text names a score.
+  function nullifiedScoreText(text) {
+    var t = String(text || '');
+    if (!t || !boothMentionsScore(t)) return false;
+    if (/\bnullified\b/i.test(t)) return true;                 // explicit wording
+    if (/\bno play\b/i.test(t)) return true;                   // accepted foul wipes the down
+    if (/\breversed\b/i.test(t) || /\boverturned\b/i.test(t) || /\boverruled\b/i.test(t)) return true; // replay verdict
+    if (/\bvoid the score\b/i.test(t) || /\berased\b/i.test(t)) return true;   // rulebook / write-up wording
+    return false;
+  }
+
+  // A booth event nullifies when points actually left the running score, or
+  // when its text reports the nullification above. Both signals are used so
+  // the day feed, the Red Zone tab and the alert sound never disagree.
+  function boothEventNullifies(event) {
+    if (!event) return false;
+    if (event.removesPoints) return true;
+    return nullifiedScoreText(event.text);
+  }
+
+  // Classify the kind of a booth event. Operates on text and type, never on a
+  // separate reviews feed (which the college-football summary does not serve).
+  function boothClassify(p) {
+    if (!p) return '';
+    var type = boothPlayType(p).toLowerCase();
+    var text = boothPlayText(p);
+    if (/\bunder (further )?review\b/i.test(text) || type.indexOf('under review') !== -1) return 'review';
+    if (/\bchallenged\b/i.test(text) || /\bchallenge by\b/i.test(text) || type.indexOf('challenge') !== -1) return 'challenge';
+    if (/\breplay (official|review)\b/i.test(text) || /\bruling on the field\b/i.test(text) ||
+        /\b(was|is) reversed\b/i.test(text) || /\b(was|is) overturned\b/i.test(text) ||
+        /\b(was|is) overruled\b/i.test(text) || /\bupheld\b/i.test(text) ||
+        type.indexOf('replay') !== -1) return 'replay';
+    // A flag can be published two ways: `isPenalty:true` + a `penalty` object on
+    // its own row, or (commonly in college football) the phrase "PENALTY <team>
+    // <foul> (<player>) <yards> yards from <spot> to <spot>" embedded at the end
+    // of the preceding play's text with isPenalty left false (verified in the
+    // summary fixture: a kickoff row ends "... End Of Play PENALTY Mizzou Holding
+    // (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07"). So accept an embedded
+    // PENALTY marker too — never only the standalone row form.
+    if (p.isPenalty || type === 'penalty' || /\bPENALTY on\b/.test(text) || /^\s*PENALTY\b/.test(text) ||
+        /\bPENALTY\s+[A-Za-z][A-Za-z &'-]*\s+[A-Z]/.test(text) || /\bPENALTY\b/.test(text)) return 'penalty';
+    return '';
+  }
+
+  // The verdict word in the text. NCAA 2025+ referee announcements say
+  // "upheld" / "overturned"; older games used "confirmed" / "stands".
+  function boothResult(text) {
+    var t = String(text || '').toLowerCase();
+    if (/\bunder (further )?review\b/.test(t)) return 'pending';
+    if (/\breversed\b/.test(t) || /\boverturned\b/.test(t) || /\boverruled\b/.test(t)) return 'overturned';
+    if (/\bupheld\b/.test(t)) return 'upheld';
+    if (/\bconfirmed\b/.test(t)) return 'confirmed';
+    if (/\bstands\b/.test(t)) return 'stands';
+    if (/\bdeclined\b/.test(t)) return 'declined';
+    if (/\boffset/.test(t)) return 'offsetting';
+    return '';
+  }
+
+  // Red zone: opponent's 20 or inside. Uses the same verified position
+  // fields the NFL mapping uses (start.yardsToEndzone is side-independent;
+  // start.downDistanceText "Goal"/"goal-to-go" is a fallback; 0 means "not
+  // provided", never "at the end zone"). NCAA plays carry these fields
+  // (verified on the Core API play-by-play: start.yardsToEndzone,
+  // downDistanceText, possessionText). A distance that cannot be established
+  // is null — it is never guessed, and the play is not a red-zone play.
+  var BOOTH_RED_ZONE_DISTANCE = 20;
+  function boothYardsToEndzone(p, teamMap) {
+    var s = p && p.start;
+    if (!s) return null;
+    if (s.yardsToEndzone != null && isFinite(s.yardsToEndzone) && s.yardsToEndzone >= 1) return s.yardsToEndzone;
+    if (s.downDistanceText && /\bgoal\b/i.test(s.downDistanceText)) return BOOTH_RED_ZONE_DISTANCE;
+    var m = (s.possessionText || '').match(/^\s*([A-Za-z&]{2,4})\s+(\d{1,3})\s*$/);
+    if (m) {
+      // The possession text names the nearer goal line. The distance to the
+      // end zone depends on which way the offense is driving; the offense id
+      // (if resolvable) tells us whether the named team is the offense.
+      var offenseId = p.possessionTeamId || p.offTeamId || '';
+      var offenseAbbr = (teamMap && offenseId && teamMap[offenseId] && teamMap[offenseId].abbr) || '';
+      if (offenseAbbr) {
+        var n = Number(m[2]);
+        return (m[1] === offenseAbbr) ? 100 - n : n;
+      }
+    }
+    return null;
+  }
+  function boothIsRedZonePlay(p, teamMap) {
+    var d = boothYardsToEndzone(p, teamMap);
+    return d != null && d <= BOOTH_RED_ZONE_DISTANCE;
+  }
+
+  function boothTeamOf(teamMap, id) {
+    if (!teamMap || id == null) return { abbr: '', displayName: '', logo: '' };
+    var t = teamMap[String(id)];
+    if (!t) return { abbr: '', displayName: '', logo: '' };
+    return t;
+  }
+
+  function boothHeading(kind, p) {
+    if (kind === 'review') return 'Play under review';
+    if (kind === 'challenge') return 'Coach\u2019s challenge';
+    if (kind === 'replay') return 'Replay review';
+    var text = (p && p.text) || '';
+    if (p && p.penaltyText) return p.penaltyText;
+    // Some NCAA/ESPN penalty rows carry only isPenalty + text (no penalty
+    // object). Parse "<yards>-yard <Foul>" from the verified wording, in any of
+    //   "PENALTY on <Team>-#<number>, <Foul>, <yards> yards"
+    //   "PENALTY <Team> <Foul> (<number> <player>) <yards> yards from <spot> to <spot>"
+    //   "PENALTY <Team> <Foul> <yards> yards"
+    var m = text.match(/\bPENALTY\s+on\s+[^,]+,\s*([^,]+?),\s*(\d+)\s+yards/i);
+    if (m) return m[2] + '-yard ' + m[1];
+    var m2 = text.match(/\bPENALTY\s+[A-Za-z &'-]+?\s+([A-Za-z &'-]+?)\s+\(?#?\d+[)]?[^,]*?\s+(\d+)\s+yards\s+from/i);
+    if (m2) return m2[2] + '-yard ' + m2[1];
+    var m3 = text.match(/\bPENALTY\s+[A-Za-z &'-]+?\s+([A-Za-z &'-]+?)\s+(\d+)\s+yards\b/i);
+    if (m3) return m3[2] + '-yard ' + m3[1];
+    return (p && p.type) || 'Penalty';
+  }
+
+  function boothPenaltyText(p) {
+    if (!p || !p.penalty) return '';
+    return boothHeading('penalty', p);
+  }
+
+  // A single booth event from a normalized play (or null when the play is not
+  // a flag / challenge / review). Position and score are attached later by
+  // boothEventContext once the full play list is known.
+  function boothEvent(p) {
+    if (!p) return null;
+    var kind = boothClassify(p);
+    if (!kind) return null;
+    return {
+      id: p.id,
+      seq: p.seq,
+      kind: kind,
+      type: boothPlayType(p),
+      text: boothPlayText(p),
+      heading: boothHeading(kind, p),
+      result: boothResult(p.text),
+      quarter: p.period,
+      clock: p.clock,
+      downDistance: p.downDistance || '',
+      awayScore: p.awayScore != null ? p.awayScore : null,
+      homeScore: p.homeScore != null ? p.homeScore : null,
+      penaltyText: p.penaltyText || '',
+      penaltyYards: (p.penalty && p.penalty.yards != null) ? p.penalty.yards : null,
+      penaltyType: (p.penalty && p.penalty.typeText) || '',
+      teamId: p.possessionTeamId || p.offTeamId || p.defTeamId || null,
+      team: null, // filled by boothEventContext via teamMap
+      yardsToEndzone: null, // filled below
+      redZone: false,
+      nullified: nullifiedScoreText(p.text)
+    };
+  }
+
+  // A score-rollback can only belong to a booth event that could actually have
+  // ruled on it: a scoring/nullification play, a review/challenge/replay, or a
+  // penalty immediately after the scoring play. A routine kickoff/punt foul
+  // that merely changes possession cannot remove the prior score.
+  function boothRollbackEligible(plays, index) {
+    var p = plays && plays[index];
+    if (!p) return false;
+    var text = boothPlayText(p);
+    if (p.scoringPlay === true || boothMentionsScore(text)) return true;
+    var kind = boothClassify(p);
+    if (kind === 'review' || kind === 'challenge' || kind === 'replay') return true;
+    if (kind !== 'penalty') return false;
+    var type = boothPlayType(p);
+    if (/kickoff|kick return|punt|punt return/i.test(type)) return false;
+    for (var i = index - 1; i >= 0 && i >= index - 3; i -= 1) {
+      var prior = plays[i];
+      if (!prior) continue;
+      if (/timeout/i.test(boothPlayType(prior))) continue;
+      return boothIsScoringPlay(prior);
+    }
+    return false;
+  }
+
+  function boothIsScoringPlay(p) {
+    if (!p) return false;
+    if (p.scoringPlay === true) return true;
+    if (boothClassify(p)) return false;
+    var text = boothPlayText(p);
+    var type = boothPlayType(p).toLowerCase();
+    if (type === 'touchdown' || /\btouchdown\b/i.test(text)) return true;
+    if (type === 'field goal' || /\bfield goal\b/i.test(text)) {
+      if (boothIsNoGood(text)) return false;
+      if (/\bgood\b/i.test(text)) return true;
+      if (type === 'field goal') return true;
+      return false;
+    }
+    if (type === 'safety' || /\bsafety\b/i.test(text)) return true;
+    if (/\bextra point\b/i.test(text) || type.indexOf('extra point') !== -1) {
+      if (boothIsNoGood(text)) return false;
+      if (/\bgood\b/i.test(text)) return true;
+      return false;
+    }
+    if (/(two-point|2-point|two point)/i.test(text) || /(two-point|2-point|two point)/i.test(type)) {
+      if (boothIsNoGood(text)) return false;
+      if (/\bgood\b/i.test(text) || /\bsuccessful\b/i.test(text)) return true;
+      return false;
+    }
+    return false;
+  }
+
+  function boothNearestScoringPlay(plays, index, lookback) {
+    var span = lookback != null ? lookback : 8;
+    var start = Math.max(0, index - span);
+    for (var i = index - 1; i >= start; i -= 1) {
+      var p = plays[i];
+      if (!p) continue;
+      if (boothIsScoringPlay(p)) {
+        var before = i > 0 ? boothScore(plays[i - 1]) : { away: 0, home: 0 };
+        var after = boothScore(p);
+        return {
+          id: p.id,
+          index: i,
+          type: boothPlayType(p),
+          text: boothPlayText(p),
+          points: Math.max(0, after.away - before.away, after.home - before.home),
+          team: (after.away - before.away) > 0 ? 'away' : ((after.home - before.home) > 0 ? 'home' : ''),
+          score: after
+        };
+      }
+    }
+    return null;
+  }
+
+  // The heart of the booth: rebuild the score before / during / after an event
+  // from the running awayScore-homeScore ESPN publishes on each play, without
+  // trusting a transient lower total on an event that cannot rule on a score.
+  function boothScoreEffect(plays, index) {
+    if (!plays || index == null || index < 0 || index >= plays.length) {
+      return { before: { away: 0, home: 0 }, during: { away: 0, home: 0 }, after: { away: 0, home: 0 }, removesPoints: false, pointsRemoved: 0, team: '' };
+    }
+    var before = index > 0 ? boothScore(plays[index - 1]) : boothScore(plays[index]);
+    var eligible = boothRollbackEligible(plays, index);
+    var publishedDuring = boothHasExplicitScore(plays[index]) ? boothScore(plays[index]) : before;
+    var dropsScore = publishedDuring.away < before.away || publishedDuring.home < before.home;
+    var during = (dropsScore && !eligible) ? before : publishedDuring;
+
+    var removedAway = eligible ? Math.max(0, before.away - during.away) : 0;
+    var removedHome = eligible ? Math.max(0, before.home - during.home) : 0;
+    var after = during;
+    var resolved = null;
+
+    // A rollback is often published on the NEXT play (e.g. "Play under
+    // review." then the verdict). Scan forward for the first lower running
+    // score, but only for an event that could have caused that correction.
+    var maxIndex = Math.min(plays.length, index + 5);
+    var maxAway = Math.max(before.away, during.away);
+    var maxHome = Math.max(before.home, during.home);
+    if (eligible) {
+      for (var i = index + 1; i < maxIndex; i += 1) {
+        var s = boothScore(plays[i]);
+        if (boothHasExplicitScore(plays[i]) && (s.away < maxAway || s.home < maxHome)) { resolved = s; break; }
+        maxAway = Math.max(maxAway, s.away);
+        maxHome = Math.max(maxHome, s.home);
+      }
+    }
+    if (resolved) {
+      after = resolved;
+      removedAway = Math.max(removedAway, Math.max(0, maxAway - resolved.away));
+      removedHome = Math.max(removedHome, Math.max(0, maxHome - resolved.home));
+    } else if (!removedAway && !removedHome && index + 1 < plays.length && boothHasExplicitScore(plays[index + 1])) {
+      var next = boothScore(plays[index + 1]);
+      if (next.away >= during.away && next.home >= during.home) after = next;
+    }
+
+    var pointsRemoved = Math.max(removedAway, removedHome);
+    return {
+      before: before,
+      during: during,
+      after: after,
+      removesPoints: pointsRemoved > 0,
+      pointsRemoved: pointsRemoved,
+      team: removedAway > 0 ? 'away' : (removedHome > 0 ? 'home' : '')
+    };
+  }
+
+  // Attach the score trail and the verdict to a raw booth event, given its
+  // index inside the full (sorted) play list for the game.
+  function boothEventContext(event, plays, index, teamMap) {
+    if (!event) return null;
+    var effect = boothScoreEffect(plays, index);
+    var related = boothNearestScoringPlay(plays, index);
+    var t = boothTeamOf(teamMap, event.teamId);
+    var withScores = Object.assign({}, event, {
+      team: t,
+      yardsToEndzone: boothYardsToEndzone(plays[index], teamMap),
+      redZone: boothIsRedZonePlay(plays[index], teamMap),
+      beforeAwayScore: effect.before.away,
+      beforeHomeScore: effect.before.home,
+      duringAwayScore: effect.during.away,
+      duringHomeScore: effect.during.home,
+      afterAwayScore: effect.after.away,
+      afterHomeScore: effect.after.home,
+      removesPoints: effect.removesPoints,
+      pointsRemoved: effect.pointsRemoved,
+      removedTeam: effect.team,
+      relatedScoringPlay: related
+    });
+    withScores.nullified = boothEventNullifies(withScores);
+    return withScores;
+  }
+
+  function boothContextIndex(plays, event) {
+    if (!plays || !event) return -1;
+    if (event.id != null) {
+      for (var i = 0; i < plays.length; i += 1) {
+        if (plays[i] && plays[i].id != null && String(plays[i].id) === String(event.id)) return i;
+      }
+    }
+    if (event.seq != null) {
+      var candidates = [];
+      for (var j = 0; j < plays.length; j += 1) {
+        var p = plays[j];
+        if (!p || String(p.seq) !== String(event.seq)) continue;
+        if (boothClassify(p) === event.kind) candidates.push(j);
+      }
+      if (candidates.length === 1) return candidates[0];
+      for (var k = 0; k < candidates.length; k += 1) {
+        if (boothPlayText(plays[candidates[k]]) === event.text) return candidates[k];
+      }
+    }
+    return -1;
+  }
+
+  function boothMergeLiveLastPlay(plays, lastPlay) {
+    var ctx = (plays || []).slice();
+    if (!lastPlay) return ctx;
+    var key = lastPlay.id != null ? String(lastPlay.id) : '';
+    var at = -1;
+    if (key) {
+      for (var i = 0; i < ctx.length; i += 1) {
+        if (ctx[i] && ctx[i].id != null && String(ctx[i].id) === key) { at = i; break; }
+      }
+    }
+    if (at >= 0) {
+      ctx[at] = lastPlay;
+    } else {
+      var copy = Object.assign({}, lastPlay);
+      if (copy.seq == null || copy.seq === '') {
+        var maxSeq = 0;
+        ctx.forEach(function (p) { if (p && p.seq != null) maxSeq = Math.max(maxSeq, Number(p.seq) || 0); });
+        copy.seq = maxSeq + 1;
+      }
+      ctx.push(copy);
+    }
+    ctx.sort(function (a, b) { return (Number(a.seq) || 0) - (Number(b.seq) || 0); });
+    return ctx;
+  }
+
+  // Build the booth events for one game from its flattened, sorted play list
+  // (state.detail.plays) plus the live last play when present. teamMap maps a
+  // team id to { abbr, displayName, logo, color } so messages can show a team.
+  function boothEvents(plays, lastPlay, teamMap) {
+    var context = boothMergeLiveLastPlay(plays, lastPlay);
+    var out = [];
+    var seen = {};
+    context.forEach(function (p, index) {
+      var ev = boothEvent(p);
+      if (!ev) return;
+      if (ev.id != null) seen[String(ev.id)] = out.length;
+      out.push(ev);
+    });
+    var result = out.map(function (event) {
+      var idx = boothContextIndex(context, event);
+      return idx < 0 ? event : boothEventContext(event, context, idx, teamMap);
+    });
+    result.sort(function (a, b) { return (Number(a.seq) || 0) - (Number(b.seq) || 0); });
+    return result;
+  }
+
+  // Merge every game's booth events into one flat, chat-style list. Each input
+  // is { id, shortName, awayAbbr, homeAbbr, date, live, events }. Ordering is
+  // left to the caller (kickoff order); duplicates (same game + play) are kept
+  // once first-occurrence-wins.
+  function dayBoothFeed(games) {
+    var out = [];
+    var seen = {};
+    (games || []).forEach(function (g) {
+      if (!g) return;
+      (g.events || []).forEach(function (e) {
+        if (!e) return;
+        var key = e.id != null
+          ? String(g.id) + ':' + String(e.id)
+          : String(g.id) + ':seq:' + (e.seq != null ? e.seq : '') + ':' + e.kind + ':' + (e.text || '');
+        if (seen[key]) return;
+        seen[key] = true;
+        out.push(Object.assign({}, e, {
+          key: key,
+          gameId: g.id,
+          shortName: g.shortName || '',
+          awayAbbr: g.awayAbbr || '',
+          homeAbbr: g.homeAbbr || '',
+          date: g.date || null,
+          liveGame: !!g.live
+        }));
+      });
+    });
+    return out;
+  }
+
+  // Preserve chat discovery order while replacing items whose source play was
+  // updated in place (for example "under review" becoming "overturned").
+  // Items no longer present in `fresh` stay in history; genuinely new keys are
+  // appended.
+  function reconcileDayBoothFeed(existing, fresh) {
+    var out = (existing || []).slice();
+    var positions = {};
+    out.forEach(function (item, index) {
+      if (item && item.key != null) positions[String(item.key)] = index;
+    });
+    (fresh || []).forEach(function (item) {
+      if (!item) return;
+      var key = item.key != null ? String(item.key) : '';
+      if (key && Object.prototype.hasOwnProperty.call(positions, key)) {
+        out[positions[key]] = item;
+        return;
+      }
+      if (key) positions[key] = out.length;
+      out.push(item);
+    });
+    return out;
+  }
+
   /* ---------------- View helpers ---------------- */
 
   function statusVM(g) {
@@ -1484,7 +2050,15 @@
       teamStatRows: teamStatRows, statusVM: statusVM, lineColumns: lineColumns, fmtKickoff: fmtKickoff, weekForDate: weekForDate,
       ESPN_CORE_BASE: ESPN_CORE_BASE, espnCorePlaysUrl: espnCorePlaysUrl, summaryDrivesOf: summaryDrivesOf,
       extractCorePlays: extractCorePlays, normalizeTeamKey: normalizeTeamKey, espnSideMatchesNCAATeam: espnSideMatchesNCAATeam,
-      ncaaContestsOf: ncaaContestsOf, findNCAAContestForGame: findNCAAContestForGame
+      ncaaContestsOf: ncaaContestsOf, findNCAAContestForGame: findNCAAContestForGame,
+      BOOTH_KINDS: BOOTH_KINDS, BOOTH_KIND_LABEL: BOOTH_KIND_LABEL, BOOTH_RESULT_LABEL: BOOTH_RESULT_LABEL,
+      BOOTH_FILTERS: BOOTH_FILTERS, DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS, BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
+      boothClassify: boothClassify, boothResult: boothResult, boothMentionsScore: boothMentionsScore,
+      nullifiedScoreText: nullifiedScoreText, boothEventNullifies: boothEventNullifies,
+      boothScoreEffect: boothScoreEffect, boothEventContext: boothEventContext, boothEvent: boothEvent,
+      boothEvents: boothEvents, dayBoothFeed: dayBoothFeed, reconcileDayBoothFeed: reconcileDayBoothFeed,
+      boothYardsToEndzone: boothYardsToEndzone, boothIsRedZonePlay: boothIsRedZonePlay,
+      boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay
     };
   }
 
@@ -1521,7 +2095,23 @@
     playerTeam: 0,
     follow: true,
     seenPlayIds: {},
-    pollers: []
+    pollers: [],
+    // Live booth (flags & reviews). boothFeed holds the day-wide list; the
+    // per-game tabs read boothEventsGame. boothMap is a gameId -> teamMap so a
+    // game's red zone resolution can find the team abbreviations.
+    booth: {
+      filter: 'all',
+      paused: false,
+      soundOn: true,
+      feed: [],              // reconciled day feed (dayBoothFeed shape)
+      eventsByGame: {},      // gameId -> booth events for that game
+      teamMaps: {},          // gameId -> { teamId: {abbr, displayName, logo, color} }
+      gamesByKey: {},        // gameId -> { id, shortName, awayAbbr, homeAbbr, date, live }
+      lastAnnounced: {},     // gameId:eventKey -> announced sound key
+      count: 0,              // how many games are included in the day feed
+      lastError: null,
+      lastLivePlays: {}      // gameId -> live last-play object (for merging)
+    }
   };
   CONFERENCES.forEach(function (c) { state.confs[c.id] = true; });
   var freshIds = {};
@@ -1531,6 +2121,7 @@
   var liveBadge = document.getElementById('liveBadge');
   var liveCountEl = document.getElementById('liveCount');
   var dateInput = document.getElementById('dateInput');
+  var dayBoothSection = document.getElementById('day-booth');
 
   /* ---------------- Tiny DOM helpers ---------------- */
   function esc(s) {
@@ -1689,6 +2280,15 @@
       state.nearby = null;
       state.nearbyFor = null;
       state.nearbyIndex = {};
+      // A newly selected date has its own slate; forget the previous day's
+      // booth feed so a "no flags yet" state is not left behind.
+      state.booth.feed = [];
+      state.booth.eventsByGame = {};
+      state.booth.teamMaps = {};
+      state.booth.gamesByKey = {};
+      state.booth.lastAnnounced = {};
+      state.booth.lastLivePlays = {};
+      state.booth.count = 0;
     } else if (showSpinner !== false) {
       // An explicit reload of the same date should not display stale adjacent
       // cards while the new nearby search is running.
@@ -1772,6 +2372,11 @@
       state.pollers.push(setInterval(function () {
         if (!document.hidden) loadScoreboard(false);
       }, delay));
+      // Live booth: seed the day feed, then poll it (fast on live days).
+      buildDayBooth(true).then(function () {
+        if (state.view === 'scoreboard') { renderDayBooth(); renderDiag(); }
+      }).catch(function () { /* keep the last feed */ });
+      startDayBoothPolling();
     }
   }
 
@@ -2389,6 +2994,9 @@
       }
       if (!gameLoadIsCurrent(run, requestedId)) return;
       if (state.detail) state.detail.plays.forEach(function (p) { state.seenPlayIds[p.id] = true; });
+      // Cache this game's booth events so the Flags & Reviews / Red Zone tabs
+      // render immediately and the day feed can reuse them.
+      if (state.detail && state.game) rebuilGameBoothFromDetail();
       state.lastUpdated = new Date();
     } catch (e) {
       if (!gameLoadIsCurrent(run, requestedId)) return;
@@ -2523,6 +3131,9 @@
         }
       });
       syncScoresFromPlays();
+      // Rebuild this game's booth events so a live "under review" → "overturned"
+      // transition updates the Flags & Reviews / Red Zone tabs and the day feed.
+      if (state.game) rebuilGameBoothFromDetail();
       state.lastUpdated = new Date();
       if (hadDetail && newPlayIds.length && state.tab === 'pbp' && state.follow) {
         requestAnimationFrame(function () {
@@ -2588,6 +3199,308 @@
       state.gamePollMode = 'pre';
       state.pollers.push(setInterval(pollGameStatus, 30000)); // waiting for kickoff
     }
+  }
+
+  /* ================================================================
+   * LIVE BOOTH — browser wiring
+   *
+   * The pure booth engine (boothClassify / boothEventNullifies /
+   * boothScoreEffect / dayBoothFeed, defined above) reshapes verified ESPN
+   * play objects. This section owns the browser half:
+   *   - build a teamMap from a game for red-zone resolution,
+   *   - fetch each day game's play-by-play (ESPN summary, then the verified
+   *     Core API plays index, then the NCAA fallback) once and cache the
+   *     booth events per game,
+   *   - render the day-wide feed above the scoreboard and the Flags &
+   *     Reviews / Red Zone tabs inside a game,
+   *   - poll the feed on the live pitches.
+   * Polling cadence mirrors the NFL booth: score/status every 250 ms,
+   * play-by-play every 1000 ms while a game is live (see /tmp/nfl-refresh.js
+   * constants, adapted below). Completed/final days do not need a hot loop.
+   * ================================================================ */
+
+  var BOOTH_SCORE_INTERVAL_MS = 250;   // NFL live scores poll
+  var BOOTH_PBP_INTERVAL_MS = 1000;    // NFL live play-by-play poll
+  var BOOTH_DAY_POLL_MS = 5000;        // non-live day feed refresh
+
+  // Build a teamMap for red-zone resolution from a parsed scoreboard event
+  // (g.away/g.home carry id, abbreviation, displayName, color, logo).
+  function boothTeamMapFromGame(g) {
+    var map = {};
+    if (!g) return map;
+    [g.away, g.home].forEach(function (side) {
+      if (!side || side.id == null) return;
+      map[String(side.id)] = {
+        id: String(side.id),
+        abbr: side.abbreviation || '',
+        displayName: side.displayName || side.name || '',
+        logo: side.logo || null,
+        color: side.color || null
+      };
+    });
+    return map;
+  }
+
+  // Build from a parsed detail (detail.teams is [away, home]).
+  function boothTeamMapFromDetail(d) {
+    var map = {};
+    if (!d) return map;
+    (d.teams || []).forEach(function (t) {
+      if (!t || t.id == null) return;
+      map[String(t.id)] = {
+        id: String(t.id),
+        abbr: t.abbreviation || '',
+        displayName: t.displayName || '',
+        logo: t.logo || null,
+        color: t.color || null
+      };
+    });
+    return map;
+  }
+
+  // Fetch the play-by-play for one day game. Prefers the ESPN summary (it
+  // carries the full normalized plays incl. start.yardsToEndzone + penalties
+  // the booth needs), then the verified Core API plays index, then the NCAA
+  // fallback (text/penalty only — no field position). Returns normalized plays.
+  async function fetchPlaysForGame(game) {
+    if (!game || !game.id) return { plays: [], source: game && game.source ? game.source : 'espn' };
+    var id = String(game.id);
+    // 1) ESPN summary plays.
+    try {
+      var r = await espnFetch(summaryUrl(id), 10000);
+      var d = parseSummary(r.data);
+      if (d.plays.length) return { plays: d.plays, detail: d, source: 'espn' };
+    } catch (e) { /* try the next source */ }
+    // 2) Core API plays (small, paginated; the historical backfill path).
+    try {
+      var core = await fetchCorePlays(id);
+      if (core && core.plays.length) return { plays: core.plays, source: 'espn-core' };
+    } catch (e) { /* try the NCAA fallback */ }
+    // 3) NCAA fallback for NCAA-source games that refuse the ESPN endpoints.
+    if (game.source === 'ncaa') {
+      try {
+        var overview = await espnFetch(ncaaGameUrl(id), 10000);
+        var contest = ncaaContestOf(overview.data);
+        var plays = [];
+        if (contest && contest.hasPbp) {
+          var pbp = await espnFetch(ncaaPlayByPlayUrl(id), 10000);
+          plays = parseNCAAPlays(pbp.data);
+        }
+        if (plays.length) return { plays: plays, source: 'ncaa' };
+      } catch (e) { /* nothing more to try */ }
+    }
+    return { plays: [], source: game.source || 'espn' };
+  }
+
+  // Build + cache the booth events for one game. Uses a provided plays list or
+  // fetches it. The game's key metadata is stored so the day feed and tabs can
+  // label rows without re-fetching.
+  function rememberGameBooth(game, plays, teamMapOverride) {
+    if (!game) return [];
+    var id = String(game.id);
+    var tm = teamMapOverride || boothTeamMapFromGame(game);
+    var events = boothEvents(plays || [], null, tm);
+    state.booth.teamMaps[id] = tm;
+    state.booth.eventsByGame[id] = events;
+    state.booth.gamesByKey[id] = {
+      id: id,
+      shortName: (game.away && game.away.abbreviation) + ' @ ' + (game.home && game.home.abbreviation),
+      awayAbbr: game.away ? game.away.abbreviation : '',
+      homeAbbr: game.home ? game.home.abbreviation : '',
+      date: game.date || null,
+      live: !!(game.status && game.status.state === 'in')
+    };
+    return events;
+  }
+
+  // Recompute the cached booth for the currently open game (used whenever its
+  // play-by-play refreshes live).
+  function rebuilGameBoothFromDetail() {
+    if (!state.detail || !state.game) return [];
+    var tm = boothTeamMapFromDetail(state.detail);
+    // Prefer the detail teamMap (has color/logo), fall back to the game.
+    if (!Object.keys(tm).length) tm = boothTeamMapFromGame(state.game);
+    var plays = state.detail.plays || [];
+    var lastPlay = state.booth.lastLivePlays[String(state.game.id)] || null;
+    return rememberGameBooth(state.game, plays, tm);
+  }
+
+  // Build the day-wide feed from every cached game. Returns the reconciled feed.
+  async function buildDayBooth(forceRefresh) {
+    var currentGames = state.games || [];
+    var refreshed = [];
+    for (var i = 0; i < currentGames.length; i++) {
+      var game = currentGames[i];
+      var id = String(game.id);
+      var cached = state.booth.eventsByGame[id];
+      var live = !!(game.status && game.status.state === 'in');
+      // Refresh live games on each cycle; final/pre games only when not cached
+      // (or when explicitly forced). This keeps the day feed correct on a hot
+      // flag without hammering every finished game.
+      if (forceRefresh || !cached || live) {
+        var fetched = await fetchPlaysForGame(game);
+        rememberGameBooth(game, fetched.plays);
+        refreshed.push(id);
+      }
+    }
+    // Assemble the feed from the cached events.
+    var perGame = Object.keys(state.booth.eventsByGame).map(function (gameId) {
+      var key = state.booth.gamesByKey[gameId] || {};
+      return {
+        id: gameId,
+        shortName: key.shortName || '',
+        awayAbbr: key.awayAbbr || '',
+        homeAbbr: key.homeAbbr || '',
+        date: key.date || null,
+        live: !!key.live,
+        events: state.booth.eventsByGame[gameId] || []
+      };
+    }).filter(function (g) { return g.events.length; });
+    var fresh = dayBoothFeed(perGame);
+    state.booth.feed = reconcileDayBoothFeed(state.booth.feed, fresh);
+    state.booth.count = perGame.length;
+    announceNewBoothEvents(fresh);
+    return state.booth.feed;
+  }
+
+  // Detect newly discovered nullified / red-zone events and play a short
+  // chime (when sound is on). Any play already in state.booth.lastAnnounced is
+  // not re-announced, so a review that upgrades from "under review" to
+  // "overturned" is announced once for its final state.
+  function boothEventSoundKey(item) {
+    if (item && item.key != null) return String(item.key);
+    return item ? ((item.gameId || '') + ':' + (item.id || (item.seq || '')) + ':' + (item.kind || '')) : '';
+  }
+  function announceNewBoothEvents(fresh) {
+    var audio = null;
+    fresh.forEach(function (item) {
+      if (!item || !item.nullified) return;
+      var key = boothEventSoundKey(item);
+      if (state.booth.lastAnnounced[key]) return;
+      state.booth.lastAnnounced[key] = true;
+      if (!state.booth.paused && state.booth.soundOn && typeof AudioContext !== 'undefined') {
+        try {
+          if (!audio) audio = new AudioContext();
+          var osc = audio.createOscillator();
+          var gain = audio.createGain();
+          osc.frequency.value = item.redZone ? 880 : 660;
+          gain.gain.setValueAtTime(0.001, audio.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.25, audio.currentTime + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + 0.25);
+          osc.connect(gain).connect(audio.destination);
+          osc.start();
+          osc.stop(audio.currentTime + 0.26);
+        } catch (e) { /* audio is best-effort */ }
+      }
+    });
+  }
+
+  // Filter a booth event list by the active booth filter.
+  function boothFilterMatches(filter, e) {
+    if (!filter || filter === 'all') return true;
+    if (filter === 'nullified') return !!e.nullified;
+    if (filter === 'redzone') return !!e.redZone || (e.yardsToEndzone != null && e.yardsToEndzone <= BOOTH_RED_ZONE_DISTANCE);
+    return e.kind === filter;
+  }
+
+  function boothSummaryScore(e) {
+    if (e.removesPoints && e.pointsRemoved > 0) {
+      return '<span class="booth-score-rollback">' + e.beforeAwayScore + '–' + e.beforeHomeScore + ' → ' + e.afterAwayScore + '–' + e.afterHomeScore +
+        ' (−' + e.pointsRemoved + ')</span>';
+    }
+    if (e.relatedScoringPlay && e.relatedScoringPlay.points > 0) {
+      return e.beforeAwayScore + '–' + e.beforeHomeScore + ' → ' + e.relatedScoringPlay.score.away + '–' + e.relatedScoringPlay.score.home;
+    }
+    return '';
+  }
+
+  function boothItemHtml(item) {
+    var kindCls = (item.kind === 'penalty') ? 'penalty' : (item.kind === 'review' ? 'review' : (item.kind === 'challenge' ? 'challenge' : 'replay'));
+    var tags = '<span class="booth-tag ' + kindCls + '">' + esc(BOOTH_KIND_LABEL[item.kind] || item.kind) + '</span>';
+    if (item.nullified) tags += '<span class="booth-tag nullified">Nullified</span>';
+    if (item.redZone || (item.yardsToEndzone != null && item.yardsToEndzone <= BOOTH_RED_ZONE_DISTANCE)) tags += '<span class="booth-tag redzone">Red zone</span>';
+    var result = item.result ? '<span class="booth-result ' + esc(item.result) + '">' + esc(BOOTH_RESULT_LABEL[item.result] || item.result) + '</span>' : '';
+    var gameLabel = item.shortName ? '<span class="bh-game">' + esc(item.shortName) + '</span>' : '';
+    var quarter = item.quarter ? esc(periodLabel(item.quarter)) : '';
+    var clockHtml = '<span class="bh-clock">' + esc(quarter ? quarter + ' ' : '') + esc(item.clock || '') + '</span>';
+    var teamHtml = '<span class="bh-team">' + esc((item.team && item.team.abbr) || (item.teamId ? '?' : '')) + '</span>';
+    // boothSummaryScore already returns a complete <span> (the rollback box, or
+    // a plain "before → after" string). Wrap it in .bh-score exactly once; the
+    // score cell is the last grid cell of the row.
+    var scoreHtml = boothSummaryScore(item);
+    return '<div class="booth-item">' +
+      clockHtml + teamHtml +
+      '<span class="bh-body"><span class="bh-heading">' + esc(item.heading) + ' ' + result + '</span>' +
+      '<span class="bh-text">' + esc(item.text) + ' ' + tags + '</span>' +
+      '<span class="bh-meta">' + gameLabel + '</span></span>' +
+      (scoreHtml ? '<span class="bh-score">' + scoreHtml + '</span>' : '<span class="bh-score"></span>') +
+      '</div>';
+  }
+
+  function boothListHtml(items) {
+    if (!items.length) {
+      return '<div class="booth-list empty-state"><strong>No flags or reviews yet.</strong>Plays, penalties and reviews appear here as the game is covered.</div>';
+    }
+    return '<div class="booth-list"><div class="booth-scroll">' + items.map(boothItemHtml).join('') + '</div></div>';
+  }
+
+  function boothToolsHtml(filters) {
+    var items = (filters || BOOTH_FILTERS).map(function (f) {
+      return '<button class="chip' + (state.booth.filter === f[0] ? ' on' : '') + '" data-booth-filter="' + f[0] + '">' + f[1] + '</button>';
+    }).join('');
+    return '<div class="booth-tools">' + items +
+      '<label class="booth-pause"><input type="checkbox" id="boothPause"' + (state.booth.paused ? ' checked' : '') + '> pause</label>' +
+      '</div>';
+  }
+
+  // Render the day-wide feed that sits above the scoreboard.
+  function renderDayBooth() {
+    if (!dayBoothSection) return;
+    var show = state.view === 'scoreboard' && state.games.length > 0;
+    if (!show) { dayBoothSection.classList.add('hidden'); return; }
+    dayBoothSection.classList.remove('hidden');
+    var visible = state.booth.feed.filter(function (e) { return boothFilterMatches(state.booth.filter, e); });
+    var liveCount = state.games.filter(function (g) { return g.status.state === 'in'; }).length;
+    var html = '<div class="booth-head">' +
+      '<span class="booth-title"><span class="dot"></span> Live booth · flags &amp; reviews</span>' +
+      '<span class="booth-sub">' + (liveCount ? liveCount + ' live' : '') + ' · ' + state.booth.feed.length + ' event' + (state.booth.feed.length === 1 ? '' : 's') + '</span>' +
+      '</div>' + boothToolsHtml(DAY_BOOTH_FILTERS);
+    dayBoothSection.innerHTML = html + boothListHtml(visible);
+  }
+
+  // Game-level Flags & Reviews / Red Zone panel (reads the cached game events).
+  // When the visitor is on the Red Zone tab, the red-zone cut is always applied
+  // on top of their chip selection; the filter chips then narrow within (e.g.
+  // only nullified red-zone plays). This mirrors the NFL booth's red-zone view.
+  function boothGameHtml() {
+    var id = state.game ? String(state.game.id) : '';
+    var events = (state.booth.eventsByGame[id] || []).filter(function (e) {
+      return state.tab !== 'redzone' || boothFilterMatches('redzone', e);
+    });
+    var visible = events.filter(function (e) { return boothFilterMatches(state.booth.filter, e); });
+    return boothToolsHtml(state.tab === 'redzone' ? DAY_BOOTH_FILTERS : BOOTH_FILTERS) + boothListHtml(visible);
+  }
+
+  // Drive the day booth polling. Runs on the scoreboard view; the cadence
+  // depends on whether any game is live (fast) or all are final/pre (slow).
+  function dayBoothPoll() {
+    if (state.view !== 'scoreboard' || !state.games.length) return;
+    if (state.booth.paused) return;
+    var hasLive = state.games.some(function (g) { return g.status.state === 'in'; });
+    buildDayBooth(hasLive).then(function () {
+      if (state.view === 'scoreboard') {
+        renderDayBooth();
+        renderDiag();
+      }
+    }).catch(function () { /* keep the last feed */ });
+  }
+  var boothPollTimer = null;
+  function startDayBoothPolling() {
+    if (boothPollTimer) clearInterval(boothPollTimer);
+    boothPollTimer = setInterval(dayBoothPoll, BOOTH_DAY_POLL_MS);
+  }
+  function stopDayBoothPolling() {
+    if (boothPollTimer) { clearInterval(boothPollTimer); boothPollTimer = null; }
   }
 
   /* ---------------- Game view rendering ---------------- */
@@ -2856,7 +3769,7 @@
       : (state.source === 'ncaa' ? '<span class="updated">NCAA fallback</span>'
         : (state.viaProxy ? '<span class="updated">via ' + esc(state.proxy === 'server' ? 'server relay' : (state.proxy || 'CORS proxy')) + '</span>' : ''));
     var tabs = '<nav class="tabs">' +
-      [['pbp', 'Play-by-Play'], ['team', 'Team Stats'], ['player', 'Player Stats']].map(function (t) {
+      [['pbp', 'Play-by-Play'], ['booth', 'Flags &amp; Reviews'], ['redzone', 'Red Zone'], ['team', 'Team Stats'], ['player', 'Player Stats']].map(function (t) {
         return '<button class="tab' + (state.tab === t[0] ? ' on' : '') + '" data-tab="' + t[0] + '">' + t[1] + '</button>';
       }).join('') +
       sourceBadge +
@@ -2864,6 +3777,8 @@
       '</nav>';
     var panel;
     if (state.tab === 'pbp') panel = trackerHtml() + pbpHtml();
+    else if (state.tab === 'booth') panel = boothGameHtml();
+    else if (state.tab === 'redzone') panel = boothGameHtml();
     else if (state.tab === 'team') panel = teamStatsHtml();
     else panel = playerStatsHtml();
     var err = state.error && !state.detail ? '<div class="banner err">' + esc(state.error) + '</div>' : '';
@@ -2887,6 +3802,7 @@
       var newWrap = document.getElementById('pbWrap');
       if (newWrap) newWrap.scrollTop = state.follow ? 0 : oldPbScroll;
     }
+    renderDayBooth();
     renderDiag();
     var back = document.getElementById('backBtn');
     if (back) back.addEventListener('click', function () { goScoreboard(state.date); });
@@ -2917,7 +3833,14 @@
       provider: state.provider,
       viaProxy: state.viaProxy,
       proxy: state.proxy,
-      error: state.error
+      error: state.error,
+      booth: {
+        events: state.booth.feed.length,
+        games: state.booth.count,
+        filter: state.booth.filter,
+        paused: state.booth.paused,
+        perGame: Object.keys(state.booth.eventsByGame).length
+      }
     };
     if (state.detail) {
       info.gameId = state.gameId;
@@ -2954,6 +3877,7 @@
 
   function goGame(gameId, gameDate) {
     stopPolling();
+    stopDayBoothPolling(); // the day booth only runs on the scoreboard view
     scoreboardRun++; // a scoreboard response must not repaint over the game
     state.view = 'game';
     state.gameId = String(gameId);
@@ -2988,9 +3912,21 @@
       return;
     }
     var tab = t.closest ? t.closest('[data-tab]') : null;
-    if (tab) { state.tab = tab.getAttribute('data-tab'); render(); return; }
+    if (tab) {
+      var nextTab = tab.getAttribute('data-tab');
+      // Establish a sensible default filter for the booth-related panels only
+      // when the visitor actually switches to that tab. The filter chips inside
+      // the panel keep their selection on every re-render.
+      if (nextTab === 'booth' && state.booth.filter === 'redzone') state.booth.filter = 'all';
+      else if (nextTab === 'redzone') state.booth.filter = 'redzone';
+      state.tab = nextTab;
+      render();
+      return;
+    }
     var pf = t.closest ? t.closest('[data-pbpf]') : null;
     if (pf) { state.pbpFilter = pf.getAttribute('data-pbpf'); render(); return; }
+    var bf = t.closest ? t.closest('[data-booth-filter]') : null;
+    if (bf) { state.booth.filter = bf.getAttribute('data-booth-filter'); render(); return; }
     var pte = t.closest ? t.closest('[data-pte]') : null;
     if (pte) { state.playerTeam = Number(pte.getAttribute('data-pte')); render(); return; }
   });
@@ -3011,6 +3947,14 @@
     // Conference changes are navigation changes too. Return to the selected
     // date's scoreboard so a detail request cannot repaint a different view.
     goScoreboard(state.date);
+  });
+
+  // Delegated change handler for the booth pause checkbox. It is bound once,
+  // not per render, so both the day-booth tools and the game Flags & Reviews /
+  // Red Zone tools share a single #boothPause id without a dangling listener.
+  document.addEventListener('change', function (e) {
+    var t = e.target;
+    if (t && t.id === 'boothPause') state.booth.paused = !!t.checked;
   });
 
   document.getElementById('prevDay').addEventListener('click', function () { goScoreboard(shiftDate(state.date, -1)); });
@@ -3040,8 +3984,15 @@
       // Reload (don't just re-render) if the day has no games and no
       // nearby-games search has run for it — e.g. coming back from a game
       // that was opened via deep link on another day.
-      if (state.loadedDate !== state.date || (!state.games.length && !state.nearby)) loadScoreboard();
-      else render(true);
+      if (state.loadedDate !== state.date || (!state.games.length && !state.nearby)) {
+        loadScoreboard();
+      } else {
+        render(true);
+        if (state.games.length) {
+          buildDayBooth(false).then(function () { if (state.view === 'scoreboard') renderDayBooth(); }).catch(function () {});
+          startDayBoothPolling();
+        }
+      }
     }
   }
 
@@ -3121,6 +4072,14 @@
     normalizeTeamKey: normalizeTeamKey,
     espnSideMatchesNCAATeam: espnSideMatchesNCAATeam,
     ncaaContestsOf: ncaaContestsOf,
-    findNCAAContestForGame: findNCAAContestForGame
+    findNCAAContestForGame: findNCAAContestForGame,
+    BOOTH_KINDS: BOOTH_KINDS, BOOTH_KIND_LABEL: BOOTH_KIND_LABEL, BOOTH_RESULT_LABEL: BOOTH_RESULT_LABEL,
+    BOOTH_FILTERS: BOOTH_FILTERS, DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS, BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
+    boothClassify: boothClassify, boothResult: boothResult, boothMentionsScore: boothMentionsScore,
+    nullifiedScoreText: nullifiedScoreText, boothEventNullifies: boothEventNullifies,
+    boothScoreEffect: boothScoreEffect, boothEventContext: boothEventContext, boothEvent: boothEvent,
+    boothEvents: boothEvents, dayBoothFeed: dayBoothFeed, reconcileDayBoothFeed: reconcileDayBoothFeed,
+    boothYardsToEndzone: boothYardsToEndzone, boothIsRedZonePlay: boothIsRedZonePlay,
+    boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay
   };
 });

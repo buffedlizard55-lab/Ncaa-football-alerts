@@ -344,6 +344,90 @@ main { max-width: 1200px; margin: 0 auto; padding: 14px 16px 40px; outline: none
 
 .updated { font-size: 11px; color: var(--text-3); margin-left: auto; }
 
+/* ---------- Live booth (flags & reviews) ---------- */
+.hidden { display: none; }
+
+/* Day-level feed section, shown above the scoreboard on the scoreboard view. */
+#day-booth {
+  max-width: 1200px; margin: 0 auto; padding: 14px 16px 0;
+}
+.booth-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.booth-title {
+  font-size: 15px; font-weight: 800; letter-spacing: 0.3px; color: var(--text);
+  display: flex; align-items: center; gap: 8px;
+}
+.booth-title .dot { flex: none; }
+.booth-sub { color: var(--text-3); font-size: 12px; font-weight: 600; }
+.booth-count { margin-left: auto; font-size: 12px; color: var(--text-3); }
+.booth-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.booth-tools .chip { font-size: 11px; padding: 3px 10px; }
+.booth-pause {
+  margin-left: auto; font-size: 11px; color: var(--text-3); display: flex; align-items: center; gap: 5px;
+}
+.booth-pause input { accent-color: var(--blue); }
+
+.booth-list {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 4px 0; position: relative;
+  max-height: 46vh; overflow-y: auto;
+}
+/* Rows are wrapped in .booth-scroll; it is a plain fill wrapper. The outer
+   .booth-list owns the single scrollbar, so the list never double-scrolls. */
+.booth-list .booth-scroll { }
+.booth-list.empty-state { max-height: none; padding: 34px 20px; text-align: center; color: var(--text-3); }
+.booth-item {
+  display: grid; grid-template-columns: 74px 44px minmax(0, 1fr) auto;
+  gap: 10px; padding: 8px 14px; border-bottom: 1px solid var(--line);
+  align-items: baseline; font-size: 13px;
+}
+.booth-item:last-child { border-bottom: none; }
+.booth-item.fresh { animation: flash 1.6s ease-out; }
+.booth-item .bh-clock { font-family: var(--mono); font-size: 11px; color: var(--text-3); white-space: nowrap; }
+.booth-item .bh-team { font-family: var(--mono); font-size: 11px; font-weight: 800; text-align: center; white-space: nowrap; }
+.booth-item .bh-body { min-width: 0; }
+.booth-item .bh-heading { color: var(--text); font-weight: 800; font-size: 12.5px; letter-spacing: 0.2px; }
+.booth-item .bh-text { color: var(--text-2); font-size: 12.5px; margin-top: 1px; }
+.booth-item .bh-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 3px; }
+.booth-item .bh-score { font-family: var(--mono); font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
+.booth-item .bh-game { font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
+
+/* Kind/result chips */
+.booth-tag {
+  display: inline-block; font-size: 9.5px; font-weight: 800; letter-spacing: 0.8px;
+  border-radius: 4px; padding: 1px 6px; text-transform: uppercase; vertical-align: 1px;
+}
+.booth-tag.penalty { background: rgba(255, 128, 128, 0.12); color: var(--red); }
+.booth-tag.review { background: rgba(90, 162, 255, 0.12); color: var(--blue); }
+.booth-tag.challenge { background: rgba(181, 140, 255, 0.15); color: var(--purple); }
+.booth-tag.replay { background: rgba(181, 140, 255, 0.15); color: var(--purple); }
+.booth-tag.nullified {
+  background: rgba(245, 196, 81, 0.16); color: var(--gold);
+}
+.booth-tag.redzone { background: rgba(53, 212, 155, 0.14); color: var(--live); }
+
+.booth-result { font-weight: 700; font-size: 11px; letter-spacing: 0.3px; }
+.booth-result.pending { color: var(--blue); }
+.booth-result.overturned { color: var(--red); }
+.booth-result.upheld, .booth-result.confirmed { color: var(--gold); }
+.booth-result.stands { color: var(--text-2); }
+.booth-result.declined { color: var(--text-3); }
+.booth-score-rollback { color: var(--gold); font-weight: 700; }
+
+/* Game-detail Flags & Reviews / Red Zone tabs reuse the same item rows. */
+.booth-panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow-y: auto; max-height: 65vh; }
+.booth-panel .booth-item { border-bottom: 1px solid var(--line); }
+
+/* ---------- Responsive: booth ---------- */
+@media (max-width: 640px) {
+  .booth-item { grid-template-columns: 58px 36px minmax(0, 1fr); }
+  .booth-item .bh-score, .booth-item .bh-game { display: none; }
+  .booth-head { gap: 6px; }
+  .booth-sub { flex-basis: 100%; }
+}
+
 /* ---------- Footer ---------- */
 .foot {
   border-top: 1px solid var(--line); margin-top: 20px;

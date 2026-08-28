@@ -769,6 +769,172 @@ function waitForPort(url, ms) {
     assert.strictEqual(plays[3].scoringType, null);
   });
 
+  console.log('--- live booth (flags & reviews) ---');
+  // Build a raw ESPN college-football play object (same field shape as the
+  // summary/Core API plays already normalized by normalizePlay) and normalize it.
+  function boothRawPlay(over) {
+    return Object.assign({
+      id: 'p', sequenceNumber: '0', type: { text: 'Play' }, text: 'play',
+      awayScore: 0, homeScore: 0, scoringPlay: false, isPenalty: false,
+      period: { number: 2 }, clock: { displayValue: '10:00' },
+      start: { yardsToEndzone: 50, downDistanceText: '1st & 10 at MIZ 40', possessionText: 'MIZ 40', yardLine: 40, team: { id: '245' } },
+      end: { yardsToEndzone: 45, downDistanceText: '1st & 10 at MIZ 45', possessionText: 'MIZ 45', yardLine: 45, team: { id: '245' } },
+      teamParticipants: [{ type: 'offense', id: '245' }, { type: 'defense', id: '142' }]
+    }, over);
+  }
+  function boothNorm(over) { return NB.normalizePlay(boothRawPlay(over), 'd1'); }
+  const teamMap = {
+    '245': { abbr: 'TA&M', displayName: 'Texas A&M Aggies', logo: '' },
+    '142': { abbr: 'MIZ', displayName: 'Missouri Tigers', logo: '' }
+  };
+
+  test('normalizePlay preserves start.yardsToEndzone and penalty details for the booth', () => {
+    const p = boothNorm({ id: '1', text: 'No Huddle #22 E.Smith rush for 40 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, start: { yardsToEndzone: 10, downDistanceText: '2nd & Goal at MIZ 10', possessionText: 'MIZ 10', yardLine: 10, team: { id: '245' } } });
+    assert.strictEqual(p.start.yardsToEndzone, 10);
+    assert.strictEqual(p.start.downDistanceText, '2nd & Goal at MIZ 10');
+    assert.strictEqual(p.start.teamId, '245');
+    const pen = boothNorm({ id: '2', text: 'PENALTY Mizzou Holding (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07', isPenalty: true, type: { text: 'Penalty' }, penalty: { yards: 7, type: { text: 'Holding' } } });
+    assert.strictEqual(pen.penalty.yards, 7);
+    assert.strictEqual(pen.penalty.typeText, 'Holding');
+    assert.strictEqual(pen.penaltyText, '7-yard Holding');
+    // NCAA-fallback plays carry null position (must never be guessed).
+    const ncaaPlay = { id: 'n', seq: 1, type: 'Play', text: 'yard run', period: 1, clock: '10:00', awayScore: 0, homeScore: 0, start: null, end: null, penalty: null };
+    assert.strictEqual(NB.boothYardsToEndzone(ncaaPlay, teamMap), null);
+  });
+
+  test('boothClassify detects the embedded "PENALTY <team> <foul>" flag (verified fixture) ', () => {
+    // Verified verbatim in the summary fixture: a kickoff row with isPenalty:false
+    // carries a penalty appended to the play text. The booth must still surface it.
+    const kickoff = boothNorm({ id: 'k', type: { text: 'Kickoff' }, text: '#99 J.Zirkel kickoff 65 yards to the Mizzou00 #11 D.Fowlkes return 33 yards to the Mizzou33, End Of Play PENALTY Mizzou Holding (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07', isPenalty: false });
+    assert.strictEqual(NB.boothClassify(kickoff), 'penalty');
+    const ev = NB.boothEvent(kickoff);
+    assert.strictEqual(ev.heading, '7-yard Holding');
+    // A kickoff-return flag may not nullify a prior score (no rollback eligible).
+    const plays = [boothNorm({ id: 'a', seq: 1, text: '#22 E.Smith rush for 2 yards', awayScore: 0, homeScore: 0 }), kickoff];
+    const effect = NB.boothScoreEffect(plays, 1);
+    assert.strictEqual(effect.removesPoints, false);
+  });
+
+  test('boothClassify separates flag / challenge / replay / review', () => {
+    assert.strictEqual(NB.boothClassify(boothNorm({ id: 'a', text: 'PENALTY on MIZ-#1 A.Brown, Holding, 10 yards', isPenalty: true })), 'penalty');
+    assert.strictEqual(NB.boothClassify(boothNorm({ id: 'b', text: 'The Missouri head coach has challenged the ruling of incomplete pass.', })), 'challenge');
+    assert.strictEqual(NB.boothClassify(boothNorm({ id: 'c', text: 'The Replay Official reviewed the play, and the ruling on the field was overturned.', })), 'replay');
+    assert.strictEqual(NB.boothClassify(boothNorm({ id: 'd', text: 'The play is under further review.' })), 'review');
+    assert.strictEqual(NB.boothClassify(boothNorm({ id: 'e', text: '#22 E.Smith rush for 2 yards' })), '');
+  });
+
+  test('boothResult matches NCAA 2025 "upheld"/"overturned" and legacy wording', () => {
+    assert.strictEqual(NB.boothResult('After further review, the ruling on the field is upheld.'), 'upheld');
+    assert.strictEqual(NB.boothResult('After further review, the ruling on the field is confirmed.'), 'confirmed');
+    assert.strictEqual(NB.boothResult('After further review, the ruling on the field stands.'), 'stands');
+    assert.strictEqual(NB.boothResult('The play is under further review.'), 'pending');
+    assert.strictEqual(NB.boothResult('After further review, the ruling is overturned. Therefore, the pass was incomplete.'), 'overturned');
+    assert.strictEqual(NB.boothResult('The penalty is declined.'), 'declined');
+  });
+
+  test('nullifiedScoreText recognizes NCAA/ESPN nullification wording only on scoring plays', () => {
+    // Must be true: text names a score AND reports it as nullified / no play / reversed.
+    assert.strictEqual(NB.nullifiedScoreText('#22 E.Smith rush for 4 yards, TOUCHDOWN NULLIFIED by Penalty.PENALTY on MIZ-#45 C.Weselman, Defensive Offside, 4 yards - No Play.'), true);
+    assert.strictEqual(NB.nullifiedScoreText('#22 E.Smith rush for 28 yards, TOUCHDOWN. The Replay Official reviewed the runner broke the plane ruling, and the play was REVERSED.'), true);
+    assert.strictEqual(NB.nullifiedScoreText('#22 E.Smith rush for 40 yards TOUCHDOWN OVERTURNED by review.'), true);
+    assert.strictEqual(NB.nullifiedScoreText('Q.Warren field goal attempt from 43 GOOD is OVERTURNED by review.'), true);
+    assert.strictEqual(NB.nullifiedScoreText('TOUCHDOWN nullified on review.'), true);
+    // Must be false: no score named, or not actually nullified.
+    assert.strictEqual(NB.nullifiedScoreText('PENALTY Mizzou Holding 7 yards from Mizzou10 to Mizzou07'), false);
+    assert.strictEqual(NB.nullifiedScoreText('#22 E.Smith rush for 2 yards'), false);
+    assert.strictEqual(NB.nullifiedScoreText('Q.Warren field goal attempt from 43 GOOD'), false);
+    assert.strictEqual(NB.nullifiedScoreText('Kickoff 65 yards Touchback'), false);
+  });
+
+  test('boothScoreEffect tracks before -> during -> after and a score rollback', () => {
+    const plays = [
+      boothNorm({ id: '1', seq: 1, text: '#22 E.Smith rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: '2', seq: 2, text: '#22 E.Smith rush for 40 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, awayScore: 7, homeScore: 0, start: { yardsToEndzone: 10, downDistanceText: '2nd & Goal at MIZ 10', possessionText: 'MIZ 10', yardLine: 10, team: { id: '245' } } }),
+      boothNorm({ id: '3', seq: 3, text: 'PENALTY Mizzou Holding (#45 C.Weselman) 10 yards from Mizzou10 to Mizzou20 - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0, start: { yardsToEndzone: 10, downDistanceText: '2nd & Goal at MIZ 10', possessionText: 'MIZ 10', yardLine: 10, team: { id: '245' } } })
+    ];
+    const effect = NB.boothScoreEffect(plays, 2); // the wiping penalty
+    assert.deepStrictEqual(effect.before, { away: 7, home: 0 });
+    assert.deepStrictEqual(effect.during, { away: 0, home: 0 });
+    assert.deepStrictEqual(effect.after, { away: 0, home: 0 });
+    assert.strictEqual(effect.removesPoints, true);
+    assert.strictEqual(effect.pointsRemoved, 7);
+    assert.strictEqual(effect.team, 'away');
+  });
+
+  test('boothEvents produces a nullified red-zone score with the score trail', () => {
+    const plays = [
+      boothNorm({ id: '1', seq: 1, text: '#22 E.Smith rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: '2', seq: 2, text: '#22 E.Smith rush for 40 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, awayScore: 7, homeScore: 0, start: { yardsToEndzone: 10, downDistanceText: '2nd & Goal at MIZ 10', possessionText: 'MIZ 10', yardLine: 10, team: { id: '245' } } }),
+      boothNorm({ id: '3', seq: 3, text: 'PENALTY Mizzou Holding (#45 C.Weselman) 10 yards from Mizzou10 to Mizzou20 - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0, start: { yardsToEndzone: 10, downDistanceText: '2nd & Goal at MIZ 10', possessionText: 'MIZ 10', yardLine: 10, team: { id: '245' } } })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    assert.strictEqual(events.length, 1);
+    const e = events[0];
+    assert.strictEqual(e.kind, 'penalty');
+    assert.strictEqual(e.nullified, true);
+    assert.strictEqual(e.removesPoints, true);
+    assert.strictEqual(e.pointsRemoved, 7);
+    assert.strictEqual(e.redZone, true); // started at MIZ 10 (<= 20)
+    assert.strictEqual(e.beforeAwayScore, 7);
+    assert.strictEqual(e.duringAwayScore, 0);
+    assert.strictEqual(e.afterAwayScore, 0);
+    assert.strictEqual(e.team.abbr, 'TA&M');
+    assert.ok(e.relatedScoringPlay && /TOUCHDOWN/.test(e.relatedScoringPlay.text));
+  });
+
+  test('boothEvents ignores ordinary plays and marks a pending review', () => {
+    const plays = [
+      boothNorm({ id: '1', seq: 1, text: '#22 E.Smith rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: '2', seq: 2, text: 'The play is under further review.', type: { text: 'Play' } })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].kind, 'review');
+    assert.strictEqual(events[0].result, 'pending');
+    assert.strictEqual(events[0].nullified, false);
+  });
+
+  test('boothEvents merges a live last-play replacement (under review -> overturned)', () => {
+    const plays = [
+      boothNorm({ id: '1', seq: 1, text: 'The play is under further review.', type: { text: 'Play' } })
+    ];
+    const live = boothNorm({ id: '1', seq: 1, text: 'After further review, the ruling is overturned. Therefore, no touchdown.', type: { text: 'Replay Review' } });
+    const events = NB.boothEvents(plays, live, teamMap);
+    assert.strictEqual(events.length, 1);
+    assert.strictEqual(events[0].result, 'overturned');
+  });
+
+  test('dayBoothFeed merges the day feed, first occurrence wins, no invented ids', () => {
+    const g1 = { id: 'g1', shortName: 'TA&M @ MIZ', awayAbbr: 'TA&M', homeAbbr: 'MIZ', date: null, live: true, events: [
+      { id: 'p1', seq: 1, kind: 'penalty', text: 'PENALTY ...' },
+      { id: 'p2', seq: 2, kind: 'review', text: 'under review' }
+    ] };
+    const g2 = { id: 'g2', shortName: 'ORE @ IU', awayAbbr: 'ORE', homeAbbr: 'IU', date: null, live: true, events: [
+      { id: 'q1', seq: 1, kind: 'penalty', text: 'PENALTY ...' }
+    ] };
+    const feed = NB.dayBoothFeed([g1, g2]);
+    assert.strictEqual(feed.length, 3);
+    assert.strictEqual(feed[0].gameId, 'g1');
+    assert.strictEqual(feed[1].gameId, 'g1');
+    assert.strictEqual(feed[2].gameId, 'g2');
+    // Exactly the same play passed twice is kept once.
+    const dup = NB.dayBoothFeed([g1, g1]);
+    assert.strictEqual(dup.length, 2);
+  });
+
+  test('reconcileDayBoothFeed preserves discovery order and replaces updated plays', () => {
+    const existing = [ { key: 'g1:p1', text: 'under review' }, { key: 'g1:p2', text: 'flag' } ];
+    const fresh = [
+      { key: 'g1:p1', text: 'overturned' },   // updated in place
+      { key: 'g1:p3', text: 'new' }            // genuinely new
+    ];
+    const merged = NB.reconcileDayBoothFeed(existing, fresh);
+    assert.strictEqual(merged.length, 3);
+    assert.strictEqual(merged[0].text, 'overturned');
+    assert.strictEqual(merged[1].text, 'flag');
+    assert.strictEqual(merged[2].text, 'new');
+  });
+
   console.log('--- server ---');
   const port = 8137;
   const base = 'http://127.0.0.1:' + port;
