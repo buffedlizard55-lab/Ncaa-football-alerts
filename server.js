@@ -51,7 +51,8 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ error: 'A valid allowlisted provider URL is required' }));
     }
     const allowedEspnHost = target.hostname === 'site.api.espn.com' || target.hostname === 'site.web.api.espn.com';
-    const allowedEspnPath = /^\/apis\/site\/v2\/sports\/football\/college-football\/(?:scoreboard|summary)$/.test(target.pathname);
+    const allowedEspnPath = /^\/apis\/site\/v2\/sports\/football\/college-football\/(?:scoreboard|summary)$/.test(target.pathname) ||
+      /^\/apis\/v2\/scoreboard\/header$/.test(target.pathname);
     const allowedEspn = allowedEspnHost && allowedEspnPath;
     // ESPN Core API plays collection — the verified historical PBP backfill
     // index (numeric event/competition ids only, never list endpoints).
