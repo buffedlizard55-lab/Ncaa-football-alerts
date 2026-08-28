@@ -1525,12 +1525,107 @@
   ];
   var DAY_BOOTH_FILTERS = BOOTH_FILTERS.concat([['redzone', 'Red zone']]);
 
+  var LIVE_HEADER_URL = 'https://site.web.api.espn.com/apis/v2/scoreboard/header?sport=football&league=college-football';
+  var LIVE_SCORES_INTERVAL_MS = 250;   // 0.25s score/status cadence
+  var LIVE_REVIEWS_INTERVAL_MS = 1000; // 1s play-by-play cadence
+  var SCOREBOARD_INTERVAL_MS = 15000;  // 15s scoreboard poll
+  var NON_REVIEW_RENDER_INTERVAL_MS = 5000; // 5s render throttle for large non-review tabs
+  var BOOTH_SOUND_KEY = 'ncaaBoothSoundEnabled';
+
   // The score on each play (away/home) as a comparable pair.
   function boothScore(play) {
     return {
       away: (play && play.awayScore != null) ? Number(play.awayScore) : 0,
       home: (play && play.homeScore != null) ? Number(play.homeScore) : 0
     };
+  }
+
+  function scorePair(away, home) {
+    return String(away != null ? away : 0) + '–' + String(home != null ? home : 0);
+  }
+
+  function boothKindCounts(events) {
+    var counts = { all: (events || []).length, flag: 0, penalty: 0, challenge: 0, replay: 0, review: 0, nullified: 0, redzone: 0 };
+    (events || []).forEach(function (e) {
+      if (!e) return;
+      if (e.kind === 'penalty' || e.kind === 'flag') {
+        counts.flag += 1;
+        counts.penalty += 1;
+      } else if (e.kind != null && counts[e.kind] != null) {
+        counts[e.kind] += 1;
+      }
+      if (boothEventNullifies(e)) counts.nullified += 1;
+      if (e.redZone) counts.redzone += 1;
+    });
+    return counts;
+  }
+
+  function boothEventShown(e, filter) {
+    if (!filter || filter === 'all') return true;
+    if (filter === 'nullified') return boothEventNullifies(e);
+    if (filter === 'redzone') return !!(e && e.redZone);
+    if (filter === 'flag') return !!(e && (e.kind === 'penalty' || e.kind === 'flag'));
+    return !!(e && e.kind === filter);
+  }
+
+  function boothFiltersHTML(filter, counts, attr, extraClass, filters) {
+    return (filters || BOOTH_FILTERS).map(function (pair) {
+      var id = pair[0], label = pair[1];
+      var n = counts ? counts[id] : null;
+      var extra = (id === 'all' || n == null) ? '' : ' · ' + n;
+      var active = (filter === id) ? ' active on' : '';
+      return '<button type="button" class="chip booth-filter' + (extraClass || '') + active + '" ' + (attr || 'data-booth-filter') + '="' + esc(id) + '">' +
+        esc(label) + extra + '</button>';
+    }).join('');
+  }
+
+  function boothScoreTrailHTML(e, awayAbbr, homeAbbr) {
+    if (!e) return '';
+    var hasScores = (e.beforeAwayScore != null || e.duringAwayScore != null || e.afterAwayScore != null);
+    if (!hasScores) return '';
+    var bAway = e.beforeAwayScore != null ? e.beforeAwayScore : (e.duringAwayScore != null ? e.duringAwayScore : 0);
+    var bHome = e.beforeHomeScore != null ? e.beforeHomeScore : (e.duringHomeScore != null ? e.duringHomeScore : 0);
+    var dAway = e.duringAwayScore != null ? e.duringAwayScore : bAway;
+    var dHome = e.duringHomeScore != null ? e.duringHomeScore : bHome;
+    var aAway = e.afterAwayScore != null ? e.afterAwayScore : dAway;
+    var aHome = e.afterHomeScore != null ? e.afterHomeScore : dHome;
+
+    var before = scorePair(bAway, bHome);
+    var during = scorePair(dAway, dHome);
+    var after = scorePair(aAway, aHome);
+    var isNullified = boothEventNullifies(e);
+    var isPending = e.result === 'pending' || (e.kind === 'review' && !e.result);
+
+    var removedAbbr = e.removedTeam === 'away' ? awayAbbr
+      : (e.removedTeam === 'home' ? homeAbbr : '');
+    var removedBadge = e.removesPoints
+      ? '<span class="badge removed">' +
+        (removedAbbr ? esc(removedAbbr) + ' ' : '') +
+        '−' + esc(e.pointsRemoved) + ' PTS</span>'
+      : '';
+    var nullifiedBadge = (!e.removesPoints && isNullified)
+      ? '<span class="badge removed">NULLIFIED</span>'
+      : '';
+    var atRiskBadge = (isPending && (boothMentionsScore(e.text) || e.relatedScoringPlay))
+      ? '<span class="badge review at-risk">SCORE AT RISK</span>'
+      : (isPending ? '<span class="badge review">REVIEW IN PROGRESS</span>' : '');
+    var related = isNullified && e.relatedScoringPlay && e.relatedScoringPlay.text
+      ? '<span class="booth-note">' + esc(e.relatedScoringPlay.text) + '</span>'
+      : '';
+    var stateCls = isNullified ? ' removed' : (isPending ? ' at-risk' : '');
+
+    return '<div class="booth-state' + stateCls + '">' +
+      '<span class="bsh-label">Score</span> ' +
+      '<span class="bsh-before">' + esc(before) + '</span> ' +
+      '<span class="bsh-arrow">→</span> ' +
+      '<span class="bsh-during' + (e.removesPoints ? ' removed' : (isPending ? ' at-risk' : '')) + '">' + esc(during) + '</span> ' +
+      '<span class="bsh-arrow">→</span> ' +
+      '<span class="bsh-after' + (e.removesPoints ? ' removed' : '') + '">' + (isPending ? '? (REVIEW)' : esc(after)) + '</span> ' +
+      removedBadge +
+      nullifiedBadge +
+      atRiskBadge +
+      '</div>' +
+      related;
   }
 
   function boothHasExplicitScore(play) {
@@ -1580,6 +1675,7 @@
   function boothEventNullifies(event) {
     if (!event) return false;
     if (event.removesPoints) return true;
+    if (event.nullified) return true;
     return nullifiedScoreText(event.text);
   }
 
@@ -2058,7 +2154,10 @@
       boothScoreEffect: boothScoreEffect, boothEventContext: boothEventContext, boothEvent: boothEvent,
       boothEvents: boothEvents, dayBoothFeed: dayBoothFeed, reconcileDayBoothFeed: reconcileDayBoothFeed,
       boothYardsToEndzone: boothYardsToEndzone, boothIsRedZonePlay: boothIsRedZonePlay,
-      boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay
+      boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay,
+      boothKindCounts: boothKindCounts, boothEventShown: boothEventShown, boothScoreTrailHTML: boothScoreTrailHTML,
+      scorePair: scorePair, LIVE_HEADER_URL: LIVE_HEADER_URL, LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
+      LIVE_REVIEWS_INTERVAL_MS: LIVE_REVIEWS_INTERVAL_MS, SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS
     };
   }
 
@@ -2103,8 +2202,10 @@
       filter: 'all',
       paused: false,
       soundOn: true,
+      audioContext: null,
       feed: [],              // reconciled day feed (dayBoothFeed shape)
       eventsByGame: {},      // gameId -> booth events for that game
+      nullifiedByGame: {},   // gameId -> newest nullified event info ({removesPoints, points})
       teamMaps: {},          // gameId -> { teamId: {abbr, displayName, logo, color} }
       gamesByKey: {},        // gameId -> { id, shortName, awayAbbr, homeAbbr, date, live }
       lastAnnounced: {},     // gameId:eventKey -> announced sound key
@@ -2638,6 +2739,11 @@
       stHtml = '<span class="st-time">' + esc(fmtKickoff(g.date, dayDate)) + '</span>';
     }
 
+    var liveBooth = lastPlayBooth(g);
+    var reviewBadge = (liveBooth && liveBooth.kind === 'review') ? '<span class="badge review">REVIEW</span>' : '';
+    var nullified = state.booth.nullifiedByGame && state.booth.nullifiedByGame[String(g.id)];
+    var nullBadge = nullified ? '<span class="badge removed">' + (nullified.removesPoints ? '−' + nullified.points + ' PTS' : 'NULLIFIED') + '</span>' : '';
+
     function teamSide(side, cls) {
       var t = g[side];
       var rec = t.records && t.records.total ? t.records.total : '';
@@ -2675,6 +2781,9 @@
     }
 
     var meta = [];
+    if (reviewBadge || nullBadge) {
+      meta.push('<div style="display:flex;gap:4px;flex-wrap:wrap;">' + reviewBadge + nullBadge + '</div>');
+    }
     if (g.broadcast) meta.push('<div><span class="gr-tv">' + esc(g.broadcast) + '</span>' + (g.neutralSite ? '<span>neutral</span>' : '') + '</div>');
     if (g.venueName) meta.push('<div>' + esc(g.venueCity ? g.venueName + ', ' + g.venueCity : g.venueName) + '</div>');
     if (g.conferences.length) meta.push('<div>' + confTags(g) + '</div>');
@@ -2687,7 +2796,9 @@
       meta.push('<div class="gr-leaders">' + leadParts.join(' • ') + '</div>');
     }
 
-    return '<article class="game-row state-' + ((sv.kind === 'live' || sv.kind === 'halftime') ? 'live' : sv.kind) + '" data-id="' + esc(g.id) + '" role="link" tabindex="0" aria-label="' + esc(g.name) + '">' +
+    var rowCls = 'game-row state-' + ((sv.kind === 'live' || sv.kind === 'halftime') ? 'live' : sv.kind) + (nullified ? ' has-nullified' : '');
+
+    return '<article class="' + rowCls + '" data-id="' + esc(g.id) + '" role="link" tabindex="0" aria-label="' + esc(g.name) + '">' +
       '<div class="gr-status">' + stHtml + '</div>' +
       teamSide('away', 'away') +
       '<div class="gr-score"><div class="gr-scores">' + scoresHtml + '</div><div class="gr-lines">' + linesHtml + '</div></div>' +
@@ -3315,13 +3426,12 @@
 
   // Recompute the cached booth for the currently open game (used whenever its
   // play-by-play refreshes live).
-  function rebuilGameBoothFromDetail() {
+  function rebuildGameBoothFromDetail() {
     if (!state.detail || !state.game) return [];
     var tm = boothTeamMapFromDetail(state.detail);
     // Prefer the detail teamMap (has color/logo), fall back to the game.
     if (!Object.keys(tm).length) tm = boothTeamMapFromGame(state.game);
     var plays = state.detail.plays || [];
-    var lastPlay = state.booth.lastLivePlays[String(state.game.id)] || null;
     return rememberGameBooth(state.game, plays, tm);
   }
 
@@ -3329,6 +3439,7 @@
   async function buildDayBooth(forceRefresh) {
     var currentGames = state.games || [];
     var refreshed = [];
+    if (!state.booth.nullifiedByGame) state.booth.nullifiedByGame = {};
     for (var i = 0; i < currentGames.length; i++) {
       var game = currentGames[i];
       var id = String(game.id);
@@ -3339,7 +3450,18 @@
       // flag without hammering every finished game.
       if (forceRefresh || !cached || live) {
         var fetched = await fetchPlaysForGame(game);
-        rememberGameBooth(game, fetched.plays);
+        var events = rememberGameBooth(game, fetched.plays);
+        var lastNullified = null;
+        for (var j = events.length - 1; j >= 0; j -= 1) {
+          if (boothEventNullifies(events[j])) {
+            lastNullified = events[j];
+            break;
+          }
+        }
+        state.booth.nullifiedByGame[id] = lastNullified ? {
+          removesPoints: !!lastNullified.removesPoints,
+          points: lastNullified.pointsRemoved || 0
+        } : null;
         refreshed.push(id);
       }
     }
@@ -3363,6 +3485,13 @@
     return state.booth.feed;
   }
 
+  function dayBoothScannable(g) {
+    var st = g && g.status && g.status.state;
+    if (st !== 'in' && st !== 'post') return false; // pre-game: no plays yet
+    if (g && g.playByPlayAvailable === false) return false;
+    return true;
+  }
+
   // Detect newly discovered nullified / red-zone events and play a short
   // chime (when sound is on). Any play already in state.booth.lastAnnounced is
   // not re-announced, so a review that upgrades from "under review" to
@@ -3371,85 +3500,306 @@
     if (item && item.key != null) return String(item.key);
     return item ? ((item.gameId || '') + ':' + (item.id || (item.seq || '')) + ':' + (item.kind || '')) : '';
   }
+
+  function unlockBoothAudio() {
+    if (state.booth.audioContext || typeof AudioContext === 'undefined') return;
+    try {
+      state.booth.audioContext = new AudioContext();
+      if (state.booth.audioContext.state === 'suspended') state.booth.audioContext.resume();
+    } catch (e) {
+      state.booth.audioContext = null;
+    }
+  }
+
+  function playBoothAlert() {
+    var ctx = state.booth.audioContext;
+    if (!ctx) return;
+    try {
+      var start = ctx.currentTime;
+      var DURATION = 3; // seconds
+
+      // --- Rain bed: brown-ish noise, softened by a low-pass filter ---
+      var sampleRate = ctx.sampleRate || 44100;
+      var frameCount = Math.floor(sampleRate * DURATION);
+      var buffer = ctx.createBuffer(1, frameCount, sampleRate);
+      var data = buffer.getChannelData(0);
+      var last = 0;
+      for (var i = 0; i < frameCount; i += 1) {
+        var white = Math.random() * 2 - 1;
+        last = (last + 0.02 * white) / 1.02;
+        data[i] = last * 3.5;
+      }
+      var rain = ctx.createBufferSource();
+      rain.buffer = buffer;
+      var filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(1000, start);
+      var rainGain = ctx.createGain();
+      rainGain.gain.setValueAtTime(0.0001, start);
+      rainGain.gain.linearRampToValueAtTime(0.22, start + 0.5); // gentle fade in
+      rainGain.gain.setValueAtTime(0.22, start + 2.3);          // hold
+      rainGain.gain.linearRampToValueAtTime(0.0001, start + DURATION); // fade out
+      rain.connect(filter);
+      filter.connect(rainGain);
+      rainGain.connect(ctx.destination);
+      rain.start(start);
+      rain.stop(start + DURATION);
+
+      // --- Water droplets: quiet falling sine "plips" over the rain bed ---
+      [
+        { at: 0.7, freq: 1200 },
+        { at: 1.4, freq: 900 },
+        { at: 2.1, freq: 1050 }
+      ].forEach(function (drop) {
+        var osc = ctx.createOscillator();
+        var gain = ctx.createGain();
+        var t = start + drop.at;
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(drop.freq, t);
+        osc.frequency.linearRampToValueAtTime(drop.freq * 0.55, t + 0.15);
+        gain.gain.setValueAtTime(0.0001, t);
+        gain.gain.linearRampToValueAtTime(0.07, t + 0.02);
+        gain.gain.linearRampToValueAtTime(0.0001, t + 0.25);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(t);
+        osc.stop(t + 0.3);
+      });
+    } catch (e) {}
+  }
+
+  function loadBoothSoundPref() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      var stored = localStorage.getItem(BOOTH_SOUND_KEY);
+      if (stored === '0') state.booth.soundOn = false;
+      else if (stored === '1') state.booth.soundOn = true;
+    } catch (e) {}
+  }
+
+  function saveBoothSoundPref() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(BOOTH_SOUND_KEY, state.booth.soundOn ? '1' : '0');
+    } catch (e) {}
+  }
+
+  function toggleBoothSound() {
+    state.booth.soundOn = !state.booth.soundOn;
+    saveBoothSoundPref();
+    renderDayBooth();
+    unlockBoothAudio();
+    if (state.booth.audioContext && state.booth.audioContext.state === 'suspended') {
+      state.booth.audioContext.resume();
+    }
+    if (state.booth.soundOn) playBoothAlert();
+  }
+
   function announceNewBoothEvents(fresh) {
-    var audio = null;
-    fresh.forEach(function (item) {
-      if (!item || !item.nullified) return;
+    var shouldAlert = false;
+    (fresh || []).forEach(function (item) {
+      if (!item) return;
       var key = boothEventSoundKey(item);
-      if (state.booth.lastAnnounced[key]) return;
+      if (!key || state.booth.lastAnnounced[key]) return;
       state.booth.lastAnnounced[key] = true;
-      if (!state.booth.paused && state.booth.soundOn && typeof AudioContext !== 'undefined') {
-        try {
-          if (!audio) audio = new AudioContext();
-          var osc = audio.createOscillator();
-          var gain = audio.createGain();
-          osc.frequency.value = item.redZone ? 880 : 660;
-          gain.gain.setValueAtTime(0.001, audio.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.25, audio.currentTime + 0.02);
-          gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + 0.25);
-          osc.connect(gain).connect(audio.destination);
-          osc.start();
-          osc.stop(audio.currentTime + 0.26);
-        } catch (e) { /* audio is best-effort */ }
+      if (boothEventNullifies(item)) {
+        shouldAlert = true;
       }
     });
+    if (shouldAlert && !state.booth.paused && state.booth.soundOn) {
+      playBoothAlert();
+    }
   }
 
   // Filter a booth event list by the active booth filter.
   function boothFilterMatches(filter, e) {
     if (!filter || filter === 'all') return true;
-    if (filter === 'nullified') return !!e.nullified;
-    if (filter === 'redzone') return !!e.redZone || (e.yardsToEndzone != null && e.yardsToEndzone <= BOOTH_RED_ZONE_DISTANCE);
-    return e.kind === filter;
+    if (filter === 'nullified') return boothEventNullifies(e);
+    if (filter === 'redzone') return !!(e && e.redZone && boothEventNullifies(e));
+    return e && e.kind === filter;
   }
 
-  function boothSummaryScore(e) {
-    if (e.removesPoints && e.pointsRemoved > 0) {
-      return '<span class="booth-score-rollback">' + e.beforeAwayScore + '–' + e.beforeHomeScore + ' → ' + e.afterAwayScore + '–' + e.afterHomeScore +
-        ' (−' + e.pointsRemoved + ')</span>';
-    }
-    if (e.relatedScoringPlay && e.relatedScoringPlay.points > 0) {
-      return e.beforeAwayScore + '–' + e.beforeHomeScore + ' → ' + e.relatedScoringPlay.score.away + '–' + e.relatedScoringPlay.score.home;
-    }
-    return '';
+  function dayBoothMsgHTML(e, liveNow) {
+    var q = periodLabel(e.quarter);
+    var when = [q, e.clock].filter(Boolean).join(' · ');
+    var kind = BOOTH_KIND_LABEL[e.kind] || e.kind;
+    var result = e.result ? (BOOTH_RESULT_LABEL[e.result] || e.result) : '';
+    var duringScore = (e.duringAwayScore != null && e.duringHomeScore != null)
+      ? scorePair(e.duringAwayScore, e.duringHomeScore)
+      : ((e.awayScore != null && e.homeScore != null)
+      ? scorePair(e.awayScore, e.homeScore)
+      : '');
+    var score = duringScore
+      ? esc(e.awayAbbr) + ' ' + esc(duringScore) + ' ' + esc(e.homeAbbr)
+      : '';
+    var logo = e.team && e.team.logo
+      ? '<img class="logo" src="' + esc(e.team.logo) + '" alt="">'
+      : '';
+    var team = e.team && e.team.abbr
+      ? '<span class="booth-team">' + esc(e.team.abbr) + '</span>'
+      : '';
+    var dd = e.downDistance
+      ? '<span class="booth-dd">' + esc(e.downDistance) + '</span>'
+      : '';
+    var liveTag = liveNow ? '<span class="badge live">LIVE</span>' : '';
+    var rz = e.redZone ? '<span class="badge rz">RZ</span>' : '';
+    var isNullified = boothEventNullifies(e);
+    var nullChip = (isNullified && !e.removesPoints)
+      ? '<span class="badge removed">NULLIFIED</span>'
+      : '';
+    var stateHtml = boothScoreTrailHTML(e, e.awayAbbr, e.homeAbbr);
+    var aria = esc(e.shortName) + ', ' + esc(kind) + ': ' + esc(e.text) +
+      (e.removesPoints ? ', removed ' + esc(e.pointsRemoved) + ' points' : '') +
+      (isNullified && !e.removesPoints ? ', score nullified' : '') +
+      (e.redZone ? ', in the red zone' : '') +
+      '. Open this game.';
+
+    var kindCls = esc(e.kind || 'penalty');
+    var removedCls = isNullified ? ' pts-removed' : '';
+
+    return '<button type="button" class="day-msg booth-msg ' + kindCls + removedCls + '" data-id="' + esc(e.gameId) + '" aria-label="' + aria + '">' +
+      '<div class="booth-msg-top">' +
+      '<span class="day-game">' + esc(e.shortName) + '</span>' +
+      liveTag +
+      '<span class="badge ' + kindCls + '">' + esc(kind) + '</span>' +
+      rz +
+      nullChip +
+      (result ? '<span class="badge result ' + esc(e.result) + '">' + esc(result) + '</span>' : '') +
+      '<span class="booth-when">' + esc(when) + '</span>' +
+      (score ? '<span class="booth-score">' + score + '</span>' : '') +
+      '</div>' +
+      '<div class="booth-msg-head">' +
+      logo + team +
+      '<span class="booth-heading">' + esc(e.heading) + '</span>' + dd +
+      '</div>' +
+      '<p class="booth-text">' + esc(e.text) + '</p>' +
+      stateHtml +
+      '</button>';
   }
 
-  function boothItemHtml(item) {
-    var kindCls = (item.kind === 'penalty') ? 'penalty' : (item.kind === 'review' ? 'review' : (item.kind === 'challenge' ? 'challenge' : 'replay'));
-    var tags = '<span class="booth-tag ' + kindCls + '">' + esc(BOOTH_KIND_LABEL[item.kind] || item.kind) + '</span>';
-    if (item.nullified) tags += '<span class="booth-tag nullified">Nullified</span>';
-    if (item.redZone || (item.yardsToEndzone != null && item.yardsToEndzone <= BOOTH_RED_ZONE_DISTANCE)) tags += '<span class="booth-tag redzone">Red zone</span>';
-    var result = item.result ? '<span class="booth-result ' + esc(item.result) + '">' + esc(BOOTH_RESULT_LABEL[item.result] || item.result) + '</span>' : '';
-    var gameLabel = item.shortName ? '<span class="bh-game">' + esc(item.shortName) + '</span>' : '';
-    var quarter = item.quarter ? esc(periodLabel(item.quarter)) : '';
-    var clockHtml = '<span class="bh-clock">' + esc(quarter ? quarter + ' ' : '') + esc(item.clock || '') + '</span>';
-    var teamHtml = '<span class="bh-team">' + esc((item.team && item.team.abbr) || (item.teamId ? '?' : '')) + '</span>';
-    // boothSummaryScore already returns a complete <span> (the rollback box, or
-    // a plain "before → after" string). Wrap it in .bh-score exactly once; the
-    // score cell is the last grid cell of the row.
-    var scoreHtml = boothSummaryScore(item);
-    return '<div class="booth-item">' +
-      clockHtml + teamHtml +
-      '<span class="bh-body"><span class="bh-heading">' + esc(item.heading) + ' ' + result + '</span>' +
-      '<span class="bh-text">' + esc(item.text) + ' ' + tags + '</span>' +
-      '<span class="bh-meta">' + gameLabel + '</span></span>' +
-      (scoreHtml ? '<span class="bh-score">' + scoreHtml + '</span>' : '<span class="bh-score"></span>') +
+  function boothMsgHTML(e, isNew) {
+    var q = periodLabel(e.quarter);
+    var when = [q, e.clock].filter(Boolean).join(' · ');
+    var kind = BOOTH_KIND_LABEL[e.kind] || e.kind;
+    var result = e.result ? (BOOTH_RESULT_LABEL[e.result] || e.result) : '';
+    var duringScore = (e.duringAwayScore != null && e.duringHomeScore != null)
+      ? scorePair(e.duringAwayScore, e.duringHomeScore)
+      : ((e.awayScore != null && e.homeScore != null)
+      ? scorePair(e.awayScore, e.homeScore)
+      : '');
+    var score = duringScore ? esc(duringScore) : '';
+    var logo = e.team && e.team.logo
+      ? '<img class="logo" src="' + esc(e.team.logo) + '" alt="">'
+      : '';
+    var team = e.team && e.team.abbr
+      ? '<span class="booth-team">' + esc(e.team.abbr) + '</span>'
+      : '';
+    var dd = e.downDistance
+      ? '<span class="booth-dd">' + esc(e.downDistance) + '</span>'
+      : '';
+    var liveTag = e.live ? '<span class="badge live">LIVE</span>' : '';
+    var g = state.game;
+    var awayAbbr = g && g.away ? g.away.abbreviation : '';
+    var homeAbbr = g && g.home ? g.home.abbreviation : '';
+    var stateHtml = boothScoreTrailHTML(e, awayAbbr, homeAbbr);
+    var rz = e.redZone ? '<span class="badge rz">RZ</span>' : '';
+    var isNullified = boothEventNullifies(e);
+    var nullChip = (isNullified && !e.removesPoints)
+      ? '<span class="badge removed">NULLIFIED</span>'
+      : '';
+    var kindCls = esc(e.kind || 'penalty');
+    var removedCls = isNullified ? ' pts-removed' : '';
+    var newCls = isNew ? ' new' : '';
+
+    return '<div class="booth-msg ' + kindCls + removedCls + newCls + '">' +
+      '<div class="booth-msg-top">' +
+      '<span class="booth-when">' + esc(when) + '</span>' +
+      liveTag +
+      '<span class="badge ' + kindCls + '">' + esc(kind) + '</span>' +
+      rz +
+      nullChip +
+      (result ? '<span class="badge result ' + esc(e.result) + '">' + esc(result) + '</span>' : '') +
+      (score ? '<span class="booth-score">' + score + '</span>' : '') +
+      '</div>' +
+      '<div class="booth-msg-head">' +
+      logo + team +
+      '<span class="booth-heading">' + esc(e.heading) + '</span>' + dd +
+      '</div>' +
+      '<p class="booth-text">' + esc(e.text) + '</p>' +
+      stateHtml +
       '</div>';
   }
 
-  function boothListHtml(items) {
-    if (!items.length) {
-      return '<div class="booth-list empty-state"><strong>No flags or reviews yet.</strong>Plays, penalties and reviews appear here as the game is covered.</div>';
-    }
-    return '<div class="booth-list"><div class="booth-scroll">' + items.map(boothItemHtml).join('') + '</div></div>';
-  }
+  function dayBoothHTML() {
+    var filter = state.booth.filter || 'all';
+    var items = state.booth.feed || [];
+    var liveCount = state.games.filter(function (g) { return g.status && g.status.state === 'in'; }).length;
+    var counts = boothKindCounts(items);
+    var visible = items.filter(function (e) { return boothFilterMatches(filter, e); });
+    var filters = boothFiltersHTML(filter, counts, 'data-booth-filter', ' day-filter', DAY_BOOTH_FILTERS);
 
-  function boothToolsHtml(filters) {
-    var items = (filters || BOOTH_FILTERS).map(function (f) {
-      return '<button class="chip' + (state.booth.filter === f[0] ? ' on' : '') + '" data-booth-filter="' + f[0] + '">' + f[1] + '</button>';
-    }).join('');
-    return '<div class="booth-tools">' + items +
-      '<label class="booth-pause"><input type="checkbox" id="boothPause"' + (state.booth.paused ? ' checked' : '') + '> pause</label>' +
+    var scannable = state.games.filter(dayBoothScannable).length;
+    var scanned = Object.keys(state.booth.eventsByGame).length;
+
+    var foot = 'Every flag & review from all of today’s games · pulled from ESPN play-by-play · ' +
+      'tracks score before → during → after when a nullified score comes off the board · ' +
+      'nullified & red zone cover TD, FG, PAT & 2-pt only · score/status 0.25s · play-by-play 1s' +
+      (scannable ? ' · games scanned ' + scanned + ' of ' + scannable : '') +
+      (liveCount ? ' · ' + liveCount + ' game' + (liveCount === 1 ? '' : 's') + ' live' : '');
+
+    // Top banner listing the day's nullified scores
+    var nullifiedAll = items.filter(boothEventNullifies);
+    var topBanner = '';
+    if (nullifiedAll.length) {
+      var summary = nullifiedAll.slice(0, 3).map(function (e) {
+        var pts = e.removesPoints ? ' −' + e.pointsRemoved + 'pts' : '';
+        return esc((e.shortName || '') + (pts || ''));
+      }).join(', ');
+      var more = nullifiedAll.length > 3 ? ' +' + (nullifiedAll.length - 3) + ' more' : '';
+      topBanner = '<div class="booth-banner removed-banner day-removed-banner">' +
+        '<span class="badge removed">' + nullifiedAll.length + ' NULLIFIED</span>' +
+        '<span>Scores taken off the board: ' + summary + more + ' – filter Nullified.</span>' +
+        '</div>';
+    }
+
+    var body;
+    if (!visible.length) {
+      body = '<div class="booth-empty">' +
+        (scanned < scannable
+          ? 'Scanning today’s games for flags and reviews…'
+          : (filter === 'redzone' && counts.all
+            ? 'No nullified scores in the red zone (the opponent’s 20 or inside) today — no touchdown, field goal, PAT or 2-pt conversion has been wiped out from there.'
+            : (filter === 'nullified' && counts.all
+              ? 'No nullified scores today — no touchdown, field goal, PAT or 2-pt conversion has been taken off the board.'
+              : 'No flags or reviews on this day yet — kickoff hasn’t happened, or the games were clean.'))) +
+        '</div>';
+    } else {
+      body = '<div class="day-feed">' +
+        visible.map(function (e) {
+          var isLive = state.games.some(function (g) { return String(g.id) === String(e.gameId) && g.status && g.status.state === 'in'; });
+          return dayBoothMsgHTML(e, isLive);
+        }).join('') +
+        '</div>';
+    }
+
+    var soundOn = !!state.booth.soundOn;
+    var soundTitle = soundOn
+      ? 'Alert sound ON - a gentle rain sound plays only when a score is nullified. Click to mute.'
+      : 'Alert sound OFF - click to enable and test the rain alert sound.';
+
+    return '<div class="booth">' +
+      '<div class="booth-head">' +
+      '<div class="booth-head-main">' +
+      '<span class="booth-title"><span class="dot"></span> Live booth · flags &amp; reviews · all games</span>' +
+      '<div class="booth-sub">' + esc(foot) + '</div>' +
+      '</div>' +
+      '<button type="button" class="day-sound-btn' + (soundOn ? ' on' : '') + '" title="' + esc(soundTitle) + '">' +
+      (soundOn ? '🔔 Sound On' : '🔇 Sound Off') +
+      '</button>' +
+      '</div>' +
+      topBanner +
+      '<div class="booth-filters">' + filters + '</div>' +
+      body +
       '</div>';
   }
 
@@ -3459,13 +3809,18 @@
     var show = state.view === 'scoreboard' && state.games.length > 0;
     if (!show) { dayBoothSection.classList.add('hidden'); return; }
     dayBoothSection.classList.remove('hidden');
-    var visible = state.booth.feed.filter(function (e) { return boothFilterMatches(state.booth.filter, e); });
-    var liveCount = state.games.filter(function (g) { return g.status.state === 'in'; }).length;
-    var html = '<div class="booth-head">' +
-      '<span class="booth-title"><span class="dot"></span> Live booth · flags &amp; reviews</span>' +
-      '<span class="booth-sub">' + (liveCount ? liveCount + ' live' : '') + ' · ' + state.booth.feed.length + ' event' + (state.booth.feed.length === 1 ? '' : 's') + '</span>' +
-      '</div>' + boothToolsHtml(DAY_BOOTH_FILTERS);
-    dayBoothSection.innerHTML = html + boothListHtml(visible);
+
+    var feed = dayBoothSection.querySelector('.day-feed');
+    var prevScroll = feed ? feed.scrollTop : 0;
+    var nearBottom = !feed || (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 56);
+
+    dayBoothSection.innerHTML = dayBoothHTML();
+
+    var feed2 = dayBoothSection.querySelector('.day-feed');
+    if (feed2) {
+      if (nearBottom) feed2.scrollTop = feed2.scrollHeight;
+      else feed2.scrollTop = prevScroll;
+    }
   }
 
   // Game-level Flags & Reviews / Red Zone panel (reads the cached game events).
@@ -3474,15 +3829,148 @@
   // only nullified red-zone plays). This mirrors the NFL booth's red-zone view.
   function boothGameHtml() {
     var id = state.game ? String(state.game.id) : '';
-    var events = (state.booth.eventsByGame[id] || []).filter(function (e) {
-      return state.tab !== 'redzone' || boothFilterMatches('redzone', e);
+    var allEvents = state.booth.eventsByGame[id] || [];
+    var isRedZoneTab = state.tab === 'redzone';
+    var events = allEvents.filter(function (e) {
+      return !isRedZoneTab || (e.redZone && boothEventNullifies(e));
     });
-    var visible = events.filter(function (e) { return boothFilterMatches(state.booth.filter, e); });
-    return boothToolsHtml(state.tab === 'redzone' ? DAY_BOOTH_FILTERS : BOOTH_FILTERS) + boothListHtml(visible);
+
+    var filter = state.booth.filter || 'all';
+    var counts = boothKindCounts(events);
+    var visible = events.filter(function (e) { return boothFilterMatches(filter, e); });
+    var filters = boothFiltersHTML(filter, counts, 'data-booth-filter', '', isRedZoneTab ? DAY_BOOTH_FILTERS : BOOTH_FILTERS);
+
+    var lastPlay = (state.detail && state.detail.plays.length) ? state.detail.plays[state.detail.plays.length - 1] : null;
+    var lastText = lastPlay ? (lastPlay.text || '') : '';
+    var livePending = !!(state.game && state.game.status && state.game.status.state === 'in' && lastPlay &&
+      (boothClassify(lastPlay) === 'review' || boothResult(lastText) === 'pending'));
+
+    var nullifiedEvents = events.filter(boothEventNullifies);
+    var nullifiedBanner = (!livePending && nullifiedEvents.length)
+      ? '<div class="booth-banner removed-banner">' +
+        '<span class="badge removed">' + nullifiedEvents.length + ' NULLIFIED</span>' +
+        '<span>Score taken off the board – ' +
+        nullifiedEvents.map(function (e) {
+          if (!e.removesPoints) return esc(e.heading || 'nullified score');
+          var team = e.removedTeam === 'away' ? (state.game && state.game.away ? state.game.away.abbreviation : 'AWAY')
+            : (state.game && state.game.home ? state.game.home.abbreviation : 'HOME');
+          return esc(team + ' ' + e.pointsRemoved + 'pts');
+        }).join(', ') +
+        ' – switch to the Nullified filter.</span>' +
+        '</div>'
+      : '';
+
+    var underReviewBanner = livePending
+      ? '<div class="booth-banner">' +
+        '<span class="badge review">UNDER REVIEW</span>' +
+        '<span>' + esc(lastText) + '</span>' +
+        '</div>'
+      : '';
+
+    var rzBanner = '';
+    if (isRedZoneTab && events.length) {
+      var removedPts = events.reduce(function (sum, e) {
+        return sum + (e.removesPoints ? Number(e.pointsRemoved) || 0 : 0);
+      }, 0);
+      rzBanner = '<div class="booth-banner removed-banner">' +
+        '<span class="badge removed">' + events.length + ' NULLIFIED IN RZ</span>' +
+        '<span>' + events.length + ' red zone scoring play(s) taken off the board' +
+        (removedPts ? ' – ' + removedPts + ' pts removed' : '') + '.</span>' +
+        '</div>';
+    }
+
+    var banner = underReviewBanner + nullifiedBanner + rzBanner;
+
+    var body;
+    if (!visible.length) {
+      body = '<div class="booth-empty">' +
+        (isRedZoneTab
+          ? 'No nullified red zone scores yet — no touchdown, field goal, PAT or 2-pt conversion has been wiped out from the opponent’s 20 or inside.'
+          : 'No flags, challenges, or replay reviews in the play-by-play yet.') +
+        '</div>';
+    } else {
+      body = '<div class="booth-feed">' +
+        visible.map(function (e) { return boothMsgHTML(e, false); }).join('') +
+        '</div>';
+    }
+
+    return '<div class="booth-panel">' +
+      banner +
+      '<div class="booth-filters">' + filters + '</div>' +
+      body +
+      '</div>';
+  }
+
+  // Live header score/status extraction
+  function liveHeaderEvents(data) {
+    var out = [];
+    (data && data.sports || []).forEach(function (sport) {
+      (sport && sport.leagues || []).forEach(function (league) {
+        (league && league.events || []).forEach(function (event) { out.push(event); });
+      });
+    });
+    return out;
+  }
+
+  var liveHeaderInFlight = false;
+  async function refreshLiveScores() {
+    var hasLive = state.games.some(function (g) { return g.status && g.status.state === 'in'; });
+    if (!hasLive || liveHeaderInFlight) return;
+    liveHeaderInFlight = true;
+    try {
+      var url = LIVE_HEADER_URL + '&_=' + Date.now();
+      var r = await espnFetch(url, 4000);
+      var evs = liveHeaderEvents(r.data);
+      var byId = {};
+      evs.forEach(function (e) { if (e && e.id != null) byId[String(e.id)] = e; });
+      var changed = false;
+      state.games.forEach(function (g) {
+        var source = byId[String(g.id)];
+        if (!source) return;
+        var comps = source.competitors || [];
+        comps.forEach(function (c) {
+          var side = c.homeAway === 'home' ? g.home : (c.homeAway === 'away' ? g.away : null);
+          if (side && c.score != null && String(side.score) !== String(c.score)) {
+            side.score = Number(c.score);
+            changed = true;
+          }
+          if (side && c.winner != null) side.winner = !!c.winner;
+        });
+        if (source.fullStatus && source.fullStatus.type) {
+          var nextSt = {
+            state: source.fullStatus.type.state || 'pre',
+            name: source.fullStatus.type.name || '',
+            detail: source.fullStatus.type.detail || '',
+            shortDetail: source.fullStatus.type.shortDetail || '',
+            description: source.fullStatus.type.description || '',
+            completed: !!source.fullStatus.type.completed,
+            clock: source.fullStatus.displayClock != null ? source.fullStatus.displayClock : '',
+            period: source.fullStatus.period != null ? source.fullStatus.period : null
+          };
+          if (JSON.stringify(g.status) !== JSON.stringify(nextSt)) {
+            g.status = nextSt;
+            changed = true;
+          }
+        }
+        if (source.situation) {
+          g.situation = source.situation;
+          if (source.situation.lastPlay) {
+            state.booth.lastLivePlays[String(g.id)] = source.situation.lastPlay;
+          }
+        }
+      });
+      if (changed) {
+        if (state.view === 'scoreboard') renderScoreboard();
+        else if (state.view === 'game') render();
+      }
+    } catch (e) {
+    } finally {
+      liveHeaderInFlight = false;
+    }
   }
 
   // Drive the day booth polling. Runs on the scoreboard view; the cadence
-  // depends on whether any game is live (fast) or all are final/pre (slow).
+  // depends on whether any game is live (fast 1s) or all are final/pre (5s).
   function dayBoothPoll() {
     if (state.view !== 'scoreboard' || !state.games.length) return;
     if (state.booth.paused) return;
@@ -3497,7 +3985,9 @@
   var boothPollTimer = null;
   function startDayBoothPolling() {
     if (boothPollTimer) clearInterval(boothPollTimer);
-    boothPollTimer = setInterval(dayBoothPoll, BOOTH_DAY_POLL_MS);
+    var hasLive = state.games.some(function (g) { return g.status && g.status.state === 'in'; });
+    var interval = hasLive ? LIVE_REVIEWS_INTERVAL_MS : BOOTH_DAY_POLL_MS;
+    boothPollTimer = setInterval(dayBoothPoll, interval);
   }
   function stopDayBoothPolling() {
     if (boothPollTimer) { clearInterval(boothPollTimer); boothPollTimer = null; }
@@ -3647,8 +4137,24 @@
     if (!d) return '<div class="spinner"></div>';
     if (!d.plays.length) return '<div class="empty"><strong>No play-by-play yet</strong>Plays appear here as the game is covered.</div>';
 
-    function teamAbbr(id) {
-      var t = d.teams.find(function (x) { return x.id === id; });
+    var id = state.game ? String(state.game.id) : '';
+    var gameBoothEvents = state.booth.eventsByGame[id] || [];
+    var boothById = {};
+    gameBoothEvents.forEach(function (e) {
+      if (e && e.id != null) boothById[String(e.id)] = e;
+    });
+
+    var nullifiedInGame = gameBoothEvents.filter(boothEventNullifies);
+    var topBanner = '';
+    if (nullifiedInGame.length) {
+      topBanner = '<div class="booth-banner removed-banner" style="margin-bottom: 10px;">' +
+        '<span class="badge removed">' + nullifiedInGame.length + ' NULLIFIED</span>' +
+        '<span>' + nullifiedInGame.length + ' scoring play(s) taken off the board in this game – see the highlighted rows or the Flags &amp; Reviews Nullified filter.</span>' +
+        '</div>';
+    }
+
+    function teamAbbr(tid) {
+      var t = d.teams.find(function (x) { return x.id === tid; });
       return t ? t.abbreviation : '';
     }
     function filtered(p) {
@@ -3678,9 +4184,14 @@
       list += '<div class="pb-q">' + esc(periodLabel(per)) + (per > 4 ? ' (overtime)' : ' quarter') + '</div>';
       var rows = byPeriod.get(per).slice().reverse();
       rows.forEach(function (p) {
+        var bEvent = boothById[String(p.id)];
+        var isNullified = boothEventNullifies(bEvent);
         var cls = 'pb-row';
+        if (isNullified) cls += ' pts-removed';
         var tags = '';
-        if (p.scoringPlay) {
+        if (isNullified) {
+          tags = '<span class="pb-tag removed">' + (bEvent && bEvent.removesPoints ? '−' + bEvent.pointsRemoved + ' PTS REMOVED' : 'NULLIFIED') + '</span>';
+        } else if (p.scoringPlay) {
           cls += ' score';
           tags = '<span class="pb-tag ' + (String(p.scoringType || '').indexOf('TD') >= 0 ? 'td' : 'fg') + '">' + esc(p.scoringType || 'SCORE') + '</span>';
         } else if (p.isPenalty) {
@@ -3703,7 +4214,7 @@
       });
     });
     list += '</div>';
-    return tools + list;
+    return topBanner + tools + list;
   }
 
   function teamStatsHtml() {
@@ -3957,6 +4468,35 @@
     if (t && t.id === 'boothPause') state.booth.paused = !!t.checked;
   });
 
+  if (dayBoothSection) {
+    dayBoothSection.addEventListener('click', function (e) {
+      var snd = e.target.closest ? e.target.closest('.day-sound-btn') : null;
+      if (snd) {
+        toggleBoothSound();
+        return;
+      }
+      var flt = e.target.closest ? (e.target.closest('.day-filter') || e.target.closest('[data-booth-filter]')) : null;
+      if (flt) {
+        var f = flt.getAttribute('data-booth-filter') || flt.getAttribute('data-day-filter');
+        if (f) {
+          state.booth.filter = f;
+          renderDayBooth();
+        }
+        return;
+      }
+      var msg = e.target.closest ? e.target.closest('.day-msg') : null;
+      if (msg) {
+        var gid = msg.getAttribute('data-id');
+        if (gid) {
+          var found = lookupGame(gid);
+          var tab = state.booth.filter === 'redzone' ? 'redzone' : 'booth';
+          state.tab = tab;
+          goGame(gid, found ? found.date : state.date);
+        }
+      }
+    });
+  }
+
   document.getElementById('prevDay').addEventListener('click', function () { goScoreboard(shiftDate(state.date, -1)); });
   document.getElementById('nextDay').addEventListener('click', function () { goScoreboard(shiftDate(state.date, 1)); });
   document.getElementById('todayBtn').addEventListener('click', function () { goScoreboard(localDateStr()); });
@@ -3999,6 +4539,24 @@
   window.addEventListener('hashchange', route);
 
   (function boot() {
+    document.addEventListener('click', unlockBoothAudio);
+    document.addEventListener('keydown', unlockBoothAudio);
+    loadBoothSoundPref();
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState !== 'hidden') {
+        if (state.view === 'scoreboard') {
+          refreshLiveScores();
+          buildDayBooth(true).then(function () { if (state.view === 'scoreboard') renderDayBooth(); }).catch(function () {});
+          loadScoreboard(false);
+        } else if (state.view === 'game') {
+          refreshLiveScores();
+          pollGameSummary();
+          pollGameStatus();
+        }
+      }
+    });
+
     dateInput.value = state.date.slice(0, 4) + '-' + state.date.slice(4, 6) + '-' + state.date.slice(6, 8);
     if (!location.hash) location.hash = '/' + state.date; // fires hashchange → route()
     else route();
@@ -4073,13 +4631,34 @@
     espnSideMatchesNCAATeam: espnSideMatchesNCAATeam,
     ncaaContestsOf: ncaaContestsOf,
     findNCAAContestForGame: findNCAAContestForGame,
-    BOOTH_KINDS: BOOTH_KINDS, BOOTH_KIND_LABEL: BOOTH_KIND_LABEL, BOOTH_RESULT_LABEL: BOOTH_RESULT_LABEL,
-    BOOTH_FILTERS: BOOTH_FILTERS, DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS, BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
-    boothClassify: boothClassify, boothResult: boothResult, boothMentionsScore: boothMentionsScore,
-    nullifiedScoreText: nullifiedScoreText, boothEventNullifies: boothEventNullifies,
-    boothScoreEffect: boothScoreEffect, boothEventContext: boothEventContext, boothEvent: boothEvent,
-    boothEvents: boothEvents, dayBoothFeed: dayBoothFeed, reconcileDayBoothFeed: reconcileDayBoothFeed,
-    boothYardsToEndzone: boothYardsToEndzone, boothIsRedZonePlay: boothIsRedZonePlay,
-    boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay
+    BOOTH_KINDS: BOOTH_KINDS,
+    BOOTH_KIND_LABEL: BOOTH_KIND_LABEL,
+    BOOTH_RESULT_LABEL: BOOTH_RESULT_LABEL,
+    BOOTH_FILTERS: BOOTH_FILTERS,
+    DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS,
+    BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
+    boothClassify: boothClassify,
+    boothResult: boothResult,
+    boothMentionsScore: boothMentionsScore,
+    nullifiedScoreText: nullifiedScoreText,
+    boothEventNullifies: boothEventNullifies,
+    boothScoreEffect: boothScoreEffect,
+    boothEventContext: boothEventContext,
+    boothEvent: boothEvent,
+    boothEvents: boothEvents,
+    dayBoothFeed: dayBoothFeed,
+    reconcileDayBoothFeed: reconcileDayBoothFeed,
+    boothYardsToEndzone: boothYardsToEndzone,
+    boothIsRedZonePlay: boothIsRedZonePlay,
+    boothIsScoringPlay: boothIsScoringPlay,
+    boothNearestScoringPlay: boothNearestScoringPlay,
+    boothKindCounts: boothKindCounts,
+    boothEventShown: boothEventShown,
+    boothScoreTrailHTML: boothScoreTrailHTML,
+    scorePair: scorePair,
+    LIVE_HEADER_URL: LIVE_HEADER_URL,
+    LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
+    LIVE_REVIEWS_INTERVAL_MS: LIVE_REVIEWS_INTERVAL_MS,
+    SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS
   };
 });

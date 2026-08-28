@@ -935,6 +935,123 @@ function waitForPort(url, ms) {
     assert.strictEqual(merged[2].text, 'new');
   });
 
+  test('boothKindCounts aggregates kinds, nullified, and red zone flags correctly', () => {
+    const sampleEvents = [
+      { kind: 'penalty', nullified: true, redZone: true },
+      { kind: 'review', nullified: true, redZone: false },
+      { kind: 'challenge', nullified: false, redZone: false },
+      { kind: 'replay', nullified: false, redZone: true },
+      { kind: 'penalty', nullified: false, redZone: false }
+    ];
+    const counts = NB.boothKindCounts(sampleEvents);
+    assert.strictEqual(counts.all, 5);
+    assert.strictEqual(counts.flag, 2);
+    assert.strictEqual(counts.review, 1);
+    assert.strictEqual(counts.challenge, 1);
+    assert.strictEqual(counts.replay, 1);
+    assert.strictEqual(counts.nullified, 2);
+    assert.strictEqual(counts.redzone, 2);
+  });
+
+  test('boothEventShown filters events matching chips', () => {
+    const e1 = { kind: 'penalty', nullified: true, redZone: true };
+    const e2 = { kind: 'review', nullified: false, redZone: false };
+    const e3 = { kind: 'challenge', nullified: false, redZone: true };
+    assert.strictEqual(NB.boothEventShown(e1, 'all'), true);
+    assert.strictEqual(NB.boothEventShown(e1, 'flag'), true);
+    assert.strictEqual(NB.boothEventShown(e1, 'nullified'), true);
+    assert.strictEqual(NB.boothEventShown(e1, 'redzone'), true);
+    assert.strictEqual(NB.boothEventShown(e1, 'review'), false);
+
+    assert.strictEqual(NB.boothEventShown(e2, 'review'), true);
+    assert.strictEqual(NB.boothEventShown(e2, 'nullified'), false);
+
+    assert.strictEqual(NB.boothEventShown(e3, 'challenge'), true);
+    assert.strictEqual(NB.boothEventShown(e3, 'redzone'), true);
+  });
+
+  test('boothScoreTrailHTML formats before -> during -> after and pending review badges', () => {
+    const normalNullified = {
+      nullified: true,
+      removesPoints: true,
+      pointsRemoved: 6,
+      beforeAwayScore: 14,
+      beforeHomeScore: 7,
+      duringAwayScore: 20,
+      duringHomeScore: 7,
+      afterAwayScore: 14,
+      afterHomeScore: 7
+    };
+    const html1 = NB.boothScoreTrailHTML(normalNullified, 'TA&M', 'MIZ');
+    assert.ok(html1.indexOf('bsh-before') !== -1);
+    assert.ok(html1.indexOf('14–7') !== -1);
+    assert.ok(html1.indexOf('bsh-during') !== -1);
+    assert.ok(html1.indexOf('20–7') !== -1);
+    assert.ok(html1.indexOf('bsh-after') !== -1);
+    assert.ok(html1.indexOf('−6 PTS') !== -1);
+
+    const pendingReview = {
+      kind: 'review',
+      result: 'pending',
+      duringAwayScore: 10,
+      duringHomeScore: 3
+    };
+    const html2 = NB.boothScoreTrailHTML(pendingReview, 'TA&M', 'MIZ');
+    assert.ok(html2.indexOf('REVIEW IN PROGRESS') !== -1);
+  });
+
+  test('score rollbacks correctly identify TD (6), FG (3), PAT (1), and 2-pt (2) scores removed', () => {
+    // 1. Touchdown wiped out (6 pts)
+    const tdPlays = [
+      boothNorm({ id: '1', seq: 1, text: 'Run for 5 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: '2', seq: 2, text: 'Pass for 30 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Passing Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: '3', seq: 3, text: 'PENALTY Offensive Holding, 10 yards, Touchdown Nullified - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0 })
+    ];
+    const tdEffect = NB.boothScoreEffect(tdPlays, 2);
+    assert.strictEqual(tdEffect.removesPoints, true);
+    assert.strictEqual(tdEffect.pointsRemoved, 6);
+    assert.strictEqual(tdEffect.team, 'away');
+
+    // 2. Field goal wiped out (3 pts)
+    const fgPlays = [
+      boothNorm({ id: '1', seq: 1, text: 'Run for 2 yards', awayScore: 10, homeScore: 7 }),
+      boothNorm({ id: '2', seq: 2, text: '35 yd Field Goal GOOD', scoringPlay: true, type: { text: 'Field Goal Good' }, awayScore: 13, homeScore: 7 }),
+      boothNorm({ id: '3', seq: 3, text: 'PENALTY False Start, 5 yards, Field Goal Nullified - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 10, homeScore: 7 })
+    ];
+    const fgEffect = NB.boothScoreEffect(fgPlays, 2);
+    assert.strictEqual(fgEffect.removesPoints, true);
+    assert.strictEqual(fgEffect.pointsRemoved, 3);
+    assert.strictEqual(fgEffect.team, 'away');
+
+    // 3. PAT extra point wiped out (1 pt)
+    const patPlays = [
+      boothNorm({ id: '1', seq: 1, text: 'Touchdown', awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: '2', seq: 2, text: 'Extra Point GOOD', scoringPlay: true, type: { text: 'Extra Point Good' }, awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: '3', seq: 3, text: 'PENALTY Illegal Formation on Extra Point - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 6, homeScore: 0 })
+    ];
+    const patEffect = NB.boothScoreEffect(patPlays, 2);
+    assert.strictEqual(patEffect.removesPoints, true);
+    assert.strictEqual(patEffect.pointsRemoved, 1);
+    assert.strictEqual(patEffect.team, 'away');
+
+    // 4. Two-point conversion wiped out (2 pts)
+    const twoPtPlays = [
+      boothNorm({ id: '1', seq: 1, text: 'Touchdown', awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: '2', seq: 2, text: 'TWO-POINT CONVERSION ATTEMPT FAILS (or SUCCEEDS)', scoringPlay: true, type: { text: 'Two-Point Conversion' }, awayScore: 8, homeScore: 0 }),
+      boothNorm({ id: '3', seq: 3, text: 'PENALTY Offensive Pass Interference on Two-Point Conversion - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 6, homeScore: 0 })
+    ];
+    const twoPtEffect = NB.boothScoreEffect(twoPtPlays, 2);
+    assert.strictEqual(twoPtEffect.removesPoints, true);
+    assert.strictEqual(twoPtEffect.pointsRemoved, 2);
+    assert.strictEqual(twoPtEffect.team, 'away');
+  });
+
+  test('polling cadence constants match requirements (0.25s live score, 1s pbp/booth, 15s full scoreboard)', () => {
+    assert.strictEqual(NB.LIVE_SCORES_INTERVAL_MS, 250);
+    assert.strictEqual(NB.LIVE_REVIEWS_INTERVAL_MS, 1000);
+    assert.strictEqual(NB.SCOREBOARD_INTERVAL_MS, 15000);
+  });
+
   console.log('--- server ---');
   const port = 8137;
   const base = 'http://127.0.0.1:' + port;
@@ -993,13 +1110,21 @@ function waitForPort(url, ms) {
       assert.notStrictEqual(res.status, 400);
       assert.strictEqual(res.status, 502);
     });
+    await atest('relay allowlists the verified scoreboard header path on site.web.api.espn.com', async () => {
+      const headerUrl = encodeURIComponent('https://site.web.api.espn.com/apis/v2/scoreboard/header?sport=football&league=college-football');
+      const res = await fetch(base + '/api/espn?url=' + headerUrl);
+      assert.notStrictEqual(res.status, 400);
+      assert.strictEqual(res.status, 502);
+    });
     await atest('relay rejects Core API paths outside the plays collection and non-numeric ids', async () => {
       const item = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/401769074/competitions/401769074/plays/123');
       const seasons = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/seasons/2025/teams/84');
       const badId = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/abc/competitions/abc/plays');
+      const badSiteWeb = encodeURIComponent('https://site.web.api.espn.com/apis/v2/scoreboard/internal');
       assert.strictEqual((await fetch(base + '/api/espn?url=' + item)).status, 400);
       assert.strictEqual((await fetch(base + '/api/espn?url=' + seasons)).status, 400);
       assert.strictEqual((await fetch(base + '/api/espn?url=' + badId)).status, 400);
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + badSiteWeb)).status, 400);
     });
     await atest('404 for unknown paths, no file escape via traversal', async () => {
       assert.strictEqual((await fetch(base + '/nope.js')).status, 404);
