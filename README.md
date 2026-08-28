@@ -469,6 +469,20 @@ on this date" report; all claims re-verified live before and after the change):
     a stub-`fetch` test proving a 429 stops the transport chain before Reader
     or proxies are touched, a definedness scan over every scoreboard/booth
     wiring function, and relay single-flight coalescing.
+22. The relay's **200-response micro-cache was verified end to end** on
+    2026-08-28, not just by unit test. This sandbox has no outbound HTTPS, so
+    the offline suite could only prove the relay's error and single-flight
+    paths; the cache-hit path was previously undemonstrated. It was closed by
+    resolving the allowlisted host `site.api.espn.com` to a local HTTPS
+    stand-in (temporary `/etc/hosts` entry plus a throwaway TLS certificate
+    trusted only through `NODE_EXTRA_CA_CERTS`, both reverted afterwards) that
+    counted the requests actually reaching it. Through the unmodified relay,
+    **12 client requests produced 2 upstream calls**: ten concurrent identical
+    requests returned one `X-Relay-Cache: miss` and nine `shared` from a single
+    upstream fetch, a repeat inside the TTL returned `hit` with no upstream
+    call, and a request after the TTL expired returned `miss` with exactly one
+    new upstream call. `server.js` was not modified for this test and still
+    performs normal TLS verification (no `rejectUnauthorized: false`).
 
 The booth verification list above (item 15) is the score/status source: ESPN
 NCAA header events mirror the NFL scoreboard header the NFL booth polls at
