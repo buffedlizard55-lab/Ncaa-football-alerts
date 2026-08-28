@@ -1052,11 +1052,158 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.SCOREBOARD_INTERVAL_MS, 15000);
   });
 
+  test('polling cadence constants also expose the idle-day scoreboard interval', () => {
+    assert.strictEqual(NB.SCOREBOARD_IDLE_INTERVAL_MS, 60000);
+    assert.strictEqual(NB.BOOTH_PASS_MAX_REFRESH, 8);
+    assert.strictEqual(NB.BOOTH_SEED_PASS_MAX, 12);
+    assert.ok(NB.BOOTH_BUSY_DAY_GAME_MS >= 250 && NB.BOOTH_BUSY_DAY_GAME_MS <= 1000);
+    assert.ok(NB.BOOTH_MAX_ACTIVE < NB.PROVIDER_MAX_CONCURRENT);
+    assert.ok(NB.BOOTH_MAX_ACTIVE >= 1);
+    assert.strictEqual(NB.LANE_USER, 0);
+    assert.strictEqual(NB.LANE_BOOTH, 2);
+  });
+
+  test('scoreboard wiring helpers are all defined (lastPlayBooth regression: an undefined reference in game-row rendering blanked the whole scoreboard)', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
+    assert.match(src, /function lastPlayBooth\s*\(/, 'lastPlayBooth must be defined');
+    assert.match(src, /lastPlayBooth\(g, state\.booth\.eventsByGame\)/, 'game rows must call it with the cached events map');
+    assert.ok(!/\brebuilGameBoothFromDetail\b/.test(src), 'typo rebuilGameBoothFromDetail must not remain');
+    assert.match(src, /function rebuildGameBoothFromDetail\s*\(/);
+    // Free-name calls inside the wiring bodies must resolve to definitions in
+    // the file: the ReferenceError class of bug that skipped every row.
+    const defined = new Set();
+    for (const m of src.matchAll(/function\s+([A-Za-z_$][\w$]*)\s*\(/g)) defined.add(m[1]);
+    for (const m of src.matchAll(/\b(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=/g)) defined.add(m[1]);
+    for (const m of src.matchAll(/\(\s*([A-Za-z_$][\w$,\s]*)\s*\)\s*=>/g)) m[1].split(',').map(s => s.trim()).filter(Boolean).forEach((p) => defined.add(p));
+    for (const m of src.matchAll(/function\s*\(([^)]*)\)/g)) m[1].split(',').map(s => s.trim()).filter(Boolean).forEach((p) => defined.add(p));
+    const keywords = new Set(['if','for','while','switch','catch','return','typeof','new','await','function','do','else','in','of','case','delete','void','yield','throw']);
+    const globals = new Set(['fetch','setTimeout','clearTimeout','setInterval','clearInterval','requestAnimationFrame','encodeURIComponent','decodeURIComponent','Number','String','Boolean','Array','Object','JSON','Math','Date','Promise','Error','Map','Set','isNaN','parseInt','parseFloat','RegExp','Intl','AbortController','URL','console','AudioContext','localStorage','document','window','location','navigator','history','globalThis','this']);
+    for (const fname of ['gameRowHtml', 'renderScoreboard', 'renderDayBooth', 'dayBoothHTML', 'pollGameSummary', 'loadGame', 'dayBoothPoll', 'buildDayBooth', 'loadScoreboard', 'render', 'refreshLiveScores', 'route', 'renderDiag']) {
+      const at = src.indexOf('function ' + fname + '(');
+      assert.ok(at >= 0, fname + ' must exist');
+      const nextFn = src.indexOf('\n  function ', at);
+      const body = src.slice(at, nextFn > at ? nextFn : at + 12000)
+        .replace(/\/\/[^\n]*/g, ' ')                 // strip line comments
+        .replace(/'(?:[^'\\\n]|\\.)*'/g, "''");     // strip single-quoted strings
+      const free = body.match(/(?:^|[^.\w$])([a-z][A-Za-z0-9_$]*)\s*\(/g) || [];
+      for (const raw of free) {
+        const name = raw.replace(/^[^a-zA-Z_$]+/, '').replace(/\s*\($/, '');
+        if (globals.has(name) || defined.has(name) || keywords.has(name)) continue;
+        throw new Error(fname + ' calls undefined function: ' + name);
+      }
+    }
+  });
+
+  test('lastPlayBooth returns the newest cached booth event for a game (never invented)', () => {
+    const events = { '7': [{ kind: 'penalty', seq: 1 }, { kind: 'review', seq: 2 }] };
+    assert.deepStrictEqual(NB.lastPlayBooth({ id: '7' }, events), { kind: 'review', seq: 2 });
+    assert.strictEqual(NB.lastPlayBooth({ id: '8' }, events), null);
+    assert.strictEqual(NB.lastPlayBooth(null, events), null);
+    assert.strictEqual(NB.lastPlayBooth({ id: '7' }, null), null);
+    assert.strictEqual(NB.lastPlayBooth({ id: '7' }, { '7': [] }), null);
+  });
+
+  test('boothRefreshPlan paces live games, refetches a final exactly once, and caps a pass', () => {
+    const now = 1000000;
+    const mk = (id, state, extra) => Object.assign({ id, status: { state } }, extra || {});
+    const games = [mk('1', 'in'), mk('2', 'in'), mk('3', 'post'), mk('4', 'pre'), mk('5', 'in')];
+    // Fresh day: everything scannable seeds (pre excluded, plan is capped).
+    const seed = NB.boothRefreshPlan(games, {}, now, { forceAll: true, perPass: 4 });
+    assert.deepStrictEqual(seed.slice(0, 3), ['1', '2', '5']);
+    assert.strictEqual(seed.length, 4);
+    // Nothing cached yet on a poll: still fetches, live-first, oldest-first.
+    const first = NB.boothRefreshPlan(games, {}, now, { minIntervalMs: 1000, perPass: 8 });
+    assert.deepStrictEqual(first, ['1', '2', '5', '3']);
+    // Live games honour the per-game floor; a final rests unless it just ended.
+    const fresh = { '1': { t: now, wasLive: true }, '2': { t: now, wasLive: true }, '5': { t: now, wasLive: true }, '3': { t: now, wasLive: false } };
+    assert.deepStrictEqual(NB.boothRefreshPlan(games, fresh, now + 500, { minIntervalMs: 1000 }), []);
+    const aged = { '1': { t: now - 1500, wasLive: true }, '2': { t: now, wasLive: true }, '5': { t: now, wasLive: true }, '3': { t: now, wasLive: true } };
+    const due = NB.boothRefreshPlan(games, aged, now, { minIntervalMs: 1000 });
+    assert.ok(due.includes('1'), 'stale live game is due');
+    assert.ok(!due.includes('2') && !due.includes('5'), 'young live games rest');
+    assert.ok(due.includes('3'), 'a cached-live final refetches once');
+    const rested = { '3': { t: now - 99999, wasLive: false } };
+    assert.deepStrictEqual(NB.boothRefreshPlan([mk('3', 'post')], rested, now, { minIntervalMs: 1000 }), []);
+    // Provider says no play-by-play: never scanned.
+    assert.deepStrictEqual(NB.boothRefreshPlan([mk('9', 'in', { playByPlayAvailable: false })], {}, now, {}), []);
+  });
+
+  await atest('createProviderGate: lanes take strict priority, the booth lane is capped below the pool, FIFO within a lane', async () => {
+    const gate = NB.createProviderGate({ max: 2, laneCaps: { 2: 1 } });
+    const order = [];
+    let release = [];
+    const block = () => new Promise((res) => release.push(res));
+    const task = (label) => () => { order.push(label); return block().then(() => label); };
+    const flush = () => new Promise((res) => setImmediate(res));
+    const jobs = [
+      gate.run(task('booth1'), 2),
+      gate.run(task('booth2'), 2),
+      gate.run(task('booth3'), 2),
+      gate.run(task('user1'), 0),
+      gate.run(task('aux1'), 1),
+      gate.run(task('user2'), 0)
+    ];
+    await flush();
+    // max=2: booth1 (lane 2 starts first but is capped to ONE active),
+    // user1 (lane 0) fills the second slot. booth2/booth3 must wait — the
+    // booth lane may never monopolise the pool the scoreboard needs.
+    assert.deepStrictEqual(order, ['booth1', 'user1']);
+    release.shift()(); // booth1 finishes -> next dispatch must be lane 0 (user2)
+    await flush();
+    assert.deepStrictEqual(order, ['booth1', 'user1', 'user2']);
+    release.shift()(); // user1 finishes -> lane 1 (aux1) before lane 2 backlog
+    await flush();
+    assert.deepStrictEqual(order, ['booth1', 'user1', 'user2', 'aux1']);
+    for (let i = 0; i < 8 && release.length; i++) {
+      const pending = release;
+      release = [];
+      pending.forEach((r) => r());
+      await flush();
+    }
+    await Promise.all(jobs);
+    assert.deepStrictEqual(order, ['booth1', 'user1', 'user2', 'aux1', 'booth2', 'booth3'],
+      'booth lane ran strictly one-at-a-time behind user/aux traffic');
+    const stats = gate.stats();
+    assert.strictEqual(stats.active, 0);
+    assert.deepStrictEqual(stats.queued, [0, 0, 0]);
+    assert.strictEqual(stats.peak.active, 2);
+    assert.ok(stats.peak.queued[2] >= 2, 'booth lane backlog was actually queued');
+  });
+
+  test('isRateLimitError recognises the provider throttle but not ordinary failures', () => {
+    assert.strictEqual(NB.isRateLimitError(new Error('HTTP 429: Too Many Requests')), true);
+    assert.strictEqual(NB.isRateLimitError(new Error('Reader HTTP 429: rate limited')), true);
+    assert.strictEqual(NB.isRateLimitError(new Error('HTTP 500')), false);
+    assert.strictEqual(NB.isRateLimitError(new Error('relay:site.api.espn.com temporarily unavailable')), false);
+  });
+
+  await atest('espnFetch fails fast on an upstream 429 instead of replaying it through Reader and public proxies', async () => {
+    const prev = globalThis.fetch;
+    const seen = [];
+    globalThis.fetch = async (url) => {
+      seen.push(String(url));
+      return { ok: false, status: 429, text: async () => 'Too Many Requests', json: async () => { throw new Error('no json'); } };
+    };
+    try {
+      await assert.rejects(
+        NB.espnFetch('https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829', 400),
+        /429/
+      );
+    } finally {
+      globalThis.fetch = prev;
+    }
+    // Two ESPN hosts at most (primary + documented alternate); no r.jina.ai
+    // and no proxy hosts — those only multiply a throttled request.
+    assert.ok(seen.length <= 2, 'expected at most 2 attempts, saw ' + seen.length + ': ' + seen.join(' | '));
+    assert.ok(!seen.some(u => u.includes('r.jina.ai')), '429 must not consume the Reader budget');
+    assert.ok(!seen.some(u => u.includes('allorigins') || u.includes('corsproxy') || u.includes('codetabs')), '429 must not hit public proxies');
+  });
+
   console.log('--- server ---');
   const port = 8137;
   const base = 'http://127.0.0.1:' + port;
   const child = spawn(process.execPath, [path.join(ROOT, 'server.js')], {
-    env: Object.assign({}, process.env, { PORT: String(port) }),
+    env: Object.assign({}, process.env, { PORT: String(port), RELAY_TEST_LATENCY_MS: '300' }),
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let serverLog = '';
@@ -1115,6 +1262,24 @@ function waitForPort(url, ms) {
       const res = await fetch(base + '/api/espn?url=' + headerUrl);
       assert.notStrictEqual(res.status, 400);
       assert.strictEqual(res.status, 502);
+    });
+    await atest('relay single-flight coalesces identical in-flight provider targets', async () => {
+      // Offline both requests fail upstream; the joiner must reuse the same
+      // attempt (its error names the shared request) instead of hitting the
+      // provider a second time for the exact same URL.
+      const headerUrl = encodeURIComponent('https://site.web.api.espn.com/apis/v2/scoreboard/header?sport=football&league=college-football&_t=' + Date.now() + '-' + Math.random());
+      const [a, b] = await Promise.all([
+        fetch(base + '/api/espn?url=' + headerUrl),
+        fetch(base + '/api/espn?url=' + headerUrl)
+      ]);
+      assert.strictEqual(a.status, b.status);
+      assert.notStrictEqual(a.status, 400);
+      const bodies = await Promise.all([a.text(), b.text()]);
+      // Upstream is unreachable in the offline runner; the second identical
+      // request must join the first one in flight and report the shared
+      // failure instead of replaying the provider request.
+      assert.ok(bodies.some(x => x.indexOf('shared request failed') !== -1) || a.status === 200,
+        'expected one attempt to be shared, saw: ' + bodies.join(' / ').slice(0, 200));
     });
     await atest('relay rejects Core API paths outside the plays collection and non-numeric ids', async () => {
       const item = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/401769074/competitions/401769074/plays/123');

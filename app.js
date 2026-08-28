@@ -209,12 +209,17 @@
   // transport is skipped for the other requests in the same refresh cycle.
   // Keep this browser-only: the Node test runner intentionally exercises the
   // raw transport order without sharing state between test cases.
+  // `force` skips the unavailable-window check for one-off user-initiated
+  // requests: the booth's background traffic may mark a transport unavailable,
+  // but clicking a day and being blocked for the whole backoff window is the
+  // exact failure the scoreboard suffered, so interactive loads still probe the
+  // transport (once) before falling through.
   var transportBackoffMs = 15000;
   var transportUnavailableUntil = {};
-  function transportCall(key, fn) {
+  function transportCall(key, fn, force) {
     if (typeof window === 'undefined') return fn();
     var now = Date.now();
-    if (transportUnavailableUntil[key] && transportUnavailableUntil[key] > now) {
+    if (!force && transportUnavailableUntil[key] && transportUnavailableUntil[key] > now) {
       return Promise.reject(new Error(key + ' temporarily unavailable'));
     }
     return Promise.resolve().then(fn).then(function (value) {
@@ -226,8 +231,25 @@
     });
   }
 
-  async function espnFetch(url, timeoutMs) {
+  // True when a transport failed with the provider's own rate-limit status
+  // (HTTP 429). Retrying the same URL through other transports or third-party
+  // proxies only multiplies the throttled request — see the loader's fail-fast.
+  function isRateLimitError(err) {
+    var msg = String((err && err.message) || err || '');
+    return /\bHTTP 429\b/i.test(msg) || /\bstatus( code)?[:= ]?429\b/i.test(msg);
+  }
+
+  async function espnFetch(url, timeoutMs, opts) {
     var t = timeoutMs || 12000;
+    opts = opts || {};
+    var lane = opts.lane == null ? LANE_USER : opts.lane;
+    var force = !!opts.force;
+    // Every provider transport attempt runs through the priority gate, so the
+    // booth's background fan-out can never monopolise the browser connection
+    // pool that the scoreboard's own requests need.
+    function gateCall(key, fn) {
+      return providerGate.run(function () { return transportCall(key, fn, force); }, lane);
+    }
     function attempt(u) {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, t);
@@ -263,6 +285,7 @@
     }
 
     var lastErr = null;
+    var rateLimited = false;
     var candidates = providerUrls(url);
     // The controlled same-origin route and direct provider hosts are tried for
     // every verified provider candidate. Reader is intentionally tried only
@@ -277,25 +300,30 @@
       var relay = sameOriginProxyUrl(candidate);
       if (relay) {
         try {
-          return { data: await transportCall('relay:' + host, function () { return attempt(relay); }), viaProxy: true, proxy: 'server', provider: candidate };
-        } catch (err) { lastErr = err; }
+          return { data: await gateCall('relay:' + host, function () { return attempt(relay); }), viaProxy: true, proxy: 'server', provider: candidate };
+        } catch (err) { lastErr = err; rateLimited = rateLimited || isRateLimitError(err); }
       }
-      try {
-        return { data: await transportCall('direct:' + host, function () { return attempt(candidate); }), viaProxy: false, proxy: null, provider: candidate };
-      } catch (err2) { lastErr = err2; }
-      if (i === 0) {
+      if (!rateLimited) {
         try {
-          return { data: await transportCall('reader:' + host, function () { return attemptReader(candidate); }), viaProxy: true, proxy: 'jina-reader', provider: candidate };
-        } catch (err3) { lastErr = err3; }
+          return { data: await gateCall('direct:' + host, function () { return attempt(candidate); }), viaProxy: false, proxy: null, provider: candidate };
+        } catch (err2) { lastErr = err2; rateLimited = rateLimited || isRateLimitError(err2); }
+      }
+      if (i === 0 && !rateLimited) {
+        try {
+          return { data: await gateCall('reader:' + host, function () { return attemptReader(candidate); }), viaProxy: true, proxy: 'jina-reader', provider: candidate };
+        } catch (err3) { lastErr = err3; rateLimited = rateLimited || isRateLimitError(err3); }
       }
     }
 
     // Direct/provider calls and the Reader transport failed. Walk the older
     // public CORS proxies as a final fallback. They are not data providers and
-    // are intentionally last because their availability is inconsistent.
+    // are intentionally last because their availability is inconsistent — and
+    // are skipped entirely while the provider is rate-limiting us, because
+    // every retry would replay the same throttled request from a third party.
+    if (!rateLimited)
     for (var j = 0; j < CORS_PROXIES.length; j++) {
       try {
-        var p = await transportCall('cors:' + CORS_PROXIES[j].id, function () {
+        var p = await gateCall('cors:' + CORS_PROXIES[j].id, function () {
           return attempt(CORS_PROXIES[j].build(url));
         });
         return { data: p, viaProxy: true, proxy: CORS_PROXIES[j].id, provider: url };
@@ -808,6 +836,7 @@
       source: ev.source || 'espn',
       provider: ev.provider || API_BASE,
       neutralSite: !!comp.neutralSite,
+      playByPlayAvailable: comp.playByPlayAvailable !== false,
       venueName: venue.fullName || '',
       venueCity: [addr.city, addr.state].filter(Boolean).join(', '),
       attendance: comp.attendance || 0,
@@ -1526,9 +1555,32 @@
   var DAY_BOOTH_FILTERS = BOOTH_FILTERS.concat([['redzone', 'Red zone']]);
 
   var LIVE_HEADER_URL = 'https://site.web.api.espn.com/apis/v2/scoreboard/header?sport=football&league=college-football';
-  var LIVE_SCORES_INTERVAL_MS = 250;   // 0.25s score/status cadence
-  var LIVE_REVIEWS_INTERVAL_MS = 1000; // 1s play-by-play cadence
-  var SCOREBOARD_INTERVAL_MS = 15000;  // 15s scoreboard poll
+  var LIVE_SCORES_INTERVAL_MS = 250;   // 0.25s score/status cadence (serial: one header fetch in flight)
+  var LIVE_REVIEWS_INTERVAL_MS = 1000; // 1s per-game play-by-play cadence floor
+  var SCOREBOARD_INTERVAL_MS = 15000;  // 15s scoreboard poll (live days)
+  var SCOREBOARD_IDLE_INTERVAL_MS = 60000; // 60s scoreboard poll once nothing is live
+  // Booth load policy (fixes the starvation the day board hit on a full
+  // Saturday): every live game used to be force-refreshed — finals included —
+  // once per second, 39 multi-hundred-KB summary documents in parallel with
+  // the scoreboard's own requests. Now: a pass takes at most
+  // BOOTH_PASS_MAX_REFRESH games (BOOTH_SEED_PASS_MAX during the first seed),
+  // each game re-fetches at most every max(LIVE_REVIEWS_INTERVAL_MS,
+  // liveGames * BOOTH_BUSY_DAY_GAME_MS) so the burst is politely capped when
+  // 30+ games are live, and only LIVE games are ever re-polled — a final
+  // game refreshes once (on the live -> final transition) and then rests.
+  var BOOTH_PASS_MAX_REFRESH = 8;
+  var BOOTH_SEED_PASS_MAX = 12;
+  var BOOTH_BUSY_DAY_GAME_MS = 400;    // per-live-game spacing on busy days
+  // Global cap on provider transport attempts. A browser keeps ~6 open
+  // connections per origin (documented Chromium behaviour), and the app
+  // relay is same-origin, so the booth is deliberately limited to
+  // BOOTH_MAX_ACTIVE < 6 attempts: at least two relay sockets always remain
+  // free for a user-initiated scoreboard/game request.
+  var PROVIDER_MAX_CONCURRENT = 6;
+  var BOOTH_MAX_ACTIVE = 2;
+  // Gate lanes: 0 = user-facing (day load, game open), 1 = secondary
+  // (nearby discovery, game polls, live header feed), 2 = booth background.
+  var LANE_USER = 0, LANE_AUX = 1, LANE_BOOTH = 2;
   var NON_REVIEW_RENDER_INTERVAL_MS = 5000; // 5s render throttle for large non-review tabs
   var BOOTH_SOUND_KEY = 'ncaaBoothSoundEnabled';
 
@@ -2084,6 +2136,117 @@
     return out;
   }
 
+  // Latest cached booth event for a scoreboard game (used for the per-row
+  // REVIEW badge). eventsByGame maps game id -> seq-sorted booth events.
+  // Returns null when the game has no cached events (never invented).
+  function lastPlayBooth(g, eventsByGame) {
+    if (!g || g.id == null || !eventsByGame) return null;
+    var events = eventsByGame[String(g.id)];
+    if (!Array.isArray(events) || !events.length) return null;
+    return events[events.length - 1] || null;
+  }
+
+  // Decide which day games a booth pass should (re)fetch, newest-priority
+  // policy expressed as a pure function so it is unit-testable offline:
+  //   - only scannable games: 'in'/'post' and not playByPlayAvailable === false
+  //   - live games: at most one fetch per game per minIntervalMs (age >= min)
+  //   - final games: fetched once; a live->final transition triggers exactly
+  //     one refresh (rec.wasLive), then they rest
+  //   - seed (forceAll): every scannable game regardless of cache age
+  //   - ordering: live first (a hot flag matters now), then oldest refresh,
+  //     then id for determinism; capped per pass so a 39-game slate cannot
+  //     queue 39 multi-hundred-KB summary fetches in one cycle.
+  function boothRefreshPlan(games, lastFetch, nowMs, cfg) {
+    cfg = cfg || {};
+    var minInterval = cfg.minIntervalMs > 0 ? cfg.minIntervalMs : 0;
+    var perPass = cfg.perPass > 0 ? cfg.perPass : Infinity;
+    var recs = [];
+    (games || []).forEach(function (g) {
+      if (!g || g.id == null) return;
+      var st = g.status && g.status.state;
+      if (st !== 'in' && st !== 'post') return;
+      if (g.playByPlayAvailable === false) return;
+      var id = String(g.id);
+      var rec = (lastFetch || {})[id] || null;
+      var live = st === 'in';
+      var age = rec ? Math.max(0, (nowMs || 0) - (rec.t || 0)) : Infinity;
+      var needed = false;
+      if (cfg.forceAll) needed = true;
+      else if (!rec) needed = true;
+      else if (live) needed = age >= minInterval;
+      else needed = !!rec.wasLive;
+      if (!needed) return;
+      recs.push({ id: id, live: live, age: age });
+    });
+    recs.sort(function (a, b) {
+      if (a.live !== b.live) return a.live ? -1 : 1;
+      if (b.age !== a.age) return b.age - a.age;
+      return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
+    });
+    return recs.slice(0, perPass).map(function (r) { return r.id; });
+  }
+
+  // Priority fetch gate shared by every provider transport attempt. The
+  // scoreboard's own day loads and the open game's first paint run at lane 0
+  // (user-facing), secondary/detail work at lane 1, and the live booth's
+  // background polls at lane 2 — capped BELOW the browser's 6-socket pool so
+  // a busy booth day can never starve a scoreboard request. Within a lane the
+  // queue is FIFO; lanes drain highest-priority-first.
+  function createProviderGate(cfg) {
+    cfg = cfg || {};
+    var max = Math.max(1, cfg.max > 0 ? cfg.max : 6);
+    var laneCaps = cfg.laneCaps || {};
+    var laneCount = 3;
+    var queues = [];
+    for (var l = 0; l < laneCount; l++) queues.push([]);
+    var active = 0;
+    var peak = { active: 0, queued: [0, 0, 0] };
+    function laneLimit(p) {
+      return laneCaps[p] === undefined ? max : Math.min(max, Math.max(1, laneCaps[p]));
+    }
+    function runNext() {
+      while (active < max) {
+        var picked = -1;
+        for (var p = 0; p < laneCount; p++) {
+          if (queues[p].length && active < laneLimit(p)) { picked = p; break; }
+        }
+        if (picked < 0) return;
+        var job = queues[picked].shift();
+        active++;
+        if (active > peak.active) peak.active = active;
+        (function (job) {
+          Promise.resolve().then(job.fn).then(function (value) {
+            active--;
+            job.res(value);
+            runNext();
+          }, function (err) {
+            active--;
+            job.rej(err);
+            runNext();
+          });
+        })(job);
+      }
+    }
+    return {
+      run: function (fn, prio) {
+        prio = Math.max(0, Math.min(laneCount - 1, prio | 0));
+        return new Promise(function (res, rej) {
+          queues[prio].push({ fn: fn, res: res, rej: rej });
+          if (queues[prio].length > peak.queued[prio]) peak.queued[prio] = queues[prio].length;
+          runNext();
+        });
+      },
+      stats: function () {
+        return { max: max, active: active, queued: queues.map(function (q) { return q.length; }), peak: peak };
+      }
+    };
+  }
+  // One module-wide gate. Node callers (tests) get plain sequential behaviour
+  // because their fake fetches resolve immediately; browser callers get the
+  // lane caps documented above.
+  var providerGate = createProviderGate({ max: PROVIDER_MAX_CONCURRENT, laneCaps: { 2: BOOTH_MAX_ACTIVE } });
+
+
   /* ---------------- View helpers ---------------- */
 
   function statusVM(g) {
@@ -2156,8 +2319,14 @@
       boothYardsToEndzone: boothYardsToEndzone, boothIsRedZonePlay: boothIsRedZonePlay,
       boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay,
       boothKindCounts: boothKindCounts, boothEventShown: boothEventShown, boothScoreTrailHTML: boothScoreTrailHTML,
+      lastPlayBooth: lastPlayBooth, boothRefreshPlan: boothRefreshPlan, createProviderGate: createProviderGate,
+      isRateLimitError: isRateLimitError,
       scorePair: scorePair, LIVE_HEADER_URL: LIVE_HEADER_URL, LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
-      LIVE_REVIEWS_INTERVAL_MS: LIVE_REVIEWS_INTERVAL_MS, SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS
+      LIVE_REVIEWS_INTERVAL_MS: LIVE_REVIEWS_INTERVAL_MS, SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS,
+      SCOREBOARD_IDLE_INTERVAL_MS: SCOREBOARD_IDLE_INTERVAL_MS,
+      BOOTH_PASS_MAX_REFRESH: BOOTH_PASS_MAX_REFRESH, BOOTH_SEED_PASS_MAX: BOOTH_SEED_PASS_MAX,
+      BOOTH_BUSY_DAY_GAME_MS: BOOTH_BUSY_DAY_GAME_MS, PROVIDER_MAX_CONCURRENT: PROVIDER_MAX_CONCURRENT,
+      BOOTH_MAX_ACTIVE: BOOTH_MAX_ACTIVE, LANE_USER: LANE_USER, LANE_AUX: LANE_AUX, LANE_BOOTH: LANE_BOOTH
     };
   }
 
@@ -2209,6 +2378,10 @@
       teamMaps: {},          // gameId -> { teamId: {abbr, displayName, logo, color} }
       gamesByKey: {},        // gameId -> { id, shortName, awayAbbr, homeAbbr, date, live }
       lastAnnounced: {},     // gameId:eventKey -> announced sound key
+      lastFetch: {},         // gameId -> { t, wasLive } — booth refresh policy input
+      lastPass: null,        // { mode, at, requested, fetched } of the latest pass
+      passInFlight: false,   // one booth pass at a time (never stacked)
+      pbpIntervalMs: 1000,   // per-game PBP floor in force this day (adaptive)
       count: 0,              // how many games are included in the day feed
       lastError: null,
       lastLivePlays: {}      // gameId -> live last-play object (for merging)
@@ -2259,7 +2432,8 @@
   // filtered locally by the enabled conference IDs. Do not use the combined
   // `groups=1,8,5,4,151` form — ESPN has returned placeholder `{}` events for
   // that form. Per-conference requests are a recovery path only.
-  async function fetchDay(dateStr, groupIds) {
+  async function fetchDay(dateStr, groupIds, opts) {
+    opts = opts || {};
     if (!groupIds.length) return { lists: [], unfiltered: false, viaProxy: false, proxy: null, provider: null, source: null, errors: [] };
 
     var errors = [];
@@ -2275,7 +2449,7 @@
     // an error banner about the provider that was skipped.
     async function tryNCAA() {
       try {
-        var ncaa = await espnFetch(ncaaScoreboardUrl(dateStr));
+        var ncaa = await espnFetch(ncaaScoreboardUrl(dateStr), undefined, { lane: LANE_USER, force: !!opts.interactive });
         if (scoreboardPayloadIsUsable(ncaa.data)) return ncaa;
         errors.push('NCAA returned no usable contests');
       } catch (ncaaError) {
@@ -2285,7 +2459,7 @@
     }
 
     try {
-      var all = await espnFetch(scoreboardUrl(dateStr));
+      var all = await espnFetch(scoreboardUrl(dateStr), undefined, { lane: LANE_USER, force: !!opts.interactive });
       if (scoreboardPayloadIsUsable(all.data)) {
         // A non-empty ESPN payload is authoritative for the selected date.
         // Only cross-check a genuinely empty slate; this keeps the normal path
@@ -2315,16 +2489,25 @@
     // If the complete feed is unavailable or malformed, use the exact NCAA
     // contest-date query before retrying ESPN one conference at a time. This
     // prevents a network outage from multiplying into five identical retries.
+    // A usable NON-empty NCAA slate is authoritative and renders directly.
+    // A usable-but-EMPTY NCAA response is kept as a safety net only: while the
+    // ESPN day feed failed with a transport/rate-limit error (not an empty
+    // result), the per-conference recovery still has to run first, otherwise a
+    // throttled ESPN day would paint a real game day as empty.
+    var ncaaEmptyFallback = null;
     var ncaaFallback = await tryNCAA();
     if (ncaaFallback) {
-      return { lists: [ncaaFallback.data], unfiltered: false, viaProxy: ncaaFallback.viaProxy, proxy: ncaaFallback.proxy, provider: ncaaFallback.provider, source: 'ncaa', errors: [] };
+      if (validEventsOf(ncaaFallback.data).length) {
+        return { lists: [ncaaFallback.data], unfiltered: false, viaProxy: ncaaFallback.viaProxy, proxy: ncaaFallback.proxy, provider: ncaaFallback.provider, source: 'ncaa', errors: [] };
+      }
+      ncaaEmptyFallback = ncaaFallback;
     }
 
     // If both complete feeds are unavailable, try each conference separately.
     // This avoids losing a usable partial slate and also covers providers that
     // only return conference events for filtered requests.
     var responses = await Promise.all(groupIds.map(function (gid) {
-      return espnFetch(scoreboardUrl(dateStr, gid)).then(
+      return espnFetch(scoreboardUrl(dateStr, gid), undefined, { lane: LANE_USER, force: !!opts.interactive }).then(
         function (r) { return { ok: true, r: r, valid: scoreboardPayloadIsUsable(r.data) }; },
         function (err) { return { ok: false, err: String((err && err.message) || err) }; }
       );
@@ -2348,6 +2531,20 @@
       return { lists: lists, unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: 'espn', errors: hasEvents ? errors : [] };
     }
 
+    if (ncaaEmptyFallback) {
+      // Every ESPN path failed and NCAA genuinely reported no contests. Show
+      // the empty date, but keep the transport error visible rather than
+      // pretending the providers agree on a scoreless day.
+      return {
+        lists: [ncaaEmptyFallback.data],
+        unfiltered: false,
+        viaProxy: ncaaEmptyFallback.viaProxy,
+        proxy: ncaaEmptyFallback.proxy,
+        provider: ncaaEmptyFallback.provider,
+        source: 'ncaa',
+        errors: errors
+      };
+    }
     return { lists: [], unfiltered: false, viaProxy: viaProxy, proxy: proxy, provider: provider, source: null, errors: errors };
   }
 
@@ -2382,13 +2579,18 @@
       state.nearbyFor = null;
       state.nearbyIndex = {};
       // A newly selected date has its own slate; forget the previous day's
-      // booth feed so a "no flags yet" state is not left behind.
+      // booth feed so a "no flags yet" state is not left behind. The run
+      // token also cancels any in-flight booth pass of the old date.
+      boothRun++;
       state.booth.feed = [];
       state.booth.eventsByGame = {};
       state.booth.teamMaps = {};
       state.booth.gamesByKey = {};
       state.booth.lastAnnounced = {};
       state.booth.lastLivePlays = {};
+      state.booth.lastFetch = {};
+      state.booth.nullifiedByGame = {};
+      state.booth.lastPass = null;
       state.booth.count = 0;
     } else if (showSpinner !== false) {
       // An explicit reload of the same date should not display stale adjacent
@@ -2403,7 +2605,7 @@
       render();
     }
     try {
-      var out = await fetchDay(requestedDate, wantedGroups);
+      var out = await fetchDay(requestedDate, wantedGroups, { interactive: showSpinner !== false });
       if (!scoreboardLoadIsCurrent(run, requestedDate)) return;
 
       var events = [];
@@ -2467,18 +2669,36 @@
     }
     render();
     if (state.view === 'scoreboard') {
-      stopPolling();
-      var live = state.games.filter(function (g) { return g.status.state === 'in'; }).length;
-      var delay = live > 0 ? 20000 : 60000;
-      state.pollers.push(setInterval(function () {
-        if (!document.hidden) loadScoreboard(false);
-      }, delay));
-      // Live booth: seed the day feed, then poll it (fast on live days).
-      buildDayBooth(true).then(function () {
+      startScoreboardPollers();
+      // Live booth: seed on a newly selected date, otherwise keep the running
+      // plan fresh. Seeding used to force-refresh every game of the day on
+      // every background reload; the day plan now paces it.
+      buildDayBooth(newDate ? 'seed' : 'poll').then(function () {
         if (state.view === 'scoreboard') { renderDayBooth(); renderDiag(); }
       }).catch(function () { /* keep the last feed */ });
       startDayBoothPolling();
     }
+  }
+
+  // Background timers for the scoreboard view. Shared by loadScoreboard and
+  // by a route() re-render that comes back to a same-date cached slate (the
+  // old code only restarted the booth there and left the day/header tickers
+  // dead). stopPolling() owns their teardown via state.pollers.
+  function startScoreboardPollers() {
+    stopPolling();
+    var live = state.games.filter(function (g) { return g.status.state === 'in'; }).length;
+    // Score/status come from the serial 250 ms header ticker while any game
+    // is live (one small feed for the whole slate, never 39); the full
+    // day request only refreshes the linescores/odds underneath it.
+    var delay = live > 0 ? SCOREBOARD_INTERVAL_MS : SCOREBOARD_IDLE_INTERVAL_MS;
+    state.pollers.push(setInterval(function () {
+      if (!document.hidden) loadScoreboard(false);
+    }, delay));
+    state.pollers.push(setInterval(function () {
+      if (document.hidden) return;
+      var anyLive = state.games.some(function (g) { return g.status && g.status.state === 'in'; });
+      if (anyLive) refreshLiveScores();
+    }, LIVE_SCORES_INTERVAL_MS));
   }
 
   function weekForDate(calendar, dateStr) {
@@ -2543,7 +2763,7 @@
       // and stays within the public provider's rate limit.
       while ((direction > 0 && cursor <= end) || (direction < 0 && cursor >= end)) {
         try {
-          var result = await espnFetch(ncaaScoreboardUrl(cursor), 8000);
+          var result = await espnFetch(ncaaScoreboardUrl(cursor), 8000, { lane: LANE_AUX });
           if (scoreboardPayloadIsUsable(result.data)) {
             anyValid = true;
             viaProxy = viaProxy || result.viaProxy;
@@ -2567,7 +2787,7 @@
     async function probeDays(from, to, step) {
       var direction = step < 0 ? -1 : 1;
       try {
-        var all = await espnFetch(scoreboardRangeUrl(from, to));
+        var all = await espnFetch(scoreboardRangeUrl(from, to), undefined, { lane: LANE_AUX });
         if (scoreboardPayloadIsUsable(all.data)) {
           var rangeEvents = filterEventsForRange(validEventsOf(all.data), from, to);
           var rangeDays = groupByDay(filterEventsForGroups(rangeEvents, groupIds));
@@ -2598,7 +2818,7 @@
       } catch (e) {}
 
       var responses = await Promise.all(groupIds.map(function (gid) {
-        return espnFetch(scoreboardRangeUrl(from, to, gid)).then(
+        return espnFetch(scoreboardRangeUrl(from, to, gid), undefined, { lane: LANE_AUX }).then(
           function (r) { return { ok: scoreboardPayloadIsUsable(r.data), r: r }; },
           function () { return { ok: false }; }
         );
@@ -2739,7 +2959,7 @@
       stHtml = '<span class="st-time">' + esc(fmtKickoff(g.date, dayDate)) + '</span>';
     }
 
-    var liveBooth = lastPlayBooth(g);
+    var liveBooth = lastPlayBooth(g, state.booth.eventsByGame);
     var reviewBadge = (liveBooth && liveBooth.kind === 'review') ? '<span class="badge review">REVIEW</span>' : '';
     var nullified = state.booth.nullifiedByGame && state.booth.nullifiedByGame[String(g.id)];
     var nullBadge = nullified ? '<span class="badge removed">' + (nullified.removesPoints ? '−' + nullified.points + ' PTS' : 'NULLIFIED') + '</span>' : '';
@@ -2893,8 +3113,9 @@
     };
   }
 
-  async function loadNCAAData(gameId) {
-    var overview = await espnFetch(ncaaGameUrl(gameId), 12000);
+  async function loadNCAAData(gameId, opts) {
+    opts = opts || {};
+    var overview = await espnFetch(ncaaGameUrl(gameId), 12000, { lane: opts.lane == null ? LANE_AUX : opts.lane, force: !!opts.force });
     var contest = ncaaContestOf(overview.data);
     if (!contest) throw new Error('NCAA game response contained no contest');
 
@@ -2906,7 +3127,7 @@
     if (contest.hasPbp) requests.push({ key: 'pbp', url: ncaaPlayByPlayUrl(gameId) });
     if (contest.hasTeamStats) requests.push({ key: 'teamStats', url: ncaaTeamStatsUrl(gameId) });
     var extras = await Promise.all(requests.map(function (request) {
-      return espnFetch(request.url, 12000).then(function (r) {
+      return espnFetch(request.url, 12000, { lane: opts.lane == null ? LANE_AUX : opts.lane, force: !!opts.force }).then(function (r) {
         return { key: request.key, result: r };
       }).catch(function () {
         return { key: request.key, result: null };
@@ -2924,7 +3145,8 @@
   // chunks than the summary document — so this still retrieves old games when
   // a transport that choked on the multi-hundred-KB summary is the only one a
   // browser allows. Pagination follows the envelope's pageCount (bounded).
-  async function fetchCorePlays(eventId) {
+  async function fetchCorePlays(eventId, opts) {
+    opts = opts || {};
     var url = espnCorePlaysUrl(eventId);
     if (!url) return null;
     var rawItems = [];
@@ -2934,7 +3156,7 @@
     var page = 1;
     var pages = 1;
     while (page <= pages) {
-      var r = await espnFetch(url + '&page=' + page);
+      var r = await espnFetch(url + '&page=' + page, undefined, { lane: opts.lane == null ? LANE_AUX : opts.lane });
       var items = r.data && Array.isArray(r.data.items) ? r.data.items : [];
       if (page === 1 && !items.length) return null;
       rawItems = rawItems.concat(items);
@@ -2960,7 +3182,7 @@
     if (!day && /^\d{8}$/.test(state.date)) day = state.date;
     if (!day) return null;
     try {
-      var dayResult = await espnFetch(ncaaScoreboardUrl(day));
+      var dayResult = await espnFetch(ncaaScoreboardUrl(day), undefined, { lane: LANE_AUX });
       if (!scoreboardPayloadIsUsable(dayResult.data)) return null;
       var contest = findNCAAContestForGame(ncaaContestsOf(dayResult.data), g);
       if (!contest) return null;
@@ -3001,7 +3223,7 @@
     render();
     try {
       if (state.game && state.game.source === 'ncaa') {
-        var ncaa = await loadNCAAData(requestedId);
+        var ncaa = await loadNCAAData(requestedId, { lane: LANE_USER, force: true });
         if (!gameLoadIsCurrent(run, requestedId)) return;
         state.detail = ncaa.detail;
         state.viaProxy = ncaa.overview.viaProxy;
@@ -3014,7 +3236,7 @@
         }
       } else {
         try {
-          var r = await espnFetch(summaryUrl(requestedId));
+          var r = await espnFetch(summaryUrl(requestedId), undefined, { lane: LANE_USER, force: true });
           if (!gameLoadIsCurrent(run, requestedId)) return;
           var parsedSummary = parseSummary(r.data);
           if (!parsedSummary.teams.length) throw new Error('ESPN summary contained no teams');
@@ -3028,7 +3250,7 @@
           // API plays index for the same event id before ever showing an
           // empty play-by-play tab for a game that has one.
           if (!state.detail.plays.length) {
-            var core = await fetchCorePlays(requestedId).catch(function () { return null; });
+            var core = await fetchCorePlays(requestedId, { lane: LANE_AUX }).catch(function () { return null; });
             if (!gameLoadIsCurrent(run, requestedId)) return;
             if (core) {
               state.detail.plays = core.plays;
@@ -3107,7 +3329,7 @@
       if (state.detail) state.detail.plays.forEach(function (p) { state.seenPlayIds[p.id] = true; });
       // Cache this game's booth events so the Flags & Reviews / Red Zone tabs
       // render immediately and the day feed can reuse them.
-      if (state.detail && state.game) rebuilGameBoothFromDetail();
+      if (state.detail && state.game) rebuildGameBoothFromDetail();
       state.lastUpdated = new Date();
     } catch (e) {
       if (!gameLoadIsCurrent(run, requestedId)) return;
@@ -3139,7 +3361,7 @@
       if (!iso) return;
       var et = etDateFromWallclock(iso);
       if (!et) return;
-      var r = await espnFetch(scoreboardUrl(et)); // full day; one-shot
+      var r = await espnFetch(scoreboardUrl(et), undefined, { lane: LANE_AUX }); // full day; one-shot
       if (!gameLoadIsCurrent(run, requestedId)) return;
       var league = (r.data && r.data.leagues && r.data.leagues[0]) || {};
       // Events live at the TOP level of the scoreboard payload (verified in
@@ -3196,7 +3418,7 @@
     var requestedId = state.gameId;
     var run = gameRun;
     if (!requestedId || state.view !== 'game') return;
-    espnFetch(ncaaGameUrl(requestedId), 12000).then(function (r) {
+    espnFetch(ncaaGameUrl(requestedId), 12000, { lane: LANE_AUX }).then(function (r) {
       if (!gameLoadIsCurrent(run, requestedId)) return;
       var oldState = state.game && state.game.status.state;
       if (!updateGameFromNCAA(r.data)) return;
@@ -3223,7 +3445,7 @@
       pollNCAAData();
       return;
     }
-    espnFetch(summaryUrl(requestedId)).then(function (r) {
+    espnFetch(summaryUrl(requestedId), undefined, { lane: LANE_AUX }).then(function (r) {
       if (!gameLoadIsCurrent(run, requestedId)) return;
       var prevIds = state.seenPlayIds;
       var hadDetail = !!state.detail;
@@ -3244,7 +3466,7 @@
       syncScoresFromPlays();
       // Rebuild this game's booth events so a live "under review" → "overturned"
       // transition updates the Flags & Reviews / Red Zone tabs and the day feed.
-      if (state.game) rebuilGameBoothFromDetail();
+      if (state.game) rebuildGameBoothFromDetail();
       state.lastUpdated = new Date();
       if (hadDetail && newPlayIds.length && state.tab === 'pbp' && state.follow) {
         requestAnimationFrame(function () {
@@ -3269,8 +3491,8 @@
       return CONFERENCES.some(function (c) { return c.id === id; });
     });
     var urls = ids.length
-      ? ids.map(function (gid) { return espnFetch(scoreboardUrl(requestedDate, gid)).then(function (r) { return r.data; }).catch(function () { return null; }); })
-      : [espnFetch(scoreboardUrl(requestedDate)).then(function (r) { return r.data; }).catch(function () { return null; })];
+      ? ids.map(function (gid) { return espnFetch(scoreboardUrl(requestedDate, gid), undefined, { lane: LANE_AUX }).then(function (r) { return r.data; }).catch(function () { return null; }); })
+      : [espnFetch(scoreboardUrl(requestedDate), undefined, { lane: LANE_AUX }).then(function (r) { return r.data; }).catch(function () { return null; })];
     Promise.all(urls).then(function (datas) {
       if (!gameLoadIsCurrent(run, requestedId)) return;
       var events = [];
@@ -3330,9 +3552,9 @@
    * constants, adapted below). Completed/final days do not need a hot loop.
    * ================================================================ */
 
-  var BOOTH_SCORE_INTERVAL_MS = 250;   // NFL live scores poll
-  var BOOTH_PBP_INTERVAL_MS = 1000;    // NFL live play-by-play poll
-  var BOOTH_DAY_POLL_MS = 5000;        // non-live day feed refresh
+  // Polling cadences live with the engine constants above:
+  // LIVE_SCORES_INTERVAL_MS (header feed), LIVE_REVIEWS_INTERVAL_MS (per-game
+  // PBP floor) and the BOOTH_PASS_*/BOOTH_BUSY_DAY_GAME_MS load policy.
 
   // Build a teamMap for red-zone resolution from a parsed scoreboard event
   // (g.away/g.home carry id, abbreviation, displayName, color, logo).
@@ -3378,23 +3600,23 @@
     var id = String(game.id);
     // 1) ESPN summary plays.
     try {
-      var r = await espnFetch(summaryUrl(id), 10000);
+      var r = await espnFetch(summaryUrl(id), 10000, { lane: LANE_BOOTH });
       var d = parseSummary(r.data);
       if (d.plays.length) return { plays: d.plays, detail: d, source: 'espn' };
     } catch (e) { /* try the next source */ }
     // 2) Core API plays (small, paginated; the historical backfill path).
     try {
-      var core = await fetchCorePlays(id);
+      var core = await fetchCorePlays(id, { lane: LANE_BOOTH });
       if (core && core.plays.length) return { plays: core.plays, source: 'espn-core' };
     } catch (e) { /* try the NCAA fallback */ }
     // 3) NCAA fallback for NCAA-source games that refuse the ESPN endpoints.
     if (game.source === 'ncaa') {
       try {
-        var overview = await espnFetch(ncaaGameUrl(id), 10000);
+        var overview = await espnFetch(ncaaGameUrl(id), 10000, { lane: LANE_BOOTH });
         var contest = ncaaContestOf(overview.data);
         var plays = [];
         if (contest && contest.hasPbp) {
-          var pbp = await espnFetch(ncaaPlayByPlayUrl(id), 10000);
+          var pbp = await espnFetch(ncaaPlayByPlayUrl(id), 10000, { lane: LANE_BOOTH });
           plays = parseNCAAPlays(pbp.data);
         }
         if (plays.length) return { plays: plays, source: 'ncaa' };
@@ -3410,7 +3632,13 @@
     if (!game) return [];
     var id = String(game.id);
     var tm = teamMapOverride || boothTeamMapFromGame(game);
-    var events = boothEvents(plays || [], null, tm);
+    // The scoreboard header feed carries each live game's last play (same
+    // play shape the summary publishes — see README verification). Merging it
+    // here gives the day feed a sub-second view of a fresh "under review"/flag
+    // row while the per-game summary refresh runs on its paced schedule.
+    var live = state.booth.lastLivePlays && state.booth.lastLivePlays[id];
+    var livePlay = live ? normalizePlay(live) : null;
+    var events = boothEvents(plays || [], livePlay, tm);
     state.booth.teamMaps[id] = tm;
     state.booth.eventsByGame[id] = events;
     state.booth.gamesByKey[id] = {
@@ -3435,54 +3663,98 @@
     return rememberGameBooth(state.game, plays, tm);
   }
 
-  // Build the day-wide feed from every cached game. Returns the reconciled feed.
-  async function buildDayBooth(forceRefresh) {
-    var currentGames = state.games || [];
-    var refreshed = [];
-    if (!state.booth.nullifiedByGame) state.booth.nullifiedByGame = {};
-    for (var i = 0; i < currentGames.length; i++) {
-      var game = currentGames[i];
-      var id = String(game.id);
-      var cached = state.booth.eventsByGame[id];
-      var live = !!(game.status && game.status.state === 'in');
-      // Refresh live games on each cycle; final/pre games only when not cached
-      // (or when explicitly forced). This keeps the day feed correct on a hot
-      // flag without hammering every finished game.
-      if (forceRefresh || !cached || live) {
-        var fetched = await fetchPlaysForGame(game);
-        var events = rememberGameBooth(game, fetched.plays);
-        var lastNullified = null;
-        for (var j = events.length - 1; j >= 0; j -= 1) {
-          if (boothEventNullifies(events[j])) {
-            lastNullified = events[j];
-            break;
+  // Build the day-wide feed. mode 'seed' = every scannable game of the day
+  // (a newly selected date; still batched), 'poll' = whatever the refresh plan
+  // says is due (live games past their per-game interval, live->final
+  // transitions, never-cached games). Exactly one pass runs at a time: the old
+  // code let a new 1 s tick stack on top of a still-running 39-game pass, which
+  // is how the booth starved the scoreboard it sits above.
+  var boothRun = 0; // navigation token; incremented to cancel in-flight passes
+  async function buildDayBooth(mode) {
+    if (state.booth.passInFlight) return state.booth.feed;
+    var run = boothRun;
+    state.booth.passInFlight = true;
+    try {
+      var currentGames = state.games || [];
+      var byId = {};
+      var liveScannable = 0;
+      currentGames.forEach(function (g) {
+        if (g && g.id != null) byId[String(g.id)] = g;
+        if (g && g.status && g.status.state === 'in' && g.playByPlayAvailable !== false) liveScannable += 1;
+      });
+      if (!state.booth.nullifiedByGame) state.booth.nullifiedByGame = {};
+      var perPass = mode === 'seed' ? BOOTH_SEED_PASS_MAX : BOOTH_PASS_MAX_REFRESH;
+      var plan;
+      if (mode === 'seed') {
+        plan = boothRefreshPlan(currentGames, state.booth.lastFetch, Date.now(), {
+          forceAll: true, perPass: perPass
+        });
+      } else {
+        var minInterval = Math.max(LIVE_REVIEWS_INTERVAL_MS, liveScannable * BOOTH_BUSY_DAY_GAME_MS);
+        state.booth.pbpIntervalMs = minInterval;
+        plan = boothRefreshPlan(currentGames, state.booth.lastFetch, Date.now(), {
+          minIntervalMs: minInterval, perPass: perPass
+        });
+      }
+      state.booth.lastPass = { mode: mode || 'poll', at: Date.now(), requested: plan.length, fetched: 0 };
+      var queue = plan.slice();
+      async function worker() {
+        while (queue.length) {
+          if (run !== boothRun || state.view !== 'scoreboard') return; // stale pass
+          var id = queue.shift();
+          var game = byId[id];
+          if (!game) continue;
+          try {
+            var fetched = await fetchPlaysForGame(game);
+            if (run !== boothRun || state.view !== 'scoreboard') return; // invalidated mid-fetch
+            var events = rememberGameBooth(game, fetched.plays);
+            var lastNullified = null;
+            for (var j = events.length - 1; j >= 0; j -= 1) {
+              if (boothEventNullifies(events[j])) {
+                lastNullified = events[j];
+                break;
+              }
+            }
+            state.booth.nullifiedByGame[id] = lastNullified ? {
+              removesPoints: !!lastNullified.removesPoints,
+              points: lastNullified.pointsRemoved || 0
+            } : null;
+            state.booth.lastFetch[id] = { t: Date.now(), wasLive: !!(game.status && game.status.state === 'in') };
+            state.booth.lastPass.fetched += 1;
+            state.booth.lastError = null;
+          } catch (fetchError) {
+            state.booth.lastError = String((fetchError && fetchError.message) || fetchError);
+            // A failed fetch must not hot-loop: back off that game by one
+            // interval so the next pass can retry it without a stampede.
+            state.booth.lastFetch[id] = { t: Date.now(), wasLive: !!(game.status && game.status.state === 'in') };
           }
         }
-        state.booth.nullifiedByGame[id] = lastNullified ? {
-          removesPoints: !!lastNullified.removesPoints,
-          points: lastNullified.pointsRemoved || 0
-        } : null;
-        refreshed.push(id);
       }
+      // A small worker pool keeps per-pass latency bounded; the provider gate
+      // caps real transport concurrency across everything (booth lane = 4).
+      await Promise.all([worker(), worker(), worker(), worker()]);
+      if (run !== boothRun || state.view !== 'scoreboard') return state.booth.feed;
+      // Assemble the feed from the cached events.
+      var perGame = Object.keys(state.booth.eventsByGame).map(function (gameId) {
+        var key = state.booth.gamesByKey[gameId] || {};
+        return {
+          id: gameId,
+          shortName: key.shortName || '',
+          awayAbbr: key.awayAbbr || '',
+          homeAbbr: key.homeAbbr || '',
+          date: key.date || null,
+          live: !!key.live,
+          events: state.booth.eventsByGame[gameId] || []
+        };
+      }).filter(function (g) { return g.events.length; });
+      var fresh = dayBoothFeed(perGame);
+      state.booth.feed = reconcileDayBoothFeed(state.booth.feed, fresh);
+      state.booth.count = perGame.length;
+      announceNewBoothEvents(fresh);
+      return state.booth.feed;
+    } finally {
+      state.booth.passInFlight = false;
     }
-    // Assemble the feed from the cached events.
-    var perGame = Object.keys(state.booth.eventsByGame).map(function (gameId) {
-      var key = state.booth.gamesByKey[gameId] || {};
-      return {
-        id: gameId,
-        shortName: key.shortName || '',
-        awayAbbr: key.awayAbbr || '',
-        homeAbbr: key.homeAbbr || '',
-        date: key.date || null,
-        live: !!key.live,
-        events: state.booth.eventsByGame[gameId] || []
-      };
-    }).filter(function (g) { return g.events.length; });
-    var fresh = dayBoothFeed(perGame);
-    state.booth.feed = reconcileDayBoothFeed(state.booth.feed, fresh);
-    state.booth.count = perGame.length;
-    announceNewBoothEvents(fresh);
-    return state.booth.feed;
   }
 
   function dayBoothScannable(g) {
@@ -3741,9 +4013,20 @@
     var scannable = state.games.filter(dayBoothScannable).length;
     var scanned = Object.keys(state.booth.eventsByGame).length;
 
+    // Cadence copy states what the wiring actually does: the header feed ticks
+    // every 0.25 s (serialised, so its real rate is one fetch at a time), and
+    // each game's play-by-play re-fetches at max(1 s, liveGames * 0.25 s) —
+    // 1 s on a light slate, gently paced on a 30-game Saturday so the
+    // scoreboard's own requests never queue behind a 39-summary stampede.
+    var liveScannable = state.games.filter(function (g) {
+      return g.status && g.status.state === 'in' && g.playByPlayAvailable !== false;
+    }).length;
+    var pbpSecs = Math.max(LIVE_REVIEWS_INTERVAL_MS, liveScannable * BOOTH_BUSY_DAY_GAME_MS) / 1000;
+    var pbpLabel = pbpSecs % 1 ? pbpSecs.toFixed(1).replace(/\.0$/, '') + 's' : pbpSecs + 's';
+
     var foot = 'Every flag & review from all of today’s games · pulled from ESPN play-by-play · ' +
       'tracks score before → during → after when a nullified score comes off the board · ' +
-      'nullified & red zone cover TD, FG, PAT & 2-pt only · score/status 0.25s · play-by-play 1s' +
+      'nullified & red zone cover TD, FG, PAT & 2-pt only · score/status 0.25s · play-by-play ' + pbpLabel + '/game' +
       (scannable ? ' · games scanned ' + scanned + ' of ' + scannable : '') +
       (liveCount ? ' · ' + liveCount + ' game' + (liveCount === 1 ? '' : 's') + ' live' : '');
 
@@ -3919,7 +4202,7 @@
     liveHeaderInFlight = true;
     try {
       var url = LIVE_HEADER_URL + '&_=' + Date.now();
-      var r = await espnFetch(url, 4000);
+      var r = await espnFetch(url, 4000, { lane: LANE_AUX });
       var evs = liveHeaderEvents(r.data);
       var byId = {};
       evs.forEach(function (e) { if (e && e.id != null) byId[String(e.id)] = e; });
@@ -3969,14 +4252,23 @@
     }
   }
 
-  // Drive the day booth polling. Runs on the scoreboard view; the cadence
-  // depends on whether any game is live (fast 1s) or all are final/pre (5s).
+  // Drive the day booth polling. Runs on the scoreboard view. The TICK is a
+  // constant 1 s; what actually gets re-fetched is decided by boothRefreshPlan
+  // (per-game floor, finals rest, per-pass cap), and an empty plan costs
+  // nothing. Passes never overlap (passInFlight), and the whole loop pauses
+  // for a hidden tab.
   function dayBoothPoll() {
     if (state.view !== 'scoreboard' || !state.games.length) return;
-    if (state.booth.paused) return;
-    var hasLive = state.games.some(function (g) { return g.status.state === 'in'; });
-    buildDayBooth(hasLive).then(function () {
-      if (state.view === 'scoreboard') {
+    if (state.booth.paused || state.booth.passInFlight) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
+    var before = (state.booth.feed || []).length;
+    buildDayBooth('poll').then(function () {
+      if (state.view !== 'scoreboard') return;
+      // Re-render only when the pass changed something (or a live day is on:
+      // the "live game" labels ride the same pass).
+      var changed = (state.booth.feed || []).length !== before
+        || (state.booth.lastPass && state.booth.lastPass.fetched > 0);
+      if (changed) {
         renderDayBooth();
         renderDiag();
       }
@@ -3985,12 +4277,13 @@
   var boothPollTimer = null;
   function startDayBoothPolling() {
     if (boothPollTimer) clearInterval(boothPollTimer);
-    var hasLive = state.games.some(function (g) { return g.status && g.status.state === 'in'; });
-    var interval = hasLive ? LIVE_REVIEWS_INTERVAL_MS : BOOTH_DAY_POLL_MS;
-    boothPollTimer = setInterval(dayBoothPoll, interval);
+    // Tick = the per-game PBP floor. Cheap when nothing is due; the plan caps
+    // each pass, so this can never fan out wider than the pass policy allows.
+    boothPollTimer = setInterval(dayBoothPoll, LIVE_REVIEWS_INTERVAL_MS);
   }
   function stopDayBoothPolling() {
     if (boothPollTimer) { clearInterval(boothPollTimer); boothPollTimer = null; }
+    boothRun++; // any in-flight pass sees the stale token and stops fetching
   }
 
   /* ---------------- Game view rendering ---------------- */
@@ -4350,7 +4643,12 @@
         games: state.booth.count,
         filter: state.booth.filter,
         paused: state.booth.paused,
-        perGame: Object.keys(state.booth.eventsByGame).length
+        perGame: Object.keys(state.booth.eventsByGame).length,
+        pass: state.booth.lastPass,
+        passInFlight: !!state.booth.passInFlight,
+        pbpIntervalMs: state.booth.pbpIntervalMs,
+        lastError: state.booth.lastError,
+        gate: providerGate.stats()
       }
     };
     if (state.detail) {
@@ -4529,7 +4827,8 @@
       } else {
         render(true);
         if (state.games.length) {
-          buildDayBooth(false).then(function () { if (state.view === 'scoreboard') renderDayBooth(); }).catch(function () {});
+          startScoreboardPollers();
+          buildDayBooth('poll').then(function () { if (state.view === 'scoreboard') renderDayBooth(); }).catch(function () {});
           startDayBoothPolling();
         }
       }
@@ -4547,7 +4846,9 @@
       if (document.visibilityState !== 'hidden') {
         if (state.view === 'scoreboard') {
           refreshLiveScores();
-          buildDayBooth(true).then(function () { if (state.view === 'scoreboard') renderDayBooth(); }).catch(function () {});
+          // A due-only pass — returning focus must not re-seed every game of
+          // the day on top of the scoreboard reload below.
+          buildDayBooth('poll').then(function () { if (state.view === 'scoreboard') renderDayBooth(); }).catch(function () {});
           loadScoreboard(false);
         } else if (state.view === 'game') {
           refreshLiveScores();
@@ -4655,10 +4956,21 @@
     boothKindCounts: boothKindCounts,
     boothEventShown: boothEventShown,
     boothScoreTrailHTML: boothScoreTrailHTML,
+    lastPlayBooth: lastPlayBooth,
+    boothRefreshPlan: boothRefreshPlan,
+    createProviderGate: createProviderGate,
+    isRateLimitError: isRateLimitError,
+    providerGate: providerGate,
     scorePair: scorePair,
     LIVE_HEADER_URL: LIVE_HEADER_URL,
     LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
     LIVE_REVIEWS_INTERVAL_MS: LIVE_REVIEWS_INTERVAL_MS,
-    SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS
+    SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS,
+    SCOREBOARD_IDLE_INTERVAL_MS: SCOREBOARD_IDLE_INTERVAL_MS,
+    BOOTH_PASS_MAX_REFRESH: BOOTH_PASS_MAX_REFRESH,
+    BOOTH_SEED_PASS_MAX: BOOTH_SEED_PASS_MAX,
+    BOOTH_BUSY_DAY_GAME_MS: BOOTH_BUSY_DAY_GAME_MS,
+    PROVIDER_MAX_CONCURRENT: PROVIDER_MAX_CONCURRENT,
+    BOOTH_MAX_ACTIVE: BOOTH_MAX_ACTIVE
   };
 });

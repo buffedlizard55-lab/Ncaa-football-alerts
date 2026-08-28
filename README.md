@@ -25,6 +25,7 @@ lookup:
 ```bash
 npm start          # or: node server.js
 npm test           # offline tests; no API key or network is required
+node test/perf-harness.js app.js --minutes=10   # offline load/rate-limit simulator (see item 19)
 ```
 
 The server requires Node 18 or newer, has no runtime dependencies, and binds to
@@ -200,7 +201,7 @@ already normalizes — see `boothClassify`, `boothEvents`, `dayBoothFeed`):
 | Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (TD, FG, PAT, 2-pt conversion, safety) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`). Ordinary plays are never flagged as nullified. |
 | Red zone | Opponent's 20 or closer, from the verified `start.yardsToEndzone` with a `downDistanceText`/goal-to-go fallback. An unknown distance is `null` — never guessed. |
 | All-games day feed | One merged, chat-ordered list (kickoff order), first occurrence wins; a play later re-issued (e.g. `under review` → `overturned`) replaces its row in place. |
-| Polling | Score/status every **250 ms**, play-by-play every **1000 ms** while a game is live, and a 5 s day-feed refresh otherwise (constants `BOOTH_SCORE_INTERVAL_MS`, `BOOTH_PBP_INTERVAL_MS`, `BOOTH_DAY_POLL_MS`). |
+| Polling | Score/status refresh from the ESPN scoreboard-header feed every **250 ms** while the tab is visible and a live game exists (`LIVE_SCORES_INTERVAL_MS`, one request in flight at a time; the header is a single small feed for the whole slate, so rows update at scoreboard speed without 39 per-game polls). Play-by-play scanning is scheduled per game by `boothRefreshPlan` with a **1000 ms** minimum interval per game (`LIVE_REVIEWS_INTERVAL_MS`), widened so a full live day never exceeds about 2.5 summary fetches per second (`BOOTH_BUSY_DAY_GAME_MS`, max 2 concurrent, max 8 per pass / 12 on the seeding pass). The full scoreboard reload runs every 15 s while any game is live and every 60 s otherwise (`SCOREBOARD_INTERVAL_MS` / `SCOREBOARD_IDLE_INTERVAL_MS`). A final is fetched exactly one more time after the clock stops, and games whose scoreboard entry says `playByPlayAvailable: false` are never polled. |
 
 **NCAA wording.** The college-football feed shares ESPN's play-by-play writer
 with the NFL, but the referee announcements differ, so the booth never applies
@@ -275,7 +276,15 @@ range returns no matching day or is unusable, it retries one request per
 enabled conference when possible, then scans the exact NCAA date query from
 the near edge of the window and stops at the first matching day. A valid empty
 range is kept as a non-network-error result, but is still checked against NCAA
-so a provider disagreement cannot hide an upcoming or prior slate. The
+so a provider disagreement cannot hide an upcoming or prior slate. For the
+selected day itself, an empty-but-valid ESPN slate is only accepted as "no
+games" when that request genuinely succeeded (it is still cross-checked
+against NCAA, which can revive the slate). When the day request *fails* with a
+transport or rate-limit error, a valid-but-empty NCAA response is held only as
+a safety net while per-conference ESPN recovery runs first, so a throttled
+provider can never paint a real game day as empty; if every path failed and
+NCAA alone reports no contests, the day renders empty with the transport error
+kept visible. The
 current season calendar is also used for an offseason jump window when ESPN
 supplies one; if it is unavailable, bounded season-boundary windows are probed
 through the exact NCAA date source instead. Results are grouped by Eastern day
@@ -299,9 +308,24 @@ not an open proxy: it permits only the retained provider hosts and paths:
   `ncaa-api.henrygd.me`
 
 Other hosts, protocols, methods, URL paths, and file traversal attempts are
-rejected. If the relay cannot reach a provider, the client tries the verified
+rejected.
+
+The relay adds two provider-load controls for exactly this scoreboard's poll
+pattern (documented in `server.js`): a one-second micro-cache (tunable via
+`RELAY_CACHE_TTL_MS`, `0` disables it) that only stores successful JSON
+responses of at most 64 entries / 8 MB, and per-URL request coalescing —
+concurrent identical requests share one upstream fetch, so 39 header rows
+refreshing through one relay cost one ESPN call per second at most. Responses
+carry `X-Relay-Cache: hit|shared|miss`, and a joined request receives the
+shared outcome verbatim including non-200 statuses, so rate-limit information
+never gets hidden by caching. If the relay cannot reach a provider, the client tries the verified
 provider-host alternative, direct access, the browser-safe Reader transport,
-and finally the older public proxy chain. The Reader target is not added to the
+and finally the older public proxy chain — with one exception that matters
+under load: when any attempt fails with an upstream 429, the remaining
+transports are skipped for the rest of that request, because replaying a
+throttled request through a third-party proxy multiplies the exact load ESPN
+just refused and burns the keyless Reader's ~20-requests-per-minute budget
+for no chance of success. The Reader target is not added to the
 relay allowlist because it is a client-side transport fallback; the server
 relay itself remains restricted to the actual ESPN/NCAA hosts. Diagnostics
 identify the source, provider, relay/proxy status, counts, and last update.
@@ -345,12 +369,16 @@ Current verification performed on **2026-08-27**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-9. `npm test` passes **94 offline checks**, including syntax, URL construction,
+9. `npm test` passes **108 offline checks**, including syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final
-   view models, the historical-backfill fixtures below, the live booth engine,
-   and the running server's health/static/security routes.
+   view models, the historical-backfill fixtures below, the live booth engine
+   (including the row-level `lastPlayBooth` helper, the `boothRefreshPlan`
+   scheduling policy, provider-gate lane priority, rate-limit fail-fast, and a
+   definedness scan of every scoreboard/booth wiring function), and the running
+   server's health/static/security routes including relay shared-flight
+   coalescing.
 
 Additional verification on **2026-08-28** (the reported 2025-season case):
 
@@ -387,6 +415,61 @@ Additional verification on **2026-08-28** (the reported 2025-season case):
     `competitors[].score/homeAway/winner` — the feed the booth's 250 ms
     score/status poll reads (same shape as the NFL header feed).
 
+Scoreboard-load verification on **2026-08-28** (the "extremely slow / no games
+on this date" report; all claims re-verified live before and after the change):
+
+16. The live scoreboard for `20260829` (`site.api.espn.com/.../scoreboard?dates=20260829`)
+    returned the full 39-game Week-1 slate again, and its
+    `competitions[].playByPlayAvailable: false` on pre-game events was confirmed
+    as a real provider field — the booth plan now uses it to skip games that
+    cannot have play-by-play yet.
+17. The scoreboard-breaking defect was located line by line: `gameRowHtml`
+    called an undefined `lastPlayBooth` helper for every row; the thrown
+    `ReferenceError` aborted the render between fetch and paint, so every
+    game day ended as "No games on this date" while the fetch itself had
+    succeeded. A `rebuil`→`rebuild` typo (two sites) had likewise silently
+    disabled per-game booth rebuild from the detail route. Both are fixed and
+    regression-tested.
+18. The slowness root cause was provider self-inflicted congestion: the booth
+    re-fetched the full ~380 KB summary of every live game at a fixed
+    1000 ms, sharing the browser's six-socket pool and ESPN's tolerance with
+    the scoreboard; under a 39-game slate the day loads queued behind (and
+    competed with) hundreds of booth requests, tripping 429s and cascading
+    into Reader/proxy fallbacks. The fix paces the booth behind a priority
+    gate (lanes: user, aux, booth with hard caps), adapts the scan interval to
+    the number of live games, serializes the 250 ms header ticker, micro-caches
+    and single-flights the same-origin relay, and makes 429s fail fast instead
+    of replaying through third-party transports. The booth still scans every
+    game of the day — the harness confirms "39 of 39" and identical feed
+    content before vs. after (156 events across the simulated slate).
+19. An offline load simulator, `test/perf-harness.js` (virtual clock, 6-socket
+    per-host browser pools, token-bucket rate limiting in front of simulated
+    ESPN hosts sized from the verified live payloads, ~20 rpm Reader budget),
+    reproduces and measures the failure and the fix. Over a simulated 10
+    minutes of a 39-game live day: HEAD paints **nothing** (4× `ReferenceError`);
+    the `lastPlayBooth`-only repair paints in 151 ms but drives **6,010**
+    upstream requests with real 429 storms on every host (292 on
+    `site.api`, 455 on the Core-API fallback) and 178 Reader-budget hits; the
+    complete fix runs **3,211** requests with **zero 429s**, no
+    proxy/Reader/Core fallback use, queue depth ≤ 1 everywhere, 151 ms first
+    paint, ~277 ms day-switch, and the full booth feed with 0 uncaught errors.
+    Run it with `node test/perf-harness.js app.js --minutes=10
+    --json-out=metrics.json`.
+20. Two harness corrections were needed during this work (microtask drain
+    between virtual timers; recurring timers keeping their identity across
+    re-registration so `clearInterval` reaches them). The initial 2026-08-28
+    harness passes had reported the `lastPlayBooth`-only build as showing an
+    empty board; that was a harness scheduling artifact inflating the request
+    flood, and after fixing the scheduler the honest reproduction is item 19 —
+    recorded here because the earlier numbers circulated during review.
+21. The suite grew to **108** checks: `lastPlayBooth` behavior,
+    `boothRefreshPlan` (live pacing floor, final-exactly-once,
+    `playByPlayAvailable: false` skip, per-pass caps, seed pass ordering),
+    provider-gate lane priority/cap/FIFO against a blocked pool, `isRateLimitError`,
+    a stub-`fetch` test proving a 429 stops the transport chain before Reader
+    or proxies are touched, a definedness scan over every scoreboard/booth
+    wiring function, and relay single-flight coalescing.
+
 The booth verification list above (item 15) is the score/status source: ESPN
 NCAA header events mirror the NFL scoreboard header the NFL booth polls at
 250 ms, so the same frame is used on the college side.
@@ -419,14 +502,12 @@ transport.
 ## Files
 
 ```text
-server.js                         static server, health check, allowlisted relay
-index.html                        scoreboard shell and diagnostics footer
-styles.css                        responsive dark scoreboard/detail UI
-app.js                            provider clients, parsers, UI, routing, polling
+server.js                         static server, health check, allowlisted relay (1 s shared micro-cache, per-URL single-flight)
 index.html                        scoreboard shell, #day-booth booth section, diagnostics footer
 styles.css                        responsive dark scoreboard/detail UI, booth styling
 app.js                            provider clients, parsers, live booth engine + wiring, UI, routing, polling
-test/run.js                       zero-dependency offline test runner (incl. live booth)
+test/run.js                       zero-dependency offline test runner (108 checks, incl. live booth + load-policy units)
+test/perf-harness.js              offline load simulator: virtual clock, per-host socket pools, provider rate-limit emulation
 test/fixtures/scoreboard-event.json       verified ESPN final-game fixture
 test/fixtures/summary.json                verified ESPN summary/PBP/stats fixture
 test/fixtures/ncaa-scoreboard.json        verified NCAA contest-shape fixture
