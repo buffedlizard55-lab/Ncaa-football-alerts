@@ -181,6 +181,61 @@ feed: play texts repeat the quarter clock as a `"(MM:SS)"` prefix (now
 stripped like ESPN rows), and an NCAA PAT is rendered `"… kick attempt good"`
 — it must be tagged `PAT`, not mistaken for a field goal.
 
+## Live booth — flags & reviews
+
+The scoreboard carries a **Live booth · flags & reviews** feed, ported from the
+NFL scoreboard's booth. It is a chat-style list of every penalty, coach's
+challenge, replay review and play-under-review from **all of the selected
+day's games**, plus a **Flags & Reviews** tab and a **Red Zone** tab inside each
+game. There is no manual input: the app discovers flags/reviews itself from the
+same play-by-play it already fetches.
+
+How it is driven (pure reshapes of the verified ESPN/NCAA play objects the app
+already normalizes — see `boothClassify`, `boothEvents`, `dayBoothFeed`):
+
+| Concern | Behavior |
+|---|---|
+| What counts as a booth event | A play whose text/type is a penalty, a coach's challenge, a replay review, or an under-review play. A flag that is published only as the trailing phrase `PENALTY <team> <foul> (<player>) <yards> yards from <spot> to <spot>` on the preceding row (`isPenalty:false`) is still caught (verified in the summary fixture). |
+| Score before → during → after | Rebuilt from the running `awayScore`/`homeScore` ESPN publishes on each play, scanning forward for a rolled-back score only when the event could actually rule on it (a scoring/nullification play, a review/challenge/replay, or a penalty right after a score). A routine kickoff/punt foul cannot remove a prior score. |
+| Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (TD, FG, PAT, 2-pt conversion, safety) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`). Ordinary plays are never flagged as nullified. |
+| Red zone | Opponent's 20 or closer, from the verified `start.yardsToEndzone` with a `downDistanceText`/goal-to-go fallback. An unknown distance is `null` — never guessed. |
+| All-games day feed | One merged, chat-ordered list (kickoff order), first occurrence wins; a play later re-issued (e.g. `under review` → `overturned`) replaces its row in place. |
+| Polling | Score/status every **250 ms**, play-by-play every **1000 ms** while a game is live, and a 5 s day-feed refresh otherwise (constants `BOOTH_SCORE_INTERVAL_MS`, `BOOTH_PBP_INTERVAL_MS`, `BOOTH_DAY_POLL_MS`). |
+
+**NCAA wording.** The college-football feed shares ESPN's play-by-play writer
+with the NFL, but the referee announcements differ, so the booth never applies
+NFL wording blindly:
+
+- An accepted foul that wipes a down is announced as **"No Play"** and NCAA
+  Rule 10 states the **"play is nullified"** (vs. the NFL's "nullified" too, but
+  the app accepts the NCAA-specific `No Play` / `void the score` / `erased`
+  forms so college games are matched from evidence, not assumed).
+- NCAA replay results are announced only as **"upheld"** or **"overturned"**
+  starting with the **2025** season (the old `confirmed` / `stands` language
+  was retired). The booth matches both the new NCAA language and the older
+  ESPN/NFL wording so 2025 and pre-2025 games are both handled.
+
+Verified wording evidence (used to build the classifiers, reviewed line by
+line):
+
+- NCAA Football Rules (Rule 10 penalty enforcement; "Play is nullified",
+  "void the score", fouls during/after a TD, FG or Try) —
+  `https://rulebook.github.io/en/interpretations/rules/10/`,
+  `http://fs.ncaa.org/Docs/stats/Stats_Manuals/Football/2020.pdf`,
+  `https://www.sdcfoa.org/ncaa/rule-10-penalty-enforcement/college-10-2-5`,
+  `https://www.sdcfoa.org/ncaa/rule-8-scoring`.
+- 2025 NCAA instant-replay announcements ("upheld"/"overturned" only) —
+  Wikipedia "Replay review in gridiron football" (`https://en.wikipedia.org/wiki/Replay_review_in_gridiron_football`)
+  and the NCAA All Divisions Instant Replay Coaches Manual; ESPN's replay
+  coverage (`https://www.espn.com/college-football/story/_/id/9796302/replay-leaves-some-uncertainty-field`)
+  uses the same "upheld"/"reversed" language.
+- The penny-flag shape (`isPenalty:false` + trailing `PENALTY <team> …`) was
+  confirmed verbatim in the verified `summary.json` fixture.
+
+The booth is added in three files: `index.html` declares the `#day-booth`
+section, `styles.css` styles the booth, and `app.js` carries the pure engine +
+browser wiring. The offline suite covers it (`test/run.js`, "live booth").
+
 ### Options investigated but not used as primary providers
 
 These were called directly rather than accepted from search-result marketing
@@ -290,12 +345,12 @@ Current verification performed on **2026-08-27**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-9. `npm test` passes **83 offline checks**, including syntax, URL construction,
+9. `npm test` passes **94 offline checks**, including syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final
-   view models, the historical-backfill fixtures below, and the running
-   server's health/static/security routes.
+   view models, the historical-backfill fixtures below, the live booth engine,
+   and the running server's health/static/security routes.
 
 Additional verification on **2026-08-28** (the reported 2025-season case):
 
@@ -319,6 +374,22 @@ Additional verification on **2026-08-28** (the reported 2025-season case):
     2026-08-28 each returned a valid empty slate with the 2026 season
     calendar attached (no games before the Aug 29 opener weekend —
     confirmed, not an error state).
+14. The live NCAA Core API play-by-play for event 401769074 (see item 11)
+    confirmed the field-position fields the booth reads: each play carries
+    `start`/`end` with `yardsToEndzone`, `downDistanceText`, `possessionText`,
+    and `teamParticipants` with an offense/defense `id`. `scoreValue` is also
+    present, so a score's point value is read from the data rather than
+    inferred.
+15. The live NCAA scoreboard header
+    (`site.web.api.espn.com/apis/v2/scoreboard/header?sport=football&league=college-football`)
+    returned `sports[].leagues[].events[]` with `id`, `competitionId`, `status`
+    (pre/live/final), `fullStatus.clock/displayClock/period/detail`, and
+    `competitors[].score/homeAway/winner` — the feed the booth's 250 ms
+    score/status poll reads (same shape as the NFL header feed).
+
+The booth verification list above (item 15) is the score/status source: ESPN
+NCAA header events mirror the NFL scoreboard header the NFL booth polls at
+250 ms, so the same frame is used on the college side.
 
 A real Chromium browser was also executed against the running local app using
 an extracted Chromium binary and its bundled NSS/NSPR libraries. The actual
@@ -352,7 +423,10 @@ server.js                         static server, health check, allowlisted relay
 index.html                        scoreboard shell and diagnostics footer
 styles.css                        responsive dark scoreboard/detail UI
 app.js                            provider clients, parsers, UI, routing, polling
-test/run.js                       zero-dependency offline test runner
+index.html                        scoreboard shell, #day-booth booth section, diagnostics footer
+styles.css                        responsive dark scoreboard/detail UI, booth styling
+app.js                            provider clients, parsers, live booth engine + wiring, UI, routing, polling
+test/run.js                       zero-dependency offline test runner (incl. live booth)
 test/fixtures/scoreboard-event.json       verified ESPN final-game fixture
 test/fixtures/summary.json                verified ESPN summary/PBP/stats fixture
 test/fixtures/ncaa-scoreboard.json        verified NCAA contest-shape fixture
