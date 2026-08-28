@@ -70,6 +70,9 @@ function waitForPort(url, ms) {
   const sum = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'summary.json'), 'utf8'));
   const ncaaScoreboard = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ncaa-scoreboard.json'), 'utf8'));
   const ncaaGame = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ncaa-game.json'), 'utf8'));
+  const ncaaScoreboard20260109 = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'ncaa-scoreboard-20260109.json'), 'utf8'));
+  const espnCorePlays = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'espn-core-plays.json'), 'utf8'));
+  const summary401769074 = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'summary-401769074.json'), 'utf8'));
 
   console.log('--- URL builders ---');
   test('scoreboardUrl single date', () => {
@@ -620,6 +623,152 @@ function waitForPort(url, ms) {
     assert.ok(detail.headerDate === null || typeof detail.headerDate === 'string');
   });
 
+  console.log('--- historical PBP backfill (verified live 2026-08-28) ---');
+  test('summaryDrivesOf accepts the verified {previous: [...]} postseason envelope', () => {
+    // Event 401769074 (Oregon @ Indiana, CFP semifinal 2026-01-09) returns
+    // drives wrapped in {"previous": [...]}, unlike the fixture's plain array.
+    // Reading only the array form hid every play of that game (the original
+    // "no pbp data" report).
+    const wrapped = JSON.parse(JSON.stringify(sum));
+    wrapped.drives = { previous: wrapped.drives };
+    assert.strictEqual(NB.summaryDrivesOf(wrapped).length, 2);
+    const d2 = NB.parseSummary(wrapped);
+    assert.strictEqual(d2.drives.length, 2);
+    assert.deepStrictEqual(d2.plays.map((p) => p.seq), [77, 78, 84, 85]);
+  });
+  test('summaryDrivesOf appends drives.current for the live-game envelope form', () => {
+    const live = JSON.parse(JSON.stringify(sum));
+    live.drives = { previous: [live.drives[0]], current: live.drives[1] };
+    const d2 = NB.parseSummary(live);
+    assert.strictEqual(d2.drives.length, 2);
+    assert.strictEqual(d2.drives[1].id, sum.drives[1].id);
+    assert.strictEqual(d2.plays.length, 4);
+  });
+  test('provider-re-issued plays (same period+sequence, new id) render once', () => {
+    // Verified live in event 401769074: one interception touchdown appears
+    // twice in the same drive at sequence "2" with two different play ids.
+    const dup = JSON.parse(JSON.stringify(sum));
+    const reissued = JSON.parse(JSON.stringify(dup.drives[0].plays[1]));
+    reissued.id = String(dup.drives[0].plays[1].id) + '-reissue';
+    dup.drives[0].plays.push(reissued);
+    const d2 = NB.parseSummary(dup);
+    assert.strictEqual(d2.plays.filter((p) => p.seq === 78).length, 1);
+    assert.deepStrictEqual(d2.plays.map((p) => p.seq), [77, 78, 84, 85]);
+  });
+  test('espnCorePlaysUrl builds the verified Core API collection URL and pins numeric ids', () => {
+    assert.strictEqual(
+      NB.espnCorePlaysUrl('401769074'),
+      'https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/401769074/competitions/401769074/plays?limit=400'
+    );
+    assert.strictEqual(NB.espnCorePlaysUrl('401769074;drop'), null);
+    assert.strictEqual(NB.espnCorePlaysUrl(''), null);
+  });
+  test('extractCorePlays normalizes verified Core API items through the summary play pipeline', () => {
+    const plays = NB.extractCorePlays(espnCorePlays);
+    assert.strictEqual(plays.length, 2);
+    assert.strictEqual(plays[0].type, 'Coin Toss');
+    assert.strictEqual(plays[0].seq, 0);
+    assert.strictEqual(plays[1].type, 'Kickoff');
+    assert.strictEqual(plays[1].clock, '14:57');            // displayValue wins over the text prefix
+    assert.ok(plays[1].text.indexOf('(15:00)') === -1);     // duplicated clock prefix stripped
+    assert.ok(plays[1].text.indexOf('kickoff 60 yards') !== -1);
+    assert.strictEqual(plays[1].offTeamId, '2483');         // teamParticipants offense id
+    assert.strictEqual(plays[1].defTeamId, '84');
+    assert.strictEqual(plays[1].possessionTeamId, '2483');  // falls back to the offense id ($ref-only start/end teams)
+    assert.strictEqual(plays[1].downDistance, '1st & 10 at ORE 20');
+    assert.strictEqual(plays[1].yardage, 15);
+    assert.strictEqual(plays[1].awayScore, 0);
+    assert.strictEqual(plays[1].time > 0, true);            // wallclock parsed
+    assert.deepStrictEqual(NB.extractCorePlays({}), []);
+  });
+  test('cross-provider matchup resolves ESPN Oregon @ Indiana to NCAA contest 6531853 (verified feed)', () => {
+    const contests = NB.ncaaContestsOf(ncaaScoreboard20260109);
+    assert.strictEqual(contests.length, 1);
+    // Shape of the parsed ESPN row for the same game (away/home names as
+    // produced by parseCompetitor from the verified 20260109 scoreboard).
+    const espnGame = {
+      away: { name: 'Oregon', displayName: 'Oregon Ducks' },
+      home: { name: 'Indiana', displayName: 'Indiana Hoosiers' }
+    };
+    const contest = NB.findNCAAContestForGame(contests, espnGame);
+    assert.ok(contest);
+    assert.strictEqual(String(contest.contestId), '6531853');
+    // The NCAA contest then feeds the normal NCAA detail loaders:
+    const event = NB.eventsOf(ncaaScoreboard20260109)[0];
+    assert.strictEqual(NB.parseEvent(event).home.score, 56);
+    assert.strictEqual(NB.parseEvent(event).status.state, 'post');
+    assert.strictEqual(NB.parseEvent(event).source, 'ncaa');
+  });
+  test('cross-provider matchup never attaches a different game', () => {
+    const contests = NB.ncaaContestsOf(ncaaScoreboard20260109);
+    const noGame = NB.findNCAAContestForGame(contests, {
+      away: { name: 'Georgia Tech', displayName: 'Georgia Tech Yellow Jackets' },
+      home: { name: 'Georgia', displayName: 'Georgia Bulldogs' }
+    });
+    assert.strictEqual(noGame, null);
+    // One team alone must not match: both sides are required.
+    const half = NB.findNCAAContestForGame(contests, {
+      away: { name: 'Oregon', displayName: 'Oregon Ducks' },
+      home: { name: 'Oregon State', displayName: 'Oregon State Beavers' }
+    });
+    assert.strictEqual(half, null);
+    // "Oregon State" must not collapse into "Oregon" through normalization.
+    assert.strictEqual(NB.findNCAAContestForGame(contests, {
+      away: { name: 'Indiana', displayName: 'Indiana Hoosiers' },
+      home: { name: 'Oregon', displayName: 'Oregon Ducks' }
+    }), null); // swapped home/away is not the same matchup orientation
+  });
+  test('regression: the reported game 401769074 yields its PBP from the verified {previous} response', () => {
+    const d = NB.parseSummary(summary401769074);
+    assert.strictEqual(d.teams.length, 2);
+    assert.strictEqual(d.teams[0].abbreviation, 'ORE');   // away-first
+    assert.strictEqual(d.teams[1].abbreviation, 'IU');
+    assert.strictEqual(d.drives.length, 2);
+    assert.strictEqual(d.drives[0].resultRaw, 'INT TD');
+    // The provider's re-issued interception touchdown (same period+sequence,
+    // two ids) collapses to one row:
+    assert.deepStrictEqual(d.plays.map((p) => p.seq), [1, 2, 4, 6]);
+    const td = d.plays.find((p) => p.seq === 2);
+    assert.strictEqual(td.scoringPlay, true);
+    assert.strictEqual(td.scoringType, 'TD');
+    assert.strictEqual(td.pointAfter, 'Extra Point Good');
+    assert.strictEqual(td.isTurnover, true);
+    assert.strictEqual(td.homeScore, 7);
+    assert.strictEqual(td.defTeamId, '84');
+    const rush = d.plays.find((p) => p.seq === 6);
+    assert.strictEqual(rush.clock, '14:06');              // displayValue wins over the "(14:13)" prefix
+    assert.ok(rush.text.indexOf('(14:13)') === -1);
+    assert.ok(rush.text.indexOf('Shotgun #22 J.Harris') === 0);
+    assert.strictEqual(rush.downDistance, '1st & 10 at ORE 36');
+    assert.strictEqual(rush.offTeamId, '2483');
+    assert.strictEqual(rush.yardage, 7);
+    // Last play score keeps the header score honest for this deep-linked game.
+    const s = NB.lastPlayScore(d);
+    assert.strictEqual(s.away, 0);
+    assert.strictEqual(s.home, 6);
+  });
+  test('NCAA PBP backfill strips duplicated clock prefixes and tags PAT/FG correctly', () => {
+    // Play texts copied verbatim from the live /game/6531853/play-by-play feed
+    // (2026-08-28); the FG rows mirror the observed NCAA wording.
+    const pbp = { contestId: 6531853, periods: [{ periodNumber: 1, playbyplayStats: [
+      { teamId: 759, plays: [{ playText: '(06:35) Shotgun F.Mendoza pass complete short left to E.Sarratt caught at Ind31, for 5 yards to the Ind31 (I.Obidegwu)', driveText: '2 and  at Ind26', homeScore: null, visitorScore: null, clock: '06:35' }] },
+      { teamId: 759, plays: [{ playText: 'Q.Warren kick attempt good (H: M.McCarthy, LS: M.Langston)', driveText: '- and true at -3', homeScore: 7, visitorScore: 0, clock: '00:00' }] },
+      { teamId: 759, plays: [{ playText: 'Q.Warren field goal attempt from 43 GOOD', driveText: '4 and true at Ore26', homeScore: 10, visitorScore: 0, clock: '01:00' }] },
+      { teamId: 759, plays: [{ playText: 'Q.Warren field goal attempt from 52 NO GOOD', driveText: '4 and true at Ore35', homeScore: 10, visitorScore: 0, clock: '00:30' }] }
+    ] }] };
+    const plays = NB.parseNCAADetail(ncaaGame, null, pbp, null).plays;
+    assert.strictEqual(plays.length, 4);
+    assert.strictEqual(plays[0].clock, '06:35');
+    assert.ok(plays[0].text.indexOf('(06:35)') === -1);
+    assert.ok(plays[0].text.indexOf('Shotgun F.Mendoza') === 0);
+    assert.strictEqual(plays[1].scoringType, 'PAT');   // was mistagged 'FG' by "kick.*good"
+    assert.strictEqual(plays[1].scoringPlay, true);
+    assert.strictEqual(plays[2].scoringType, 'FG');
+    assert.strictEqual(plays[2].scoringPlay, true);
+    assert.strictEqual(plays[3].scoringPlay, false);   // "NO GOOD" is not a score
+    assert.strictEqual(plays[3].scoringType, null);
+  });
+
   console.log('--- server ---');
   const port = 8137;
   const base = 'http://127.0.0.1:' + port;
@@ -668,6 +817,23 @@ function waitForPort(url, ms) {
       const alternatePort = encodeURIComponent('https://site.api.espn.com:444/apis/site/v2/sports/football/college-football/scoreboard?dates=20260829');
       assert.strictEqual((await fetch(base + '/api/espn?url=' + credentialed)).status, 400);
       assert.strictEqual((await fetch(base + '/api/espn?url=' + alternatePort)).status, 400);
+    });
+    await atest('relay allowlists the verified ESPN Core API plays path', async () => {
+      // The upstream is unreachable from the offline test runner, so a
+      // successful allowlist match surfaces as a 502 relay error — anything
+      // but the 400 the relay returns for a rejected target.
+      const core = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/401769074/competitions/401769074/plays?limit=400&page=2');
+      const res = await fetch(base + '/api/espn?url=' + core);
+      assert.notStrictEqual(res.status, 400);
+      assert.strictEqual(res.status, 502);
+    });
+    await atest('relay rejects Core API paths outside the plays collection and non-numeric ids', async () => {
+      const item = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/401769074/competitions/401769074/plays/123');
+      const seasons = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/seasons/2025/teams/84');
+      const badId = encodeURIComponent('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/abc/competitions/abc/plays');
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + item)).status, 400);
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + seasons)).status, 400);
+      assert.strictEqual((await fetch(base + '/api/espn?url=' + badId)).status, 400);
     });
     await atest('404 for unknown paths, no file escape via traversal', async () => {
       assert.strictEqual((await fetch(base + '/nope.js')).status, 404);

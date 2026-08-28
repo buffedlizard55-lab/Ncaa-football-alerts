@@ -1,0 +1,163 @@
+{
+  "_fixture_note": "Partial but field-exact summary for game 401769074 (Oregon at Indiana, CFP Peach Bowl semifinal, 2026-01-09) as returned by https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401769074 — fetched live on 2026-08-28. This is the game from the reported 'no pbp data' deep link. Verbatim key points: (1) drives is an OBJECT with a previous[] array, not a plain array; (2) the interception touchdown at sequenceNumber \"2\" is listed TWICE in drive 4017690742 with two different play ids (40176907417 and 401769074763 — a provider re-issue); (3) start/end.team and teamParticipants[].team entries are reduced to their id payloads ($ref stubs dropped for size); (4) drives 1 and 2 are shown with their first 3 and selected plays respectively (drive 4017690744 lists sequences 4 and 6 of its 14 plays); team logos arrays, uid/slug fields on teams, and the boxscore.statistics/header sections are omitted for size. All remaining values are verbatim API output.",
+  "boxscore": {
+    "teams": [
+      {
+        "team": { "id": "2483", "abbreviation": "ORE", "displayName": "Oregon Ducks", "color": "00934b", "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/2483.png" },
+        "statistics": [],
+        "displayOrder": 1,
+        "homeAway": "away"
+      },
+      {
+        "team": { "id": "84", "abbreviation": "IU", "displayName": "Indiana Hoosiers", "color": "970310", "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/84.png" },
+        "statistics": [],
+        "displayOrder": 2,
+        "homeAway": "home"
+      }
+    ],
+    "players": []
+  },
+  "format": { "regulation": { "periods": 4, "displayName": "Quarter", "slug": "quarter", "clock": 900.0 } },
+  "gameInfo": {
+    "venue": { "id": "5348", "fullName": "Mercedes-Benz Stadium", "address": { "city": "Atlanta", "state": "GA", "zipCode": "30313", "country": "USA" }, "grass": false },
+    "attendance": 75604
+  },
+  "drives": {
+    "previous": [
+      {
+        "id": "4017690742",
+        "description": "1 play, 0 yards, 0:08",
+        "team": { "id": "2483", "name": "Ducks", "abbreviation": "ORE", "displayName": "Oregon Ducks", "shortDisplayName": "Oregon" },
+        "start": { "period": { "type": "quarter", "number": 1 }, "clock": { "displayValue": "14:57" }, "yardLine": 80, "text": "ORE 20" },
+        "end": { "period": { "type": "quarter", "number": 1 }, "clock": { "displayValue": "14:57" }, "yardLine": 97, "text": "ORE 3" },
+        "timeElapsed": { "displayValue": "0:08" },
+        "yards": 0,
+        "isScore": true,
+        "offensivePlays": 1,
+        "result": "INT TD",
+        "shortDisplayResult": "INT TD",
+        "displayResult": "Interception Touchdown",
+        "plays": [
+          {
+            "id": "4017690743",
+            "sequenceNumber": "1",
+            "type": { "id": "53", "text": "Kickoff", "abbreviation": "K" },
+            "text": "(15:00) #93 Q.Warren kickoff 60 yards to the Ore05 #11 J.McClellan return 15 yards to the Ore20 (#2 B.Baldwin Jr.). #1 A.Ferrell injured on the play",
+            "awayScore": 0,
+            "homeScore": 0,
+            "period": { "number": 1 },
+            "clock": { "displayValue": "14:57" },
+            "scoringPlay": false,
+            "priority": false,
+            "modified": "2026-01-13T01:22Z",
+            "wallclock": "2026-01-10T00:47:01Z",
+            "teamParticipants": [ { "id": "2483", "order": 1, "type": "offense" }, { "id": "84", "order": 2, "type": "defense" } ],
+            "isPenalty": false,
+            "statYardage": 15,
+            "start": { "down": 1, "distance": 10, "yardLine": 35, "yardsToEndzone": 65, "team": { "id": "84" } },
+            "end": { "down": 1, "distance": 10, "yardLine": 80, "yardsToEndzone": 80, "downDistanceText": "1st & 10 at ORE 20", "shortDownDistanceText": "1st & 10", "possessionText": "ORE 20", "team": { "id": "2483" } },
+            "isTurnover": false
+          },
+          {
+            "id": "40176907417",
+            "sequenceNumber": "2",
+            "type": { "id": "36", "text": "Interception Return Touchdown", "abbreviation": "TD" },
+            "text": "D'Angelo Ponds 25 Yd Interception Return (Nico Radicic Kick)",
+            "awayScore": 0,
+            "homeScore": 7,
+            "period": { "number": 1 },
+            "clock": { "displayValue": "14:49" },
+            "scoringPlay": true,
+            "priority": true,
+            "modified": "2026-01-10T04:53Z",
+            "teamParticipants": [ { "id": "84", "order": 1, "type": "defense" }, { "id": "2483", "order": 2, "type": "offense" } ],
+            "isPenalty": false,
+            "statYardage": 25,
+            "start": { "down": 1, "distance": 10, "yardLine": 80, "yardsToEndzone": 0, "downDistanceText": "1st & 10 at ORE 20", "shortDownDistanceText": "1st & 10", "possessionText": "ORE 20", "team": { "id": "2483" } },
+            "end": { "down": -1, "distance": 0, "yardLine": 0, "yardsToEndzone": 0, "team": { "id": "84" } },
+            "scoringType": { "name": "touchdown", "displayName": "Touchdown", "abbreviation": "TD" },
+            "pointAfterAttempt": { "id": 61, "text": "Extra Point Good", "abbreviation": "Extra Point Good", "value": 1 },
+            "isTurnover": true
+          },
+          {
+            "id": "401769074763",
+            "sequenceNumber": "2",
+            "type": { "id": "36", "text": "Interception Return Touchdown", "abbreviation": "TD" },
+            "text": "D'Angelo Ponds 25 Yd Interception Return (Nico Radicic Kick)",
+            "awayScore": 0,
+            "homeScore": 7,
+            "period": { "number": 1 },
+            "clock": { "displayValue": "14:49" },
+            "scoringPlay": true,
+            "priority": true,
+            "modified": "2026-01-13T01:22Z",
+            "teamParticipants": [ { "id": "84", "order": 1, "type": "defense" }, { "id": "2483", "order": 2, "type": "offense" } ],
+            "isPenalty": false,
+            "statYardage": 25,
+            "start": { "down": 1, "distance": 10, "yardLine": 80, "yardsToEndzone": 0, "downDistanceText": "1st & 10 at ORE 20", "shortDownDistanceText": "1st & 10", "possessionText": "ORE 20", "team": { "id": "2483" } },
+            "end": { "down": -1, "distance": 0, "yardLine": 0, "yardsToEndzone": 0, "team": { "id": "84" } },
+            "scoringType": { "name": "touchdown", "displayName": "Touchdown", "abbreviation": "TD" },
+            "pointAfterAttempt": { "id": 61, "text": "Extra Point Good", "abbreviation": "Extra Point Good", "value": 1 },
+            "isTurnover": true
+          }
+        ]
+      },
+      {
+        "id": "4017690744",
+        "description": "14 plays, 75 yards, 7:38",
+        "team": { "id": "2483", "name": "Ducks", "abbreviation": "ORE", "displayName": "Oregon Ducks", "shortDisplayName": "Oregon" },
+        "start": { "period": { "type": "quarter", "number": 1 }, "clock": { "displayValue": "14:49" }, "yardLine": 75, "text": "ORE 25" },
+        "end": { "period": { "type": "quarter", "number": 1 }, "clock": { "displayValue": "7:11" }, "yardLine": 3, "text": "IU 3" },
+        "timeElapsed": { "displayValue": "7:38" },
+        "yards": 75,
+        "isScore": true,
+        "offensivePlays": 14,
+        "result": "TD",
+        "shortDisplayResult": "TD",
+        "displayResult": "Touchdown",
+        "plays": [
+          {
+            "id": "40176907427",
+            "sequenceNumber": "4",
+            "type": { "id": "53", "text": "Kickoff", "abbreviation": "K" },
+            "text": "(14:49) #93 Q.Warren kickoff 65 yards to the Ore00, Touchback",
+            "awayScore": 0,
+            "homeScore": 6,
+            "period": { "number": 1 },
+            "clock": { "displayValue": "14:49" },
+            "scoringPlay": false,
+            "priority": false,
+            "modified": "2026-01-13T01:22Z",
+            "wallclock": "2026-01-10T00:50:21Z",
+            "teamParticipants": [ { "id": "2483", "order": 1, "type": "offense" }, { "id": "84", "order": 2, "type": "defense" } ],
+            "isPenalty": false,
+            "statYardage": 0,
+            "start": { "down": 1, "distance": 10, "yardLine": 35, "yardsToEndzone": 65, "team": { "id": "84" } },
+            "end": { "down": 1, "distance": 10, "yardLine": 75, "yardsToEndzone": 75, "downDistanceText": "1st & 10 at ORE 25", "shortDownDistanceText": "1st & 10", "possessionText": "ORE 25", "team": { "id": "2483" } },
+            "isTurnover": false
+          },
+          {
+            "id": "40176907434",
+            "sequenceNumber": "6",
+            "type": { "id": "5", "text": "Rush", "abbreviation": "RUSH" },
+            "text": "(14:13) Shotgun #22 J.Harris rush right for 7 yards gain to the Ore36 (#22 J.Sharpe), out of bounds, 1ST DOWN",
+            "awayScore": 0,
+            "homeScore": 6,
+            "period": { "number": 1 },
+            "clock": { "displayValue": "14:06" },
+            "scoringPlay": false,
+            "priority": false,
+            "modified": "2026-01-13T01:22Z",
+            "wallclock": "2026-01-10T00:52:27Z",
+            "teamParticipants": [ { "id": "2483", "order": 1, "type": "offense" }, { "id": "84", "order": 2, "type": "defense" } ],
+            "isPenalty": false,
+            "statYardage": 7,
+            "start": { "down": 2, "distance": 6, "yardLine": 71, "yardsToEndzone": 71, "downDistanceText": "2nd & 6 at ORE 29", "shortDownDistanceText": "2nd & 6", "possessionText": "ORE 29", "team": { "id": "2483" } },
+            "end": { "down": 1, "distance": 10, "yardLine": 64, "yardsToEndzone": 64, "downDistanceText": "1st & 10 at ORE 36", "shortDownDistanceText": "1st & 10", "possessionText": "ORE 36", "team": { "id": "2483" } },
+            "isTurnover": false
+          }
+        ]
+      }
+    ]
+  }
+}

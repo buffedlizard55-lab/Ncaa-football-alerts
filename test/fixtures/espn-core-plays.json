@@ -1,0 +1,56 @@
+{
+  "_fixture_note": "Envelope and play items copied from the live ESPN Core API collection https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/401769074/competitions/401769074/plays (Oregon at Indiana, CFP semifinal, 2026-01-09), fetched 2026-08-28. The live envelope reports count 168 for this event. Two items are kept: the coin toss and the opening kickoff. Athlete-level 'participants'/'statistics' entries and $ref stub objects (team/probability/drive) are omitted for size; every remaining value is verbatim.",
+  "count": 2,
+  "pageIndex": 1,
+  "pageSize": 400,
+  "pageCount": 1,
+  "items": [
+    {
+      "id": "4017690742",
+      "sequenceNumber": "0",
+      "type": { "id": "70", "text": "Coin Toss" },
+      "text": "Indiana wins the toss, and defers. Oregon to receive. Indiana defends.",
+      "awayScore": 0,
+      "homeScore": 0,
+      "period": { "number": 1 },
+      "clock": { "value": 900.0, "displayValue": "15:00" },
+      "scoringPlay": false,
+      "priority": false,
+      "scoreValue": 0,
+      "modified": "2026-01-13T01:22Z",
+      "teamParticipants": [
+        { "id": "84", "order": 1, "type": "offense" },
+        { "id": "2483", "order": 2, "type": "defense" }
+      ],
+      "isPenalty": false,
+      "statYardage": 0,
+      "start": { "down": 0, "distance": 10, "yardLine": 0, "yardsToEndzone": 0 },
+      "end": { "down": 0, "distance": 10, "yardLine": 0, "yardsToEndzone": 0 },
+      "isTurnover": false
+    },
+    {
+      "id": "4017690743",
+      "sequenceNumber": "1",
+      "type": { "id": "53", "text": "Kickoff", "abbreviation": "K" },
+      "text": "(15:00) #93 Q.Warren kickoff 60 yards to the Ore05 #11 J.McClellan return 15 yards to the Ore20 (#2 B.Baldwin Jr.). #1 A.Ferrell injured on the play",
+      "awayScore": 0,
+      "homeScore": 0,
+      "period": { "number": 1 },
+      "clock": { "value": 897.0, "displayValue": "14:57" },
+      "scoringPlay": false,
+      "priority": false,
+      "scoreValue": 0,
+      "modified": "2026-01-13T01:22Z",
+      "wallclock": "2026-01-10T00:47:01Z",
+      "teamParticipants": [
+        { "id": "2483", "order": 1, "type": "offense" },
+        { "id": "84", "order": 2, "type": "defense" }
+      ],
+      "isPenalty": false,
+      "statYardage": 15,
+      "start": { "down": 1, "distance": 10, "yardLine": 35, "yardsToEndzone": 65 },
+      "end": { "down": 1, "distance": 10, "yardLine": 80, "yardsToEndzone": 80, "downDistanceText": "1st & 10 at ORE 20", "shortDownDistanceText": "1st & 10", "possessionText": "ORE 20" },
+      "isTurnover": false
+    }
+  ]
+}

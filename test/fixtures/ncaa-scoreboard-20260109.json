@@ -1,0 +1,68 @@
+{
+  "_fixture_note": "Verbatim sdataprod.ncaa.com persisted-query response for sportCode=MFB, division=11, seasonYear=2025, contestDate=2026-01-09, fetched live on 2026-08-28. It contains the CFP Peach Bowl semifinal (Oregon at Indiana), which is the NCAA-side match of ESPN event 401769074 for the cross-provider historical backfill. Pretty-printed; values verbatim.",
+  "data": {
+    "contests": [
+      {
+        "__typename": "Contest",
+        "championshipId": 6392,
+        "bracketId": 301,
+        "contestId": 6531853,
+        "url": "/game/6531853",
+        "gameState": "F",
+        "statusCodeDisplay": "final",
+        "currentPeriod": "FINAL",
+        "contestClock": "",
+        "finalMessage": "FINAL",
+        "startTimeEpoch": 1768005000,
+        "startTime": "19:30",
+        "startDate": "01/09/2026",
+        "hasStartTime": true,
+        "broadcasterId": 41440,
+        "broadcasterName": "ESPN",
+        "roundNumber": 3,
+        "roundDescription": "CFP Semifinals",
+        "sportUrl": "football",
+        "stage": 3,
+        "tba": false,
+        "isChampionship": true,
+        "championshipGame": {
+          "__typename": "ChampionshipGame",
+          "round": { "__typename": "Round", "roundNumber": 3, "title": "CFP Semifinals", "subtitle": "" }
+        },
+        "teams": [
+          {
+            "__typename": "ContestTeam",
+            "isHome": true,
+            "seoname": "indiana",
+            "nameShort": "Indiana",
+            "name6Char": "IND",
+            "name8Char": "",
+            "name10Char": "",
+            "seed": 1,
+            "teamRank": null,
+            "score": 56,
+            "isWinner": true,
+            "conferenceSeo": "big-ten"
+          },
+          {
+            "__typename": "ContestTeam",
+            "isHome": false,
+            "seoname": "oregon",
+            "nameShort": "Oregon",
+            "name6Char": "OREGN",
+            "name8Char": "",
+            "name10Char": "",
+            "seed": 5,
+            "teamRank": null,
+            "score": 22,
+            "isWinner": false,
+            "conferenceSeo": "big-ten"
+          }
+        ],
+        "liveVideos": [
+          { "__typename": "Stream", "state": "pre", "enabled": false, "stateCode": 1, "doNotSyndicate": false, "syndicateOnly": false }
+        ]
+      }
+    ]
+  }
+}
