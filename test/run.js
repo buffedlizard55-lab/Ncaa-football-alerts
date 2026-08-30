@@ -846,6 +846,83 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.nullifiedScoreText('Kickoff 65 yards Touchback'), false);
   });
 
+  test('boothIsScoringPlay recognizes offensive, defensive, special-teams scores and safety', () => {
+    // Offensive touchdown
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'off', scoringPlay: true, type: { text: 'Rushing Touchdown' }, text: '#22 rush for 1 yard TOUCHDOWN' })), true);
+    // Defensive touchdown (pick-six) — type is the return TD word, no `scoringPlay` flag needed
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'def', type: { text: 'Interception Return Touchdown' }, text: '#12 intercepts, returns 80 yards for a TOUCHDOWN' })), true);
+    // Defensive touchdown via feed scoringType code
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'def2', scoringType: { abbreviation: 'TD' }, text: '#44 fumble recovery return 25 yards' })), true);
+    // Special-teams touchdown (kickoff return)
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'st', type: { text: 'Kickoff Return Touchdown' }, text: '#11 returns kickoff 92 yards for a TOUCHDOWN' })), true);
+    // Special-teams touchdown (punt return)
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'pr', type: { text: 'Punt Return Touchdown' }, text: '#3 returns punt 64 yards TOUCHDOWN' })), true);
+    // Field goal and safety
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'fg', scoringPlay: true, type: { text: 'Field Goal Good' }, text: '32 yard field goal GOOD' })), true);
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'sf', type: { text: 'Safety' }, text: 'sacked in end zone, SAFETY' })), true);
+    // A routine play is not a scoring play (never guessed)
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'r1', text: '#22 rush for 2 yards' })), false);
+    assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'r2', type: { text: 'Penalty' }, text: 'PENALTY Mizzou Holding 7 yards', isPenalty: true })), false);
+  });
+
+  test('boothAnnounceStep re-announces a review that is later nullified, once', () => {
+    const seen = {};
+    // First seen while "under review" (not nullified): silent, remembered as non-nullified.
+    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:1', false), { key: 'g:1', nullified: false });
+    assert.strictEqual(seen['g:1'], false);
+    // Same non-nullified state again: silent, no change.
+    assert.strictEqual(NB.boothAnnounceStep(seen, 'g:1', false), null);
+    // Transition to nullified (OVERTURNED): alerts once.
+    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:1', true), { key: 'g:1', nullified: true });
+    assert.strictEqual(seen['g:1'], true);
+    // Already alerted nullified: never repeats.
+    assert.strictEqual(NB.boothAnnounceStep(seen, 'g:1', true), null);
+    // A brand-new nullified item alerts immediately.
+    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:2', true), { key: 'g:2', nullified: true });
+  });
+
+  test('boothEvents nullifies a safety and a defensive touchdown (score rollback)', () => {
+    // Safety wiped by a penalty after the play (2 pts).
+    const safetyPlays = [
+      boothNorm({ id: 's1', seq: 1, text: 'Run for 1 yard', awayScore: 0, homeScore: 3 }),
+      boothNorm({ id: 's2', seq: 2, text: 'SACKED in end zone for a SAFETY', scoringPlay: true, type: { text: 'Safety' }, awayScore: 0, homeScore: 5 }),
+      boothNorm({ id: 's3', seq: 3, text: 'PENALTY Defensive Holding on Safety - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 3 })
+    ];
+    const sfEffect = NB.boothScoreEffect(safetyPlays, 2);
+    assert.strictEqual(sfEffect.removesPoints, true);
+    assert.strictEqual(sfEffect.pointsRemoved, 2);
+    assert.strictEqual(sfEffect.team, 'home');
+
+    // Defensive interception-return touchdown wiped by an accepted foul (6 pts).
+    const defPlays = [
+      boothNorm({ id: 'd1', seq: 1, text: 'Pass incomplete', awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'd2', seq: 2, text: 'Intercepted, returned 80 yards, TOUCHDOWN', scoringPlay: true, type: { text: 'Interception Return Touchdown' }, awayScore: 7, homeScore: 6 }),
+      boothNorm({ id: 'd3', seq: 3, text: 'PENALTY Offensive Holding, Interception Return Touchdown Nullified - No Play', isPenalty: true, type: { text: 'Penalty' }, awayScore: 7, homeScore: 0 })
+    ];
+    const defEffect = NB.boothScoreEffect(defPlays, 2);
+    assert.strictEqual(defEffect.removesPoints, true);
+    assert.strictEqual(defEffect.pointsRemoved, 6);
+    assert.strictEqual(defEffect.team, 'home');
+    // The nullification wording is recognised for a defensive TD too.
+    assert.strictEqual(NB.nullifiedScoreText('TOUCHDOWN nullified on review'), true);
+  });
+
+  test('boothScoreDropped detects a header total falling (points left the board) only on a real drop', () => {
+    // Away team's total falls: a TD/FG was taken off the board.
+    assert.strictEqual(NB.boothScoreDropped(14, 7, 7, 7), true);
+    // Home team's total falls.
+    assert.strictEqual(NB.boothScoreDropped(14, 7, 14, 3), true);
+    // A normal score increase (or unchanged) is never a drop.
+    assert.strictEqual(NB.boothScoreDropped(7, 7, 14, 7), false);
+    assert.strictEqual(NB.boothScoreDropped(7, 7, 7, 7), false);
+    // Missing side info (null) is "no data", never a drop.
+    assert.strictEqual(NB.boothScoreDropped(null, null, 7, 7), false);
+    assert.strictEqual(NB.boothScoreDropped(14, 7, null, 7), false);
+    // A first sample can't be a drop (baseline only) — the caller seeds the
+    // baseline before comparing, so a null prev is treated as no-drop.
+    assert.strictEqual(NB.boothScoreDropped(null, null, 7, 7), false);
+  });
+
   test('boothScoreEffect tracks before -> during -> after and a score rollback', () => {
     const plays = [
       boothNorm({ id: '1', seq: 1, text: '#22 E.Smith rush for 2 yards', awayScore: 0, homeScore: 0 }),
@@ -1078,7 +1155,7 @@ function waitForPort(url, ms) {
     for (const m of src.matchAll(/function\s*\(([^)]*)\)/g)) m[1].split(',').map(s => s.trim()).filter(Boolean).forEach((p) => defined.add(p));
     const keywords = new Set(['if','for','while','switch','catch','return','typeof','new','await','function','do','else','in','of','case','delete','void','yield','throw']);
     const globals = new Set(['fetch','setTimeout','clearTimeout','setInterval','clearInterval','requestAnimationFrame','encodeURIComponent','decodeURIComponent','Number','String','Boolean','Array','Object','JSON','Math','Date','Promise','Error','Map','Set','isNaN','parseInt','parseFloat','RegExp','Intl','AbortController','URL','console','AudioContext','localStorage','document','window','location','navigator','history','globalThis','this']);
-    for (const fname of ['gameRowHtml', 'renderScoreboard', 'renderDayBooth', 'dayBoothHTML', 'pollGameSummary', 'loadGame', 'dayBoothPoll', 'buildDayBooth', 'loadScoreboard', 'render', 'refreshLiveScores', 'route', 'renderDiag']) {
+    for (const fname of ['gameRowHtml', 'renderScoreboard', 'renderDayBooth', 'dayBoothHTML', 'pollGameSummary', 'loadGame', 'dayBoothPoll', 'buildDayBooth', 'loadScoreboard', 'render', 'refreshLiveScores', 'refreshLiveBoothForGame', 'refreshLiveBoothForScoreDrop', 'applyBoothGame', 'boothGameFromId', 'route', 'renderDiag']) {
       const at = src.indexOf('function ' + fname + '(');
       assert.ok(at >= 0, fname + ' must exist');
       const nextFn = src.indexOf('\n  function ', at);
