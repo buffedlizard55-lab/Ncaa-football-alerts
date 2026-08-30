@@ -198,9 +198,11 @@ already normalizes — see `boothClassify`, `boothEvents`, `dayBoothFeed`):
 |---|---|
 | What counts as a booth event | A play whose text/type is a penalty, a coach's challenge, a replay review, or an under-review play. A flag that is published only as the trailing phrase `PENALTY <team> <foul> (<player>) <yards> yards from <spot> to <spot>` on the preceding row (`isPenalty:false`) is still caught (verified in the summary fixture). |
 | Score before → during → after | Rebuilt from the running `awayScore`/`homeScore` ESPN publishes on each play, scanning forward for a rolled-back score only when the event could actually rule on it (a scoring/nullification play, a review/challenge/replay, or a penalty right after a score). A routine kickoff/punt foul cannot remove a prior score. |
-| Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (TD, FG, PAT, 2-pt conversion, safety) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`). Ordinary plays are never flagged as nullified. |
+| Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (offensive, defensive or special-teams touchdown, field goal, safety, PAT or 2-pt conversion) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`), or the running score actually drops. Ordinary plays are never flagged as nullified. |
 | Red zone | Opponent's 20 or closer, from the verified `start.yardsToEndzone` with a `downDistanceText`/goal-to-go fallback. An unknown distance is `null` — never guessed. |
 | All-games day feed | One merged, chat-ordered list (kickoff order), first occurrence wins; a play later re-issued (e.g. `under review` → `overturned`) replaces its row in place. |
+| Alerts & sound | A short rain chime plays **only when a scoring play is nullified** — never for a routine flag, challenge, or an `under review` row. A review that starts `under review` and is later `OVERTURNED` is announced once, on its final nullified state. `boothAnnounceStep` is the pure decision (unit-tested). |
+| Lowest latency | Score/status rides the 250 ms header feed. Two fast paths fire on that tick, before the paced per-game summary pass: (1) when the live `situation.lastPlay` changes to a flag/review/challenge/replay/nullified verdict, that game's cached booth events are re-merged and re-rendered immediately (no provider request, purely local); and (2) when a live game's header total **drops** (the fastest proof that points came off the board), that one game's play-by-play is fetched immediately — bypassing the paced interval — so the authoritative nullifying row and the before→during→after trail are confirmed as soon as the provider has them. `boothScoreDropped` is the pure, unit-tested decision for the drop; a drop never invents an alert (the chime still requires the play text/rollback to confirm). |
 | Polling | Score/status refresh from the ESPN scoreboard-header feed every **250 ms** while the tab is visible and a live game exists (`LIVE_SCORES_INTERVAL_MS`, one request in flight at a time; the header is a single small feed for the whole slate, so rows update at scoreboard speed without 39 per-game polls). Play-by-play scanning is scheduled per game by `boothRefreshPlan` with a **1000 ms** minimum interval per game (`LIVE_REVIEWS_INTERVAL_MS`), widened so a full live day never exceeds about 2.5 summary fetches per second (`BOOTH_BUSY_DAY_GAME_MS`, max 2 concurrent, max 8 per pass / 12 on the seeding pass). The full scoreboard reload runs every 15 s while any game is live and every 60 s otherwise (`SCOREBOARD_INTERVAL_MS` / `SCOREBOARD_IDLE_INTERVAL_MS`). A final is fetched exactly one more time after the clock stops, and games whose scoreboard entry says `playByPlayAvailable: false` are never polled. |
 
 **NCAA wording.** The college-football feed shares ESPN's play-by-play writer
@@ -369,13 +371,14 @@ Current verification performed on **2026-08-27**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-9. `npm test` passes **108 offline checks**, including syntax, URL construction,
+9. `npm test` passes **112 offline checks**, including syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final
    view models, the historical-backfill fixtures below, the live booth engine
    (including the row-level `lastPlayBooth` helper, the `boothRefreshPlan`
-   scheduling policy, provider-gate lane priority, rate-limit fail-fast, and a
+   scheduling policy, provider-gate lane priority, rate-limit fail-fast, the
+   nullified-scoring-play alert decision in `boothAnnounceStep`, and a
    definedness scan of every scoreboard/booth wiring function), and the running
    server's health/static/security routes including relay shared-flight
    coalescing.
@@ -462,12 +465,16 @@ on this date" report; all claims re-verified live before and after the change):
     empty board; that was a harness scheduling artifact inflating the request
     flood, and after fixing the scheduler the honest reproduction is item 19 —
     recorded here because the earlier numbers circulated during review.
-21. The suite grew to **108** checks: `lastPlayBooth` behavior,
+21. The suite grew to **112** checks: `lastPlayBooth` behavior,
     `boothRefreshPlan` (live pacing floor, final-exactly-once,
     `playByPlayAvailable: false` skip, per-pass caps, seed pass ordering),
     provider-gate lane priority/cap/FIFO against a blocked pool, `isRateLimitError`,
     a stub-`fetch` test proving a 429 stops the transport chain before Reader
-    or proxies are touched, a definedness scan over every scoreboard/booth
+    or proxies are touched, the nullified-only alert decision in
+    `boothAnnounceStep` (an `under review` play re-announces once when
+    OVERTURNED, and only nullified plays ever chime), defensive/special-teams
+    touchdown and safety recognition in `boothIsScoringPlay`, and a definedness
+    scan over every scoreboard/booth
     wiring function, and relay single-flight coalescing.
 22. The relay's **200-response micro-cache was verified end to end** on
     2026-08-28, not just by unit test. This sandbox has no outbound HTTPS, so
@@ -483,6 +490,26 @@ on this date" report; all claims re-verified live before and after the change):
     call, and a request after the TTL expired returned `miss` with exactly one
     new upstream call. `server.js` was not modified for this test and still
     performs normal TLS verification (no `rejectUnauthorized: false`).
+23. **Nullified-scoring-plays alert behavior** was added for the all-games
+    replay feed (2026-08-30). Only scoring plays that come off the board — an
+    offensive/defensive/special-teams touchdown, field goal, safety, PAT or
+    2-pt conversion — set the alert sound; a routine flag, coach's challenge,
+    or an `under review` row never chimes. `boothAnnounceStep` is the pure
+    decision and is unit-tested: a play first seen as `under review`
+    (non-nullified) is remembered, then re-announced **once** when the verdict
+    nullifies it, and never repeats. The **lowest-latency** path re-merges the
+    250 ms header feed's live `situation.lastPlay` into a game's cached booth
+    events and re-renders immediately (no extra provider request), so a
+    nullification verdict can alert on the header cadence rather than waiting
+    for the paced per-game summary pass. A second, even earlier signal was
+    added: when a live game's **header total drops**, `boothScoreDropped` flags
+    it and that one game's play-by-play is fetched immediately (bypassing the
+    paced interval) so the authoritative nullifying row is confirmed as soon as
+    the provider has it — a drop never invents a chime, it only pulls the data
+    forward. The offline suite now covers safety, defensive-touchdown and
+    special-teams-touchdown nullification end to end and the score-drop
+    decision (108→112 checks); the perf harness still reports `39 of 39` games
+    scanned, 156 feed events, and 0 uncaught errors.
 
 The booth verification list above (item 15) is the score/status source: ESPN
 NCAA header events mirror the NFL scoreboard header the NFL booth polls at
@@ -520,7 +547,7 @@ server.js                         static server, health check, allowlisted relay
 index.html                        scoreboard shell, #day-booth booth section, diagnostics footer
 styles.css                        responsive dark scoreboard/detail UI, booth styling
 app.js                            provider clients, parsers, live booth engine + wiring, UI, routing, polling
-test/run.js                       zero-dependency offline test runner (108 checks, incl. live booth + load-policy units)
+test/run.js                       zero-dependency offline test runner (112 checks, incl. live booth + load-policy units)
 test/perf-harness.js              offline load simulator: virtual clock, per-host socket pools, provider rate-limit emulation
 test/fixtures/scoreboard-event.json       verified ESPN final-game fixture
 test/fixtures/summary.json                verified ESPN summary/PBP/stats fixture

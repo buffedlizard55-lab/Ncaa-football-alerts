@@ -1503,8 +1503,8 @@
    * and under-review play from a game (and, at the day level, from every
    * game of the selected day). It tracks the running score before →
    * during → after a score is taken off the board and flags the nullified
-   * scoring plays (TD, FG, PAT and 2-pt conversion only) plus the red-zone
-   * subset of those.
+   * scoring plays (offensive/defensive/special-teams touchdown, field goal,
+   * safety, PAT and 2-pt conversion) plus the red-zone subset of those.
    *
    * Everything here is a pure reshape of the verified ESPN college-football
    * play objects (same text / type.text / isPenalty / penalty / start.* /
@@ -1594,6 +1594,21 @@
 
   function scorePair(away, home) {
     return String(away != null ? away : 0) + '–' + String(home != null ? home : 0);
+  }
+
+  // Pure decision for the lowest-latency "points left the board" trigger: a
+  // live game's total on the 250 ms scoreboard-header feed can only go up (a
+  // score) — so a DECREASE is the fastest signal that a scoring play was
+  // nullified (TD/FG/safety/PAT/2-pt taken off the board). This mirrors what
+  // the play-by-play rollback math in boothScoreEffect derives from the running
+  // awayScore/homeScore, but it is read straight off the header feed, one tick
+  // earlier. `null` means "no information for that side" and never counts as a
+  // drop. Returns true only when a side's total went strictly down.
+  function boothScoreDropped(prevAway, prevHome, nextAway, nextHome) {
+    function dropped(prev, next) {
+      return prev != null && next != null && Number(next) < Number(prev);
+    }
+    return dropped(prevAway, nextAway) || dropped(prevHome, nextHome);
   }
 
   function boothKindCounts(events) {
@@ -1708,9 +1723,11 @@
   //      scoring play,
   //   c) a replay verdict that OVERTURNED / REVERSED a scoring play.
   // NCAA 2025+ announces "upheld"/"overturned"; older games used the same
-  // "nullified"/"No Play" wording. "void the score" / "erased" / "wiped"
-  // appear in the rulebook and in ESPN write-ups, so they are matched too, but
-  // only when the text names a score.
+  // "nullified"/"No Play" wording. "void the score" / "erased" appear in the
+  // rulebook and in ESPN write-ups and are matched too, but only when the text
+  // names a score. The trigger set is deliberately closed (no "wiped" /
+  // "taken off the board", etc.) so a score that is merely described is never
+  // mis-flagged as nullified.
   function nullifiedScoreText(text) {
     var t = String(text || '');
     if (!t || !boothMentionsScore(t)) return false;
@@ -1729,6 +1746,23 @@
     if (event.removesPoints) return true;
     if (event.nullified) return true;
     return nullifiedScoreText(event.text);
+  }
+
+  // Pure, testable decision for the live alert. `seen` tracks the last
+  // announced state for a feed key: absent = never seen, false = seen while
+  // NOT nullified, true = already alerted because it is (or became) nullified.
+  // A play that first appears as "under review" (not nullified) and is later
+  // OVERTURNED is re-announced once — on its final nullified state — so every
+  // nullified scoring play fires the alert exactly once. Returns null when the
+  // item should stay silent, otherwise { key, nullified } (the state to store).
+  function boothAnnounceStep(seen, key, isNullified) {
+    if (!key) return null;
+    var prior = seen ? seen[key] : null;
+    if (prior === true) return null;                    // already alerted for this nullified state
+    if (prior === false && !isNullified) return null;   // seen non-nullified, still non-nullified
+    var next = !!isNullified;
+    if (seen) seen[key] = next;
+    return { key: key, nullified: next };
   }
 
   // Classify the kind of a booth event. Operates on text and type, never on a
@@ -1887,26 +1921,36 @@
     return false;
   }
 
+  // True when a play is a scoring play that a booth event could nullify:
+  // offensive, defensive (interception/fumble-return) and special-teams
+  // (kickoff/punt/return) touchdowns, field goals, safeties and conversions.
+  // Uses the feed's `scoringPlay`/`scoringType` flags AND the type/text wording
+  // so defensive and special-teams scores are recognised from the same
+  // published text — never guessed from a field position. `boothClassify`
+  // returns first so a penalty/review row that merely mentions a score in its
+  // text is not mistaken for the score itself.
   function boothIsScoringPlay(p) {
     if (!p) return false;
     if (p.scoringPlay === true) return true;
     if (boothClassify(p)) return false;
     var text = boothPlayText(p);
     var type = boothPlayType(p).toLowerCase();
-    if (type === 'touchdown' || /\btouchdown\b/i.test(text)) return true;
-    if (type === 'field goal' || /\bfield goal\b/i.test(text)) {
+    var scoringType = String(p.scoringType || '').toLowerCase();
+    if (scoringType === 'td' || scoringType === 'fg' || scoringType === 'sf' || scoringType === 'pat') return true;
+    if (/\btouchdown\b/i.test(text) || /\btouchdown\b/.test(type) || /\btd\b/.test(type) || type === 'touchdown') return true;
+    if (/\bfield goal\b/i.test(text) || /\bfield goal\b/.test(type) || /\bfg\b/.test(type)) {
       if (boothIsNoGood(text)) return false;
       if (/\bgood\b/i.test(text)) return true;
-      if (type === 'field goal') return true;
+      if (/\bfield goal\b/.test(type) || /\bfg\b/.test(type)) return true;
       return false;
     }
-    if (type === 'safety' || /\bsafety\b/i.test(text)) return true;
-    if (/\bextra point\b/i.test(text) || type.indexOf('extra point') !== -1) {
+    if (/\bsafety\b/i.test(text) || /\bsafety\b/.test(type) || /\bsf\b/.test(type)) return true;
+    if (/\bextra point\b/i.test(text) || /\bextra point\b/.test(type) || /PAT/i.test(type)) {
       if (boothIsNoGood(text)) return false;
       if (/\bgood\b/i.test(text)) return true;
       return false;
     }
-    if (/(two-point|2-point|two point)/i.test(text) || /(two-point|2-point|two point)/i.test(type)) {
+    if (/(two-point|2-point|two point|2 point)/i.test(text) || /(two-point|2-point|two point|2 point)/i.test(type)) {
       if (boothIsNoGood(text)) return false;
       if (/\bgood\b/i.test(text) || /\bsuccessful\b/i.test(text)) return true;
       return false;
@@ -2314,11 +2358,13 @@
       BOOTH_FILTERS: BOOTH_FILTERS, DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS, BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
       boothClassify: boothClassify, boothResult: boothResult, boothMentionsScore: boothMentionsScore,
       nullifiedScoreText: nullifiedScoreText, boothEventNullifies: boothEventNullifies,
+      boothAnnounceStep: boothAnnounceStep,
       boothScoreEffect: boothScoreEffect, boothEventContext: boothEventContext, boothEvent: boothEvent,
       boothEvents: boothEvents, dayBoothFeed: dayBoothFeed, reconcileDayBoothFeed: reconcileDayBoothFeed,
       boothYardsToEndzone: boothYardsToEndzone, boothIsRedZonePlay: boothIsRedZonePlay,
       boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay,
       boothKindCounts: boothKindCounts, boothEventShown: boothEventShown, boothScoreTrailHTML: boothScoreTrailHTML,
+      boothScoreDropped: boothScoreDropped,
       lastPlayBooth: lastPlayBooth, boothRefreshPlan: boothRefreshPlan, createProviderGate: createProviderGate,
       isRateLimitError: isRateLimitError,
       scorePair: scorePair, LIVE_HEADER_URL: LIVE_HEADER_URL, LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
@@ -2374,6 +2420,7 @@
       audioContext: null,
       feed: [],              // reconciled day feed (dayBoothFeed shape)
       eventsByGame: {},      // gameId -> booth events for that game
+      playsByGame: {},       // gameId -> normalized plays (raw cache, for sub-second live re-merge)
       nullifiedByGame: {},   // gameId -> newest nullified event info ({removesPoints, points})
       teamMaps: {},          // gameId -> { teamId: {abbr, displayName, logo, color} }
       gamesByKey: {},        // gameId -> { id, shortName, awayAbbr, homeAbbr, date, live }
@@ -2384,7 +2431,8 @@
       pbpIntervalMs: 1000,   // per-game PBP floor in force this day (adaptive)
       count: 0,              // how many games are included in the day feed
       lastError: null,
-      lastLivePlays: {}      // gameId -> live last-play object (for merging)
+      lastLivePlays: {},     // gameId -> live last-play object (for merging)
+      lastHeaderScores: {}   // gameId -> {away,home} last header totals (for score-drop fast trigger)
     }
   };
   CONFERENCES.forEach(function (c) { state.confs[c.id] = true; });
@@ -2588,6 +2636,7 @@
       state.booth.gamesByKey = {};
       state.booth.lastAnnounced = {};
       state.booth.lastLivePlays = {};
+      state.booth.lastHeaderScores = {};
       state.booth.lastFetch = {};
       state.booth.nullifiedByGame = {};
       state.booth.lastPass = null;
@@ -3639,6 +3688,11 @@
     var live = state.booth.lastLivePlays && state.booth.lastLivePlays[id];
     var livePlay = live ? normalizePlay(live) : null;
     var events = boothEvents(plays || [], livePlay, tm);
+    // Cache the raw (non-merged) plays so the 250 ms header feed can re-merge a
+    // fresh live last play without re-fetching the summary (see
+    // refreshLiveBoothForGame). The live play is never stored here — merging it
+    // again on the next refresh would otherwise accumulate rows.
+    state.booth.playsByGame[id] = (plays || []).slice();
     state.booth.teamMaps[id] = tm;
     state.booth.eventsByGame[id] = events;
     state.booth.gamesByKey[id] = {
@@ -3650,6 +3704,95 @@
       live: !!(game.status && game.status.state === 'in')
     };
     return events;
+  }
+
+  // Shared tail of every booth refresh: rebuild a game's events, update the
+  // per-row NULLIFIED badge, reconcile the day feed, announce any nullified
+  // score (the only thing that ever chimes), and repaint. `game` is the parsed
+  // scoreboard event; `plays` is the normalized play list (already including
+  // the live last play when this is the fast path). Idempotent: re-running it
+  // with the same data does not duplicate feed rows (dayBoothFeed + reconcile)
+  // and does not re-alert (boothAnnounceStep dedupes by key).
+  function applyBoothGame(game, plays) {
+    var id = String(game.id);
+    var tm = state.booth.teamMaps[id] || boothTeamMapFromGame(game);
+    var events = rememberGameBooth(game, plays, tm);
+    var lastNullified = null;
+    for (var j = events.length - 1; j >= 0; j -= 1) {
+      if (boothEventNullifies(events[j])) { lastNullified = events[j]; break; }
+    }
+    state.booth.nullifiedByGame[id] = lastNullified ? {
+      removesPoints: !!lastNullified.removesPoints,
+      points: lastNullified.pointsRemoved || 0
+    } : null;
+    var gk = state.booth.gamesByKey[id] || {};
+    var perGame = [{
+      id: id,
+      shortName: gk.shortName || '',
+      awayAbbr: gk.awayAbbr || '',
+      homeAbbr: gk.homeAbbr || '',
+      date: gk.date || null,
+      live: !!(game.status && game.status.state === 'in'),
+      events: events
+    }];
+    var fresh = dayBoothFeed(perGame);
+    state.booth.feed = reconcileDayBoothFeed(state.booth.feed, fresh);
+    state.booth.count = Object.keys(state.booth.eventsByGame).reduce(function (n, gid) {
+      return n + ((state.booth.eventsByGame[gid] || []).length ? 1 : 0);
+    }, 0);
+    announceNewBoothEvents(fresh);
+    // Refresh both the day feed and the per-row REVIEW / NULLIFIED badges
+    // without waiting for a score/status change to repaint the scoreboard.
+    renderDayBooth();
+    renderScoreboard();
+    renderDiag();
+  }
+
+  function boothGameFromId(id) {
+    var game = null;
+    (state.games || []).forEach(function (g) {
+      if (g && String(g.id) === String(id)) game = g;
+    });
+    return game;
+  }
+
+  // Sub-second fast path (lowest-latency alert): re-merge the live header's
+  // last play for ONE game into its cached booth events, re-announce, and
+  // re-render — no per-game summary fetch. The header feed ticks every 250 ms;
+  // wiring this here means a "play is under review" / flag / overturned verdict
+  // reaches the alert sound and the feed on the header cadence instead of
+  // waiting for the paced 1 s per-game PBP pass. It is purely local (no
+  // provider request) and respects the paused flag.
+  function refreshLiveBoothForGame(id) {
+    if (state.view !== 'scoreboard' || state.booth.paused) return;
+    var game = boothGameFromId(id);
+    if (!game) return;
+    applyBoothGame(game, state.booth.playsByGame[id] || []);
+  }
+
+  // Score-drop fast path (lowest-latency confirmation): when the header
+  // total for a live game goes DOWN (a scoring play was nullified), trigger an
+  // immediate per-game play-by-play fetch for that ONE game — bypassing the
+  // paced per-game interval — so the authoritative nullifying row (and the
+  // before->during->after trail) is in the feed as soon as the provider has it.
+  // This closes the latency gap where the header's last-play feed has not yet
+  // surfaced the nullifying row even though the total already dropped. It is
+  // bounded: nullifications are rare, and the fetch runs through the booth lane
+  // cap (BOOTH_MAX_ACTIVE), so it can never starve the scoreboard.
+  async function refreshLiveBoothForScoreDrop(id) {
+    if (state.view !== 'scoreboard' || state.booth.paused) return;
+    var game = boothGameFromId(id);
+    if (!game) return;
+    try {
+      var fetched = await fetchPlaysForGame(game);
+      if (state.view !== 'scoreboard') return;
+      applyBoothGame(game, fetched.plays);
+      state.booth.lastFetch[id] = { t: Date.now(), wasLive: !!(game.status && game.status.state === 'in') };
+      state.booth.lastError = null;
+    } catch (fetchError) {
+      state.booth.lastError = String((fetchError && fetchError.message) || fetchError);
+      state.booth.lastFetch[id] = { t: Date.now(), wasLive: !!(game.status && game.status.state === 'in') };
+    }
   }
 
   // Recompute the cached booth for the currently open game (used whenever its
@@ -3765,9 +3908,11 @@
   }
 
   // Detect newly discovered nullified / red-zone events and play a short
-  // chime (when sound is on). Any play already in state.booth.lastAnnounced is
-  // not re-announced, so a review that upgrades from "under review" to
-  // "overturned" is announced once for its final state.
+  // chime (when sound is on). boothAnnounceStep makes the decision: a play
+  // already announced as nullified stays silent, but a "under review" play that
+  // is later OVERTURNED is re-announced once for its final nullified state, so
+  // every nullified scoring play alerts the user exactly once. Only nullified
+  // scoring plays ever set shouldAlert — routine flags and reviews never chime.
   function boothEventSoundKey(item) {
     if (item && item.key != null) return String(item.key);
     return item ? ((item.gameId || '') + ':' + (item.id || (item.seq || '')) + ':' + (item.kind || '')) : '';
@@ -3872,11 +4017,9 @@
     (fresh || []).forEach(function (item) {
       if (!item) return;
       var key = boothEventSoundKey(item);
-      if (!key || state.booth.lastAnnounced[key]) return;
-      state.booth.lastAnnounced[key] = true;
-      if (boothEventNullifies(item)) {
-        shouldAlert = true;
-      }
+      var step = boothAnnounceStep(state.booth.lastAnnounced, key, boothEventNullifies(item));
+      if (!step) return;
+      if (step.nullified) shouldAlert = true;
     });
     if (shouldAlert && !state.booth.paused && state.booth.soundOn) {
       playBoothAlert();
@@ -4026,7 +4169,7 @@
 
     var foot = 'Every flag & review from all of today’s games · pulled from ESPN play-by-play · ' +
       'tracks score before → during → after when a nullified score comes off the board · ' +
-      'nullified & red zone cover TD, FG, PAT & 2-pt only · score/status 0.25s · play-by-play ' + pbpLabel + '/game' +
+      'nullified & red zone cover any scoring play (touchdown, field goal, safety, PAT & 2-pt) · score/status 0.25s · play-by-play ' + pbpLabel + '/game' +
       (scannable ? ' · games scanned ' + scanned + ' of ' + scannable : '') +
       (liveCount ? ' · ' + liveCount + ' game' + (liveCount === 1 ? '' : 's') + ' live' : '');
 
@@ -4051,9 +4194,9 @@
         (scanned < scannable
           ? 'Scanning today’s games for flags and reviews…'
           : (filter === 'redzone' && counts.all
-            ? 'No nullified scores in the red zone (the opponent’s 20 or inside) today — no touchdown, field goal, PAT or 2-pt conversion has been wiped out from there.'
+            ? 'No nullified scores in the red zone (the opponent’s 20 or inside) today — no touchdown, field goal, safety, PAT or 2-pt conversion has been wiped out from there.'
             : (filter === 'nullified' && counts.all
-              ? 'No nullified scores today — no touchdown, field goal, PAT or 2-pt conversion has been taken off the board.'
+              ? 'No nullified scores today — no touchdown, field goal, safety, PAT or 2-pt conversion has been taken off the board.'
               : 'No flags or reviews on this day yet — kickoff hasn’t happened, or the games were clean.'))) +
         '</div>';
     } else {
@@ -4168,7 +4311,7 @@
     if (!visible.length) {
       body = '<div class="booth-empty">' +
         (isRedZoneTab
-          ? 'No nullified red zone scores yet — no touchdown, field goal, PAT or 2-pt conversion has been wiped out from the opponent’s 20 or inside.'
+          ? 'No nullified red zone scores yet — no touchdown, field goal, safety, PAT or 2-pt conversion has been wiped out from the opponent’s 20 or inside.'
           : 'No flags, challenges, or replay reviews in the play-by-play yet.') +
         '</div>';
     } else {
@@ -4207,18 +4350,40 @@
       var byId = {};
       evs.forEach(function (e) { if (e && e.id != null) byId[String(e.id)] = e; });
       var changed = false;
+      var liveBoothDirty = {};    // gameId -> true when its live last play changed to a booth event
+      var scoreDropDirty = {};    // gameId -> true when the header total dropped (points left the board)
       state.games.forEach(function (g) {
         var source = byId[String(g.id)];
         if (!source) return;
+        var gid = String(g.id);
         var comps = source.competitors || [];
+        var headerAway = null, headerHome = null;
         comps.forEach(function (c) {
           var side = c.homeAway === 'home' ? g.home : (c.homeAway === 'away' ? g.away : null);
+          if (side && c.score != null) {
+            if (c.homeAway === 'home') headerHome = Number(c.score);
+            else headerAway = Number(c.score);
+          }
           if (side && c.score != null && String(side.score) !== String(c.score)) {
             side.score = Number(c.score);
             changed = true;
           }
           if (side && c.winner != null) side.winner = !!c.winner;
         });
+        // Header totals can only go up while a game is live (a score). A
+        // DECREASE — relative to the last header observation, never a first
+        // sample — is the fastest proof that points came off the board. It is
+        // used to pull that game's play-by-play forward, not to invent an alert
+        // (announceNewBoothEvents still requires the play text/rollback).
+        var prevHeader = state.booth.lastHeaderScores[gid];
+        if (prevHeader) {
+          if (boothScoreDropped(prevHeader.away, prevHeader.home, headerAway, headerHome)) {
+            scoreDropDirty[gid] = true;
+          }
+        }
+        if (headerAway != null || headerHome != null) {
+          state.booth.lastHeaderScores[gid] = { away: headerAway, home: headerHome };
+        }
         if (source.fullStatus && source.fullStatus.type) {
           var nextSt = {
             state: source.fullStatus.type.state || 'pre',
@@ -4238,9 +4403,37 @@
         if (source.situation) {
           g.situation = source.situation;
           if (source.situation.lastPlay) {
-            state.booth.lastLivePlays[String(g.id)] = source.situation.lastPlay;
+            var lastPlay = source.situation.lastPlay;
+            var prev = state.booth.lastLivePlays[gid];
+            var prevId = prev && prev.id != null ? String(prev.id) : '';
+            var prevText = prev ? (prev.text || '') : '';
+            var prevAway = prev && prev.awayScore != null ? prev.awayScore : null;
+            var prevHome = prev && prev.homeScore != null ? prev.homeScore : null;
+            var newId = lastPlay.id != null ? String(lastPlay.id) : '';
+            var newText = lastPlay.text || '';
+            var newAway = lastPlay.awayScore != null ? lastPlay.awayScore : null;
+            var newHome = lastPlay.homeScore != null ? lastPlay.homeScore : null;
+            var playChanged = newId !== prevId || newText !== prevText || newAway !== prevAway || newHome !== prevHome;
+            // Always retain the latest live play (a verdict is often published as
+            // an in-place edit with the same id/text but a corrected score).
+            state.booth.lastLivePlays[gid] = lastPlay;
+            // Only re-merge the booth when there is a genuinely new flag /
+            // review / challenge / replay / nullified verdict. A routine play
+            // must not re-render the feed.
+            if (playChanged) {
+              var np = normalizePlay(lastPlay);
+              if (boothEvent(np)) liveBoothDirty[gid] = true;
+            }
           }
         }
+      });
+      // Lowest-latency path: merge the changed live play into that game's booth
+      // events and announce any nullified score before the paced PBP pass runs.
+      Object.keys(liveBoothDirty).forEach(refreshLiveBoothForGame);
+      // A header score drop means points left the board; pull that game's
+      // play-by-play forward for the fastest authoritative confirmation.
+      Object.keys(scoreDropDirty).forEach(function (gid) {
+        refreshLiveBoothForScoreDrop(gid);
       });
       if (changed) {
         if (state.view === 'scoreboard') renderScoreboard();
