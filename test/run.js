@@ -820,6 +820,7 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.boothClassify(boothNorm({ id: 'b', text: 'The Missouri head coach has challenged the ruling of incomplete pass.', })), 'challenge');
     assert.strictEqual(NB.boothClassify(boothNorm({ id: 'c', text: 'The Replay Official reviewed the play, and the ruling on the field was overturned.', })), 'replay');
     assert.strictEqual(NB.boothClassify(boothNorm({ id: 'd', text: 'The play is under further review.' })), 'review');
+    assert.strictEqual(NB.boothClassify(boothNorm({ id: 'n', text: '#22 E.Smith rush for 4 yards, TOUCHDOWN NULLIFIED - No Play.' })), 'replay');
     assert.strictEqual(NB.boothClassify(boothNorm({ id: 'e', text: '#22 E.Smith rush for 2 yards' })), '');
   });
 
@@ -921,6 +922,18 @@ function waitForPort(url, ms) {
     // A first sample can't be a drop (baseline only) — the caller seeds the
     // baseline before comparing, so a null prev is treated as no-drop.
     assert.strictEqual(NB.boothScoreDropped(null, null, 7, 7), false);
+  });
+
+  test('boothScoreRiskReason pulls immediate PBP for score-at-risk header plays only', () => {
+    const score = boothNorm({ id: 'td', seq: 1, scoringPlay: true, type: { text: 'Kickoff Return Touchdown' }, text: '#11 returns kickoff 92 yards for a TOUCHDOWN', awayScore: 6, homeScore: 0 });
+    const routine = boothNorm({ id: 'run', seq: 2, text: '#22 rush for 3 yards', awayScore: 6, homeScore: 0 });
+    const afterScoreFlag = boothNorm({ id: 'flag', seq: 3, text: 'PENALTY Offensive Holding, 10 yards', isPenalty: true, type: { text: 'Penalty' }, awayScore: 6, homeScore: 0 });
+    const scoreReview = boothNorm({ id: 'rev', seq: 4, text: 'The Replay Official reviewed the touchdown ruling, and the ruling was overturned.', type: { text: 'Replay Review' }, awayScore: 0, homeScore: 0 });
+    assert.strictEqual(NB.boothScoreRiskReason(score, null), 'scoring-play');
+    assert.strictEqual(NB.boothScoreRiskReason(afterScoreFlag, score), 'after-score-event');
+    assert.strictEqual(NB.boothScoreRiskReason(scoreReview, routine), 'score-event');
+    assert.strictEqual(NB.boothScoreRiskReason(routine, score), '');
+    assert.ok(NB.boothFastFetchKey(scoreReview, 'score-event').includes('score-event'));
   });
 
   test('boothScoreEffect tracks before -> during -> after and a score rollback', () => {
@@ -1047,6 +1060,22 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.boothEventShown(e3, 'redzone'), true);
   });
 
+  test('all-games live booth shows only nullified scoring plays while tracking tabs keep every category', () => {
+    const items = [
+      { key: 'g:flag', kind: 'penalty', nullified: false, redZone: true, text: 'PENALTY Holding' },
+      { key: 'g:review', kind: 'review', nullified: false, text: 'The play is under further review.' },
+      { key: 'g:null', kind: 'penalty', nullified: true, redZone: false, text: 'Touchdown Nullified - No Play' },
+      { key: 'g:replay', kind: 'replay', nullified: false, text: 'Ruling on the field is upheld.' }
+    ];
+    assert.deepStrictEqual(NB.dayBoothLiveEvents(items).map((e) => e.key), ['g:null']);
+    assert.deepStrictEqual(NB.dayBoothTrackingEvents(items, 'all').map((e) => e.key), ['g:flag', 'g:review', 'g:null', 'g:replay']);
+    assert.deepStrictEqual(NB.dayBoothTrackingEvents(items, 'flag').map((e) => e.key), ['g:flag', 'g:null']);
+    assert.deepStrictEqual(NB.dayBoothTrackingEvents(items, 'review').map((e) => e.key), ['g:review']);
+    assert.deepStrictEqual(NB.dayBoothTrackingEvents(items, 'replay').map((e) => e.key), ['g:replay']);
+    assert.deepStrictEqual(NB.dayBoothTrackingEvents(items, 'redzone').map((e) => e.key), ['g:flag']);
+    assert.deepStrictEqual(NB.dayBoothTrackingEvents(items, 'nullified').map((e) => e.key), ['g:null']);
+  });
+
   test('boothScoreTrailHTML formats before -> during -> after and pending review badges', () => {
     const normalNullified = {
       nullified: true,
@@ -1123,9 +1152,17 @@ function waitForPort(url, ms) {
     assert.strictEqual(twoPtEffect.team, 'away');
   });
 
+  test('sound never plays as a toggle/test tone; only nullified-score alerts can call it', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
+    assert.ok(!/if\s*\(state\.booth\.soundOn\)\s*playBoothAlert\s*\(\s*\)/.test(src), 'enabling sound must not play a test notification');
+    assert.match(src, /if\s*\(shouldAlert\s*&&\s*!state\.booth\.paused\s*&&\s*state\.booth\.soundOn\)\s*\{\s*playBoothAlert\s*\(\s*\)/s,
+      'the remaining sound path must be gated by a nullified-score alert decision');
+  });
+
   test('polling cadence constants match requirements (0.25s live score, 1s pbp/booth, 15s full scoreboard)', () => {
     assert.strictEqual(NB.LIVE_SCORES_INTERVAL_MS, 250);
     assert.strictEqual(NB.LIVE_REVIEWS_INTERVAL_MS, 1000);
+    assert.ok(NB.LIVE_SCORE_RISK_REFETCH_MS <= 500);
     assert.strictEqual(NB.SCOREBOARD_INTERVAL_MS, 15000);
   });
 

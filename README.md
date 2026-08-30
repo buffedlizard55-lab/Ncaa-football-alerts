@@ -19,6 +19,9 @@ lookup:
   final recaps when available.
 - Live scoreboards refresh automatically. Live game views refresh the
   provider's current status and play-by-play without showing video.
+- The all-games Live Booth alert surface shows **only nullified scoring plays**;
+  flags, challenges, replay, under-review, red-zone and nullified audit rows are
+  still tracked in separate tabs.
 
 ## Run
 
@@ -182,14 +185,17 @@ feed: play texts repeat the quarter clock as a `"(MM:SS)"` prefix (now
 stripped like ESPN rows), and an NCAA PAT is rendered `"… kick attempt good"`
 — it must be tagged `PAT`, not mistaken for a field goal.
 
-## Live booth — flags & reviews
+## Live booth — nullified scoring plays
 
-The scoreboard carries a **Live booth · flags & reviews** feed, ported from the
-NFL scoreboard's booth. It is a chat-style list of every penalty, coach's
-challenge, replay review and play-under-review from **all of the selected
-day's games**, plus a **Flags & Reviews** tab and a **Red Zone** tab inside each
-game. There is no manual input: the app discovers flags/reviews itself from the
-same play-by-play it already fetches.
+The scoreboard carries a **Live booth · nullified scoring plays** alert feed,
+with separate tracking tabs for flags, coach's challenges, replay reviews,
+under-review rows, red-zone rows and nullified rows from **all of the selected
+day's games**. The live alert section is intentionally narrow: only plays that
+nullify a score (offensive, defensive or special-teams touchdown, field goal,
+safety, PAT or 2-point conversion) appear there. Routine flags/reviews remain
+available for audit in their own tabs and inside the per-game **Flags & Reviews**
+and **Red Zone** views. There is no manual input: the app discovers everything
+from the same play-by-play it already fetches.
 
 How it is driven (pure reshapes of the verified ESPN/NCAA play objects the app
 already normalizes — see `boothClassify`, `boothEvents`, `dayBoothFeed`):
@@ -200,23 +206,32 @@ already normalizes — see `boothClassify`, `boothEvents`, `dayBoothFeed`):
 | Score before → during → after | Rebuilt from the running `awayScore`/`homeScore` ESPN publishes on each play, scanning forward for a rolled-back score only when the event could actually rule on it (a scoring/nullification play, a review/challenge/replay, or a penalty right after a score). A routine kickoff/punt foul cannot remove a prior score. |
 | Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (offensive, defensive or special-teams touchdown, field goal, safety, PAT or 2-pt conversion) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`), or the running score actually drops. Ordinary plays are never flagged as nullified. |
 | Red zone | Opponent's 20 or closer, from the verified `start.yardsToEndzone` with a `downDistanceText`/goal-to-go fallback. An unknown distance is `null` — never guessed. |
-| All-games day feed | One merged, chat-ordered list (kickoff order), first occurrence wins; a play later re-issued (e.g. `under review` → `overturned`) replaces its row in place. |
+| All-games live feed | The top live section filters the merged feed through `dayBoothLiveEvents`, so **only confirmed nullified scoring plays** are rendered there. Routine flags/reviews never appear in that live alert surface. |
+| Separate tracking tabs | The same merged event cache is still exposed through `dayBoothTrackingEvents` tabs for Flags, Challenges, Replay, Under review, Red zone and Nullified. A play later re-issued (e.g. `under review` → `overturned`) replaces its row in place. |
 | Alerts & sound | A short rain chime plays **only when a scoring play is nullified** — never for a routine flag, challenge, or an `under review` row. A review that starts `under review` and is later `OVERTURNED` is announced once, on its final nullified state. `boothAnnounceStep` is the pure decision (unit-tested). |
-| Lowest latency | Score/status rides the 250 ms header feed. Two fast paths fire on that tick, before the paced per-game summary pass: (1) when the live `situation.lastPlay` changes to a flag/review/challenge/replay/nullified verdict, that game's cached booth events are re-merged and re-rendered immediately (no provider request, purely local); and (2) when a live game's header total **drops** (the fastest proof that points came off the board), that one game's play-by-play is fetched immediately — bypassing the paced interval — so the authoritative nullifying row and the before→during→after trail are confirmed as soon as the provider has them. `boothScoreDropped` is the pure, unit-tested decision for the drop; a drop never invents an alert (the chime still requires the play text/rollback to confirm). |
-| Polling | Score/status refresh from the ESPN scoreboard-header feed every **250 ms** while the tab is visible and a live game exists (`LIVE_SCORES_INTERVAL_MS`, one request in flight at a time; the header is a single small feed for the whole slate, so rows update at scoreboard speed without 39 per-game polls). Play-by-play scanning is scheduled per game by `boothRefreshPlan` with a **1000 ms** minimum interval per game (`LIVE_REVIEWS_INTERVAL_MS`), widened so a full live day never exceeds about 2.5 summary fetches per second (`BOOTH_BUSY_DAY_GAME_MS`, max 2 concurrent, max 8 per pass / 12 on the seeding pass). The full scoreboard reload runs every 15 s while any game is live and every 60 s otherwise (`SCOREBOARD_INTERVAL_MS` / `SCOREBOARD_IDLE_INTERVAL_MS`). A final is fetched exactly one more time after the clock stops, and games whose scoreboard entry says `playByPlayAvailable: false` are never polled. |
+| Lowest latency | Score/status rides the 250 ms header feed. Three fast paths fire on that tick, before the paced per-game summary pass: (1) when the live `situation.lastPlay` changes to a flag/review/challenge/replay/nullified verdict, that game's cached booth events are re-merged and re-rendered immediately (no provider request, purely local); (2) when the header last play is a scoring play, a score-relevant review/flag/challenge/replay, or a booth event immediately after a scoring play, that one game's play-by-play is fetched immediately with a 500 ms per-game debounce (`boothScoreRiskReason`) so any potential nullification gets authoritative context without waiting for the all-games pass; and (3) when a live game's header total **drops** (the fastest proof that points came off the board), that one game's play-by-play is fetched immediately — bypassing the paced interval — so the authoritative nullifying row and the before→during→after trail are confirmed as soon as the provider has them. `boothScoreDropped` is the pure, unit-tested decision for the drop; neither fast path invents an alert (the chime still requires the play text/rollback to confirm). |
+| Polling | Score/status refresh from the ESPN scoreboard-header feed every **250 ms** while the tab is visible and a live game exists (`LIVE_SCORES_INTERVAL_MS`, one request in flight at a time; the header is a single small feed for the whole slate, so rows update at scoreboard speed without 39 per-game polls). Potential score-nullification games bypass the normal pass immediately, with duplicate same-play pulls debounced for **500 ms** (`LIVE_SCORE_RISK_REFETCH_MS`). Routine play-by-play scanning is scheduled per game by `boothRefreshPlan` with a **1000 ms** minimum interval per game (`LIVE_REVIEWS_INTERVAL_MS`), widened so a full live day never exceeds about 2.5 summary fetches per second (`BOOTH_BUSY_DAY_GAME_MS`, max 2 concurrent, max 8 per pass / 12 on the seeding pass). The full scoreboard reload runs every 15 s while any game is live and every 60 s otherwise (`SCOREBOARD_INTERVAL_MS` / `SCOREBOARD_IDLE_INTERVAL_MS`). A final is fetched exactly one more time after the clock stops, and games whose scoreboard entry says `playByPlayAvailable: false` are never polled. |
 
 **NCAA wording.** The college-football feed shares ESPN's play-by-play writer
 with the NFL, but the referee announcements differ, so the booth never applies
-NFL wording blindly:
+NFL wording blindly. The matcher is constrained by the published play text plus
+running score deltas; it never infers a nullification from a generic flag alone.
+Official rule references used for the wording guardrails:
 
-- An accepted foul that wipes a down is announced as **"No Play"** and NCAA
-  Rule 10 states the **"play is nullified"** (vs. the NFL's "nullified" too, but
-  the app accepts the NCAA-specific `No Play` / `void the score` / `erased`
-  forms so college games are matched from evidence, not assumed).
-- NCAA replay results are announced only as **"upheld"** or **"overturned"**
-  starting with the **2025** season (the old `confirmed` / `stands` language
-  was retired). The booth matches both the new NCAA language and the older
-  ESPN/NFL wording so 2025 and pre-2025 games are both handled.
+- 2025-26 NCAA All Divisions Football Instant Replay Coaches Manual:
+  `https://ncaaorg.s3.amazonaws.com/championships/sports/football/common/2025-26MFB_InstantReplayManual.pdf`
+- Report of the NCAA Football Rules Committee, February 25-27, 2025:
+  `https://ncaaorg.s3.amazonaws.com/championships/sports/football/rules/Feb2025PRMFB_AnnualMeetingReport.pdf`
+
+Implementation notes:
+
+- An accepted foul that wipes a down is announced in feeds as **"No Play"**;
+  the booth accepts this only when the same row or related scoring row names a
+  touchdown, field goal, safety, PAT, or 2-point conversion.
+- NCAA replay results are announced as **"upheld"** or **"overturned"** starting
+  with the **2025** season (the old `confirmed` / `stands` language was retired).
+  The booth matches both the new NCAA language and the older ESPN wording so
+  2025 and pre-2025 games are both handled.
 
 Verified wording evidence (used to build the classifiers, reviewed line by
 line):
