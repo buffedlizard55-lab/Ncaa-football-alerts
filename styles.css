@@ -392,6 +392,21 @@ main { max-width: 1200px; margin: 0 auto; padding: 14px 16px 40px; outline: none
   box-shadow: 0 0 0 2px rgba(245, 196, 81, 0.2), 0 4px 14px rgba(0, 0, 0, 0.3);
 }
 
+/* Highlight games with a scoring play at risk (pending flag/challenge/review) */
+.game-row.has-risk, .game-row:has(.badge.at-risk) {
+  border-color: rgba(255, 128, 128, 0.55);
+  box-shadow: 0 0 0 2px rgba(255, 128, 128, 0.18), 0 4px 14px rgba(0, 0, 0, 0.3);
+}
+
+/* Play-by-play row whose score is at risk (verdict pending) */
+.pb-row.score-risk {
+  background: linear-gradient(90deg, rgba(255, 128, 128, 0.12), rgba(255, 128, 128, 0.03));
+  border-left: 3px solid var(--red);
+}
+.pb-row.score-risk .pb-text { color: var(--red); font-weight: 700; }
+.pb-tag.review { background: rgba(255, 128, 128, 0.12); color: var(--red); }
+
+
 /* ---------- Live booth (flags & reviews) ---------- */
 .hidden { display: none !important; }
 
@@ -589,6 +604,12 @@ main { max-width: 1200px; margin: 0 auto; padding: 14px 16px 40px; outline: none
   border-left-width: 6px;
   background: linear-gradient(90deg, rgba(245, 196, 81, 0.12), rgba(245, 196, 81, 0.03));
   box-shadow: 0 2px 10px rgba(245, 196, 81, 0.15);
+}
+.booth-msg.score-risk {
+  border-left-color: var(--red);
+  border-left-width: 6px;
+  background: linear-gradient(90deg, rgba(255, 128, 128, 0.12), rgba(255, 128, 128, 0.03));
+  box-shadow: 0 2px 10px rgba(255, 128, 128, 0.15);
 }
 .booth-msg.new { animation: booth-in .35s ease; }
 @keyframes booth-in {
