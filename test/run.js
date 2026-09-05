@@ -866,20 +866,28 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.boothIsScoringPlay(boothNorm({ id: 'r2', type: { text: 'Penalty' }, text: 'PENALTY Mizzou Holding 7 yards', isPenalty: true })), false);
   });
 
-  test('boothAnnounceStep re-announces a review that is later nullified, once', () => {
+  test('boothAnnounceStep alerts at risk immediately, re-alerts once when nullified, and stays silent on a clean resolution', () => {
     const seen = {};
-    // First seen while "under review" (not nullified): silent, remembered as non-nullified.
-    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:1', false), { key: 'g:1', nullified: false });
-    assert.strictEqual(seen['g:1'], false);
-    // Same non-nullified state again: silent, no change.
-    assert.strictEqual(NB.boothAnnounceStep(seen, 'g:1', false), null);
-    // Transition to nullified (OVERTURNED): alerts once.
-    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:1', true), { key: 'g:1', nullified: true });
-    assert.strictEqual(seen['g:1'], true);
+    // First seen as AT RISK (scoring play with a pending flag/review): alerts NOW.
+    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:1', 1), { key: 'g:1', level: 1 });
+    assert.strictEqual(seen['g:1'], 1);
+    // Still at risk (no verdict yet): silent, no change.
+    assert.strictEqual(NB.boothAnnounceStep(seen, 'g:1', 1), null);
+    // The verdict NULLIFIES the score: re-alerts exactly once, at the higher level.
+    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:1', 2), { key: 'g:1', level: 2 });
+    assert.strictEqual(seen['g:1'], 2);
     // Already alerted nullified: never repeats.
-    assert.strictEqual(NB.boothAnnounceStep(seen, 'g:1', true), null);
-    // A brand-new nullified item alerts immediately.
-    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:2', true), { key: 'g:2', nullified: true });
+    assert.strictEqual(NB.boothAnnounceStep(seen, 'g:1', 2), null);
+    // A risk that resolves cleanly (upheld / penalty declined) never alerts again.
+    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:3', 1), { key: 'g:3', level: 1 });
+    assert.strictEqual(NB.boothAnnounceStep(seen, 'g:3', 0), null);
+    assert.strictEqual(seen['g:3'], 1);
+    // A brand-new nullified item alerts immediately at level 2.
+    assert.deepStrictEqual(NB.boothAnnounceStep(seen, 'g:2', 2), { key: 'g:2', level: 2 });
+    // Legacy boolean true (old stored state) is respected as level 2: silent.
+    const legacy = { 'g:9': true };
+    assert.strictEqual(NB.boothAnnounceStep(legacy, 'g:9', true), null);
+    assert.strictEqual(NB.boothAnnounceStep(legacy, 'g:9', 2), null);
   });
 
   test('boothEvents nullifies a safety and a defensive touchdown (score rollback)', () => {
@@ -934,6 +942,237 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.boothScoreRiskReason(scoreReview, routine), 'score-event');
     assert.strictEqual(NB.boothScoreRiskReason(routine, score), '');
     assert.ok(NB.boothFastFetchKey(scoreReview, 'score-event').includes('score-event'));
+  });
+
+  test('boothClassify keeps a head-coach challenge distinct from a plain review (official script wording)', () => {
+    // 2025 NCAA Instant Replay Manual §6-1-b: the challenge announcement always
+    // ends "The play is under further review." — that trailing sentence must
+    // not swallow the row into the generic 'review' kind.
+    const challenge = boothNorm({ id: 'ch1', text: 'The Missouri head coach has challenged the ruling of touchdown. The play is under further review.', type: { text: 'Challenge' } });
+    assert.strictEqual(NB.boothClassify(challenge), 'challenge');
+    assert.strictEqual(NB.boothResult(challenge.text), 'pending');
+    const review = boothNorm({ id: 'rv1', text: 'The ruling on the previous play is touchdown. The play is under further review.', type: { text: 'Under Review' } });
+    assert.strictEqual(NB.boothClassify(review), 'review');
+  });
+
+  test('nullifiedScoreText matches the manual’s literal overturned verdict ("Therefore, no touchdown")', () => {
+    // Manual §6-1-d-2 scripts the overturned announcement WITHOUT the word
+    // "overturned": "After further review, the ruling is [evidence]. Therefore, [impact]."
+    assert.strictEqual(NB.nullifiedScoreText('After further review, the ruling is the runner stepped out of bounds at the two. Therefore, no touchdown, ball at the two.'), true);
+    assert.strictEqual(NB.nullifiedScoreText('After further review, the ruling is the kick passed outside the upright. Therefore, no field goal.'), true);
+    assert.strictEqual(NB.nullifiedScoreText('Pass complete for 12 yards to the MIZ 20'), false);
+    assert.strictEqual(NB.nullifiedScoreText('#22 rush for 2 yards'), false);
+  });
+
+  test('at-risk: a touchdown under review flags the score BEFORE the verdict', () => {
+    // Live mid-review state: TD on the board, review row is the newest row.
+    const midPlays = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'td', seq: 2, text: '#10 pass complete to #88 for 45 yards, TOUCHDOWN', scoringPlay: true, type: { text: 'Passing Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'rev', seq: 3, text: 'The ruling on the previous play is touchdown. The play is under further review.', type: { text: 'Under Review' }, awayScore: 6, homeScore: 0 })
+    ];
+    const midEvents = NB.boothEvents(midPlays, null, teamMap);
+    const midReview = midEvents.find(e => e.id === 'rev');
+    assert.strictEqual(midReview.kind, 'review');
+    assert.strictEqual(NB.boothEventScoreAtRisk(midReview), true, 'score at risk while the review is pending');
+    assert.strictEqual(NB.boothEventAlertLevel(midReview), 1);
+    assert.ok(NB.dayBoothLiveEvents(midEvents).some(e => e.id === 'rev'), 'pending review of a score appears in the alert feed');
+
+    // Verdict lands by the manual’s literal script; the score reverts.
+    const donePlays = midPlays.concat([
+      boothNorm({ id: 'verdict', seq: 4, text: 'After further review, the ruling is the runner stepped out of bounds at the two. Therefore, no touchdown, ball at the two.', type: { text: 'Replay Review' }, awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'next', seq: 5, text: '#22 rush for no gain', awayScore: 0, homeScore: 0 })
+    ]);
+    const doneEvents = NB.boothEvents(donePlays, null, teamMap);
+    const doneReview = doneEvents.find(e => e.id === 'rev');
+    const verdict = doneEvents.find(e => e.id === 'verdict');
+    assert.strictEqual(NB.boothEventScoreAtRisk(doneReview), false, 'verdict decided: no longer at risk');
+    assert.strictEqual(NB.boothEventNullifies(verdict), true, 'the overturned verdict nullifies the touchdown');
+    assert.strictEqual(NB.boothEventAlertLevel(verdict), 2);
+  });
+
+  test('at-risk resolves cleanly when the review is upheld', () => {
+    const plays = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'td', seq: 2, text: '#10 pass complete to #88 for 45 yards, TOUCHDOWN', scoringPlay: true, type: { text: 'Passing Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'rev', seq: 3, text: 'The ruling on the previous play is touchdown. The play is under further review.', type: { text: 'Under Review' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'verdict', seq: 4, text: 'After further review, the ruling on the field is upheld.', type: { text: 'Replay Review' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'xp', seq: 5, text: '#99 kick attempt good', awayScore: 7, homeScore: 0 })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    const review = events.find(e => e.id === 'rev');
+    assert.strictEqual(NB.boothEventScoreAtRisk(review), false, 'upheld verdict ends the risk');
+    assert.strictEqual(NB.boothEventAlertLevel(review), 0, 'no alert on a clean resolution');
+    assert.strictEqual(NB.boothEventNullifies(events.find(e => e.id === 'verdict')), false);
+    // A risk that resolved cleanly never enters the live alert surface.
+    assert.ok(!NB.dayBoothLiveEvents(events).some(e => e.id === 'rev'));
+  });
+
+  test('at-risk: a scoring play whose own row carries the flag alerts before enforcement (the 50-yard TD case)', () => {
+    const mid = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'tdf', seq: 2, text: '#10 pass complete to #88 for 50 yards, TOUCHDOWN. PENALTY on TA&M-#75, Offensive Holding, 10 yards', scoringPlay: true, isPenalty: true, type: { text: 'Penalty' }, awayScore: 6, homeScore: 0 })
+    ];
+    const midEvents = NB.boothEvents(mid, null, teamMap);
+    const flagged = midEvents.find(e => e.id === 'tdf');
+    assert.strictEqual(flagged.kind, 'penalty');
+    assert.strictEqual(NB.boothEventScoreAtRisk(flagged), true, 'flag on the scoring play itself = score at risk');
+    assert.strictEqual(NB.boothEventAlertLevel(flagged), 1);
+    assert.ok(NB.dayBoothLiveEvents(midEvents).some(e => e.id === 'tdf'));
+    // Once the provider shows play resumed with the points kept, the risk ends.
+    const done = mid.concat([
+      boothNorm({ id: 'xp', seq: 3, text: '#99 kick attempt good', awayScore: 7, homeScore: 0 })
+    ]);
+    const doneEvents = NB.boothEvents(done, null, teamMap);
+    assert.strictEqual(NB.boothEventScoreAtRisk(doneEvents.find(e => e.id === 'tdf')), false);
+  });
+
+  test('at-risk: a made field goal with a flag is at risk (NCAA 10-2-5-d: the score can be canceled)', () => {
+    const plays = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 3, homeScore: 3 }),
+      boothNorm({ id: 'fg', seq: 2, text: '#19 42 yard field goal GOOD. PENALTY on MIZ-#99, Offside, 5 yards', scoringPlay: true, isPenalty: true, type: { text: 'Field Goal Good' }, awayScore: 6, homeScore: 3 })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    const fg = events.find(e => e.id === 'fg');
+    assert.strictEqual(NB.boothEventScoreAtRisk(fg), true, 'a successful FG with a live-ball foul can be canceled and re-kicked');
+    assert.strictEqual(NB.boothEventAlertLevel(fg), 1);
+  });
+
+  test('at-risk: a coach’s challenge of a touchdown rules the score at risk', () => {
+    const plays = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'td', seq: 2, text: '#11 returns kickoff 98 yards for a TOUCHDOWN', scoringPlay: true, type: { text: 'Kickoff Return Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'ch', seq: 3, text: 'The Missouri head coach has challenged the ruling of touchdown. The play is under further review.', type: { text: 'Challenge' }, awayScore: 6, homeScore: 0 })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    const ch = events.find(e => e.id === 'ch');
+    assert.strictEqual(ch.kind, 'challenge');
+    assert.strictEqual(NB.boothEventScoreAtRisk(ch), true);
+    assert.strictEqual(NB.boothEventAlertLevel(ch), 1);
+    assert.ok(NB.dayBoothLiveEvents(events).some(e => e.id === 'ch'));
+  });
+
+  test('at-risk never fires for routine flags or reviews with no score attached', () => {
+    const plays = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'r2', seq: 2, text: '#22 rush for 3 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'r3', seq: 3, text: 'Pass incomplete', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'r4', seq: 4, text: 'Timeout Missouri, clock 06:00', type: { text: 'Timeout' }, awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'fl', seq: 5, text: 'PENALTY Mizzou Holding (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'rv', seq: 6, text: 'The play is under further review.', type: { text: 'Under Review' }, awayScore: 0, homeScore: 0 })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    assert.ok(events.length >= 2);
+    events.forEach(e => {
+      assert.strictEqual(NB.boothEventScoreAtRisk(e), false, 'no score attached: ' + e.id);
+      assert.strictEqual(NB.boothEventAlertLevel(e), 0, 'no alert: ' + e.id);
+    });
+    assert.strictEqual(NB.dayBoothLiveEvents(events).length, 0);
+  });
+
+  test('at-risk: a review far after a completed score is not that score at risk', () => {
+    const plays = [
+      boothNorm({ id: 'td', seq: 1, text: '#10 pass for 30 yards, TOUCHDOWN', scoringPlay: true, type: { text: 'Passing Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'xp', seq: 2, text: '#99 kick attempt good', awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'ko', seq: 3, text: '#99 kickoff 65 yards, touchback', type: { text: 'Kickoff' }, awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'r1', seq: 4, text: '#22 rush for 4 yards', awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'rv', seq: 5, text: 'The ruling on the previous play is a four-yard gain. The play is under further review.', type: { text: 'Under Review' }, awayScore: 7, homeScore: 0 })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    const rv = events.find(e => e.id === 'rv');
+    assert.strictEqual(NB.boothEventScoreAtRisk(rv), false, 'the review is about the spot, not the earlier touchdown');
+  });
+
+  test('the At-risk filter and risk counts select exactly the pending score-risk events', () => {
+    // A pending review of a touchdown, plus a flag announced during the same
+    // stoppage (still inside the tight risk window) — both are score-adjacent.
+    const plays = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'td', seq: 2, text: '#10 pass for 45 yards, TOUCHDOWN', scoringPlay: true, type: { text: 'Passing Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'rev', seq: 3, text: 'The ruling on the previous play is touchdown. The play is under further review.', type: { text: 'Under Review' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'fl', seq: 4, text: 'PENALTY Mizzou Holding (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07', isPenalty: true, type: { text: 'Penalty' }, awayScore: 6, homeScore: 0 })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    const counts = NB.boothKindCounts(events);
+    assert.strictEqual(counts.risk, 2, 'the pending review AND the flag inside the risk window are both at risk');
+    const shown = NB.dayBoothTrackingEvents(events, 'risk');
+    assert.strictEqual(shown.length, 2);
+    assert.ok(NB.boothEventShown(events.find(e => e.id === 'rev'), 'risk'));
+    assert.ok(NB.boothEventShown(events.find(e => e.id === 'fl'), 'risk'));
+
+    // The same routine flag moved beyond the risk window (e.g. on the next
+    // series, after the try and the kickoff) is NOT that score at risk.
+    const far = [
+      boothNorm({ id: 'f1', seq: 1, text: '#10 pass for 45 yards, TOUCHDOWN', scoringPlay: true, type: { text: 'Passing Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'f2', seq: 2, text: '#99 kick attempt good', awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'f3', seq: 3, text: '#99 kickoff 65 yards, touchback', type: { text: 'Kickoff' }, awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'f4', seq: 4, text: '#22 rush for 4 yards', awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'f5', seq: 5, text: 'Pass incomplete', awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'ffl', seq: 6, text: 'PENALTY Mizzou Holding (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07', isPenalty: true, type: { text: 'Penalty' }, awayScore: 7, homeScore: 0 })
+    ];
+    const farEvents = NB.boothEvents(far, null, teamMap);
+    assert.strictEqual(NB.boothKindCounts(farEvents).risk, 0, 'a flag well after the score cannot remove it');
+    assert.ok(!NB.boothEventShown(farEvents.find(e => e.id === 'ffl'), 'risk'));
+    assert.strictEqual(NB.BOOTH_RISK_LOOKBACK, 3);
+  });
+
+  test('at-risk: a flag on the kickoff after a score is NOT that score at risk (verified fixture shape)', () => {
+    // The embedded-penny-flag shape from the verified summary fixture, placed
+    // where the feed actually publishes it: TD -> try -> kickoff, flag on the
+    // kickoff. A foul during the kick cannot remove the prior score.
+    const plays = [
+      boothNorm({ id: 'td', seq: 1, text: '#10 pass for 45 yards, TOUCHDOWN', scoringPlay: true, type: { text: 'Passing Touchdown' }, awayScore: 6, homeScore: 0 }),
+      boothNorm({ id: 'xp', seq: 2, text: '#99 kick attempt good', awayScore: 7, homeScore: 0 }),
+      boothNorm({ id: 'ko', seq: 3, text: '#99 J.Zirkel kickoff 65 yards to the Mizzou00 #11 D.Fowlkes return 33 yards to the Mizzou33, End Of Play PENALTY Mizzou Holding (#45 C.Weselman) 7 yards from Mizzou14 to Mizzou07', isPenalty: false, type: { text: 'Kickoff' }, awayScore: 7, homeScore: 0 })
+    ];
+    const events = NB.boothEvents(plays, null, teamMap);
+    const ko = events.find(e => e.id === 'ko');
+    assert.strictEqual(ko.kind, 'penalty');
+    assert.strictEqual(NB.boothEventScoreAtRisk(ko), false, 'the kickoff foul sits within the lookback of the TD but cannot remove it');
+    // A flagged kickoff-RETURN touchdown is still at risk through its own text.
+    const ret = [
+      boothNorm({ id: 'r0', seq: 1, text: '#99 kickoff 65 yards, touchback', type: { text: 'Kickoff' }, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 'krtd', seq: 2, text: '#11 D.Fowlkes return kickoff 98 yards for a TOUCHDOWN. PENALTY Mizzou Holding (#45 C.Weselman) 10 yards', isPenalty: true, type: { text: 'Kickoff Return Touchdown' }, awayScore: 6, homeScore: 7 })
+    ];
+    const retEvents = NB.boothEvents(ret, null, teamMap);
+    const krtd = retEvents.find(e => e.id === 'krtd');
+    assert.strictEqual(NB.boothEventScoreAtRisk(krtd), true, 'special-teams touchdown with a flag on the runback is at risk');
+    assert.strictEqual(NB.boothEventAlertLevel(krtd), 1);
+  });
+
+  test('full alert ladder for one scoring play: at-risk immediately, nullified at the verdict, silent after', () => {
+    // Mid-game: the flagged touchdown is the newest row.
+    const midPlays = [
+      boothNorm({ id: 'r1', seq: 1, text: '#22 rush for 2 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'tdf', seq: 2, text: '#10 pass complete to #88 for 50 yards, TOUCHDOWN. PENALTY on TA&M-#75, Offensive Holding, 10 yards', scoringPlay: true, isPenalty: true, type: { text: 'Penalty' }, awayScore: 6, homeScore: 0 })
+    ];
+    const seen = {};
+    const riskFeed = NB.dayBoothFeed([{ id: 'g', shortName: 'MIZ @ TA&M', awayAbbr: 'MIZ', homeAbbr: 'TA&M', live: true, events: NB.boothEvents(midPlays, null, teamMap) }]);
+    const firstAlerts = [];
+    riskFeed.forEach(item => {
+      const step = NB.boothAnnounceStep(seen, item.key, NB.boothEventAlertLevel(item));
+      if (step) firstAlerts.push(step);
+    });
+    assert.ok(firstAlerts.some(s => s.level === 1), 'the at-risk state alerts immediately, before any verdict');
+
+    // The flag is enforced and wipes the touchdown.
+    const donePlays = midPlays.concat([
+      boothNorm({ id: 'enforce', seq: 3, text: 'PENALTY on TA&M-#75, Offensive Holding, 10 yards from the MIZ45 to the MIZ35, No Play. Touchdown nullified', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'next', seq: 4, text: '#22 rush for no gain', awayScore: 0, homeScore: 0 })
+    ]);
+    const doneEvents = NB.boothEvents(donePlays, null, teamMap);
+    const doneFeed = NB.dayBoothFeed([{ id: 'g', shortName: 'MIZ @ TA&M', awayAbbr: 'MIZ', homeAbbr: 'TA&M', live: true, events: doneEvents }]);
+    const secondAlerts = [];
+    doneFeed.forEach(item => {
+      const step = NB.boothAnnounceStep(seen, item.key, NB.boothEventAlertLevel(item));
+      if (step) secondAlerts.push(step);
+    });
+    assert.ok(secondAlerts.some(s => s.level === 2), 'the nullified verdict re-alerts at level 2');
+    assert.ok(!secondAlerts.some(s => s.key === 'g:tdf' && s.level === 1), 'the already-alerted risk state stays silent');
+    // Every row in the live alert surface is at-risk or nullified — never routine.
+    NB.dayBoothLiveEvents(doneEvents).forEach(e => {
+      assert.ok(NB.boothEventAlertLevel(e) > 0, 'live feed row must be alertable: ' + e.id);
+    });
   });
 
   test('boothScoreEffect tracks before -> during -> after and a score rollback', () => {
@@ -1152,11 +1391,18 @@ function waitForPort(url, ms) {
     assert.strictEqual(twoPtEffect.team, 'away');
   });
 
-  test('sound never plays as a toggle/test tone; only nullified-score alerts can call it', () => {
+  test('sound never plays as a toggle/test tone; only at-risk/nullified scoring alerts can call it', () => {
     const src = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
     assert.ok(!/if\s*\(state\.booth\.soundOn\)\s*playBoothAlert\s*\(\s*\)/.test(src), 'enabling sound must not play a test notification');
-    assert.match(src, /if\s*\(shouldAlert\s*&&\s*!state\.booth\.paused\s*&&\s*state\.booth\.soundOn\)\s*\{\s*playBoothAlert\s*\(\s*\)/s,
-      'the remaining sound path must be gated by a nullified-score alert decision');
+    // The only call sites are the alert ladder (level 1 = score at risk, level 2 = nullified).
+    const calls = (src.match(/playBoothAlert\s*\(([^)]*)\)/g) || [])
+      .filter(c => !/playBoothAlert\s*\(\s*kind\s*\)/.test(c)); // skip the function definition
+    assert.ok(calls.length >= 2, 'expected the alert-ladder call sites');
+    calls.forEach(c => {
+      assert.ok(/'nullified'|'risk'/.test(c), 'every sound call must be gated by an at-risk or nullified alert kind: ' + c);
+    });
+    assert.match(src, /if\s*\(nullifiedAlert\)\s*playBoothAlert\('nullified'\);\s*else if\s*\(riskAlert\)\s*playBoothAlert\('risk'\);/s,
+      'the sound path must be driven by boothAnnounceStep levels, never by routine flags');
   });
 
   test('polling cadence constants match requirements (0.25s live score, 1s pbp/booth, 15s full scoreboard)', () => {
@@ -1192,7 +1438,7 @@ function waitForPort(url, ms) {
     for (const m of src.matchAll(/function\s*\(([^)]*)\)/g)) m[1].split(',').map(s => s.trim()).filter(Boolean).forEach((p) => defined.add(p));
     const keywords = new Set(['if','for','while','switch','catch','return','typeof','new','await','function','do','else','in','of','case','delete','void','yield','throw']);
     const globals = new Set(['fetch','setTimeout','clearTimeout','setInterval','clearInterval','requestAnimationFrame','encodeURIComponent','decodeURIComponent','Number','String','Boolean','Array','Object','JSON','Math','Date','Promise','Error','Map','Set','isNaN','parseInt','parseFloat','RegExp','Intl','AbortController','URL','console','AudioContext','localStorage','document','window','location','navigator','history','globalThis','this']);
-    for (const fname of ['gameRowHtml', 'renderScoreboard', 'renderDayBooth', 'dayBoothHTML', 'pollGameSummary', 'loadGame', 'dayBoothPoll', 'buildDayBooth', 'loadScoreboard', 'render', 'refreshLiveScores', 'refreshLiveBoothForGame', 'refreshLiveBoothForScoreDrop', 'applyBoothGame', 'boothGameFromId', 'route', 'renderDiag']) {
+    for (const fname of ['gameRowHtml', 'renderScoreboard', 'renderDayBooth', 'dayBoothHTML', 'pollGameSummary', 'loadGame', 'dayBoothPoll', 'buildDayBooth', 'loadScoreboard', 'render', 'refreshLiveScores', 'refreshLiveBoothForGame', 'refreshLiveBoothForScoreRisk', 'refreshLiveBoothForScoreDrop', 'applyBoothGame', 'boothLatestAlert', 'announceNewBoothEvents', 'boothGameFromId', 'dayBoothMsgHTML', 'boothScoreTrailHTML', 'route', 'renderDiag']) {
       const at = src.indexOf('function ' + fname + '(');
       assert.ok(at >= 0, fname + ' must exist');
       const nextFn = src.indexOf('\n  function ', at);

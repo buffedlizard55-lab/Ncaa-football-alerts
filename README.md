@@ -19,9 +19,12 @@ lookup:
   final recaps when available.
 - Live scoreboards refresh automatically. Live game views refresh the
   provider's current status and play-by-play without showing video.
-- The all-games Live Booth alert surface shows **only nullified scoring plays**;
-  flags, challenges, replay, under-review, red-zone and nullified audit rows are
-  still tracked in separate tabs.
+- The all-games Live Booth alert surface shows **scoring plays at risk and
+  nullified scoring plays** — every touchdown, field goal, safety, PAT or 2-pt
+  that arrives with a penalty, coach's challenge, replay review or under-review
+  attached (alerted immediately, before the verdict), plus every score taken
+  off the board. Routine flags, challenges, replay, under-review, red-zone and
+  nullified audit rows are still tracked in separate tabs.
 
 ## Run
 
@@ -185,31 +188,44 @@ feed: play texts repeat the quarter clock as a `"(MM:SS)"` prefix (now
 stripped like ESPN rows), and an NCAA PAT is rendered `"… kick attempt good"`
 — it must be tagged `PAT`, not mistaken for a field goal.
 
-## Live booth — nullified scoring plays
+## Live booth — scoring plays at risk & nullified
 
-The scoreboard carries a **Live booth · nullified scoring plays** alert feed,
-with separate tracking tabs for flags, coach's challenges, replay reviews,
-under-review rows, red-zone rows and nullified rows from **all of the selected
-day's games**. The live alert section is intentionally narrow: only plays that
-nullify a score (offensive, defensive or special-teams touchdown, field goal,
-safety, PAT or 2-point conversion) appear there. Routine flags/reviews remain
-available for audit in their own tabs and inside the per-game **Flags & Reviews**
-and **Red Zone** views. There is no manual input: the app discovers everything
-from the same play-by-play it already fetches.
+The scoreboard carries a **Live booth · scoring plays at risk & nullified**
+alert feed, with separate tracking tabs for flags, coach's challenges, replay
+reviews, under-review rows, at-risk rows, red-zone rows and nullified rows from
+**all of the selected day's games**. The live alert section is intentionally
+narrow and two-tiered:
+
+1. **SCORE AT RISK** — the moment a scoring play (offensive, defensive or
+   special-teams touchdown, field goal, safety, PAT or 2-point conversion)
+   arrives **with a penalty, coach's challenge, replay review or under-review
+   attached and no verdict yet**. This alerts immediately — at the 250 ms
+   header-feed cadence, before the referee's final decision — which is exactly
+   the "50-yard play ruled a touchdown with a flag on it" case.
+2. **NULLIFIED** — a score that actually came off the board (verdict wording or
+   a running-score rollback), alerted and tracked as before.
+
+A risk that resolves cleanly (review upheld, penalty declined/enforced with the
+points kept, or play simply resumed with the published running score intact)
+stops alerting and leaves the live surface, remaining in the audit tabs.
+Routine flags/reviews that cannot rule on a score never alert. There is no
+manual input: the app discovers everything from the same play-by-play it
+already fetches.
 
 How it is driven (pure reshapes of the verified ESPN/NCAA play objects the app
 already normalizes — see `boothClassify`, `boothEvents`, `dayBoothFeed`):
 
 | Concern | Behavior |
 |---|---|
-| What counts as a booth event | A play whose text/type is a penalty, a coach's challenge, a replay review, or an under-review play. A flag that is published only as the trailing phrase `PENALTY <team> <foul> (<player>) <yards> yards from <spot> to <spot>` on the preceding row (`isPenalty:false`) is still caught (verified in the summary fixture). |
+| What counts as a booth event | A play whose text/type is a penalty, a coach's challenge, a replay review, or an under-review play. A flag that is published only as the trailing phrase `PENALTY <team> <foul> (<player>) <yards> yards from <spot> to <spot>` on the preceding row (`isPenalty:false`) is still caught (verified in the summary fixture, and again live on 2026-09-04: `"... 1ST DOWN, PENALTY CU  Pass Interference (#7 R.Fontenette) 11 yard from GT 04 to GT 15, 1ST DOWN. NO PLAY"`, `type.text:"Penalty"`, `isPenalty:true`). |
 | Score before → during → after | Rebuilt from the running `awayScore`/`homeScore` ESPN publishes on each play, scanning forward for a rolled-back score only when the event could actually rule on it (a scoring/nullification play, a review/challenge/replay, or a penalty right after a score). A routine kickoff/punt foul cannot remove a prior score. |
-| Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (offensive, defensive or special-teams touchdown, field goal, safety, PAT or 2-pt conversion) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`), or the running score actually drops. Ordinary plays are never flagged as nullified. |
+| Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (offensive, defensive or special-teams touchdown, field goal, safety, PAT or 2-pt conversion) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`, or the 2025 replay-manual verdict script "… Therefore, **no touchdown** / no safety / no field goal"), or the running score actually drops. Ordinary plays are never flagged as nullified. |
+| Scores at risk (new) | `boothEventScoreAtRisk` / `boothEventAlertLevel`: a booth event that can rule on a score — penalty, coach's challenge, replay review, or under-review — **attached to a scoring play with no final decision yet**. Attached means the row's own text names the score, or the scoring play sits within `BOOTH_RISK_LOOKBACK = 3` rows behind it (the stoppage happens before the try/enforcement, so anything farther cannot be that score). Pending means the verdict word is `under (further) review` or absent (`upheld`/`confirmed`/`stands`/`declined`/`offsetting`/`overturned` all mean decided). A flag published on a kickoff/punt row is never associated with the preceding score (a foul during the kick cannot remove the touchdown/try/field goal), while a flagged kick- or punt-return touchdown is still at risk through its own text. The risk state auto-resolves when the verdict row lands or play resumes with a published running score (`boothRiskResolvedAhead`). Grounded in NCAA Rule 10 (fouls during a TD/FG down can keep, cancel or void the score — 10-2-5-d gives the scoring team the option to *cancel* a successful field goal) and the 2025 replay manual's stoppage scripts. |
 | Red zone | Opponent's 20 or closer, from the verified `start.yardsToEndzone` with a `downDistanceText`/goal-to-go fallback. An unknown distance is `null` — never guessed. |
-| All-games live feed | The top live section filters the merged feed through `dayBoothLiveEvents`, so **only confirmed nullified scoring plays** are rendered there. Routine flags/reviews never appear in that live alert surface. |
+| All-games live feed | The top live section filters the merged feed through `dayBoothLiveEvents`, so **only at-risk and nullified scoring plays** are rendered there. Routine flags/reviews never appear in that live alert surface. |
 | Separate tracking tabs | The same merged event cache is still exposed through `dayBoothTrackingEvents` tabs for Flags, Challenges, Replay, Under review, Red zone and Nullified. A play later re-issued (e.g. `under review` → `overturned`) replaces its row in place. |
-| Alerts & sound | A short rain chime plays **only when a scoring play is nullified** — never for a routine flag, challenge, or an `under review` row. A review that starts `under review` and is later `OVERTURNED` is announced once, on its final nullified state. `boothAnnounceStep` is the pure decision (unit-tested). |
-| Lowest latency | Score/status rides the 250 ms header feed. Three fast paths fire on that tick, before the paced per-game summary pass: (1) when the live `situation.lastPlay` changes to a flag/review/challenge/replay/nullified verdict, that game's cached booth events are re-merged and re-rendered immediately (no provider request, purely local); (2) when the header last play is a scoring play, a score-relevant review/flag/challenge/replay, or a booth event immediately after a scoring play, that one game's play-by-play is fetched immediately with a 500 ms per-game debounce (`boothScoreRiskReason`) so any potential nullification gets authoritative context without waiting for the all-games pass; and (3) when a live game's header total **drops** (the fastest proof that points came off the board), that one game's play-by-play is fetched immediately — bypassing the paced interval — so the authoritative nullifying row and the before→during→after trail are confirmed as soon as the provider has them. `boothScoreDropped` is the pure, unit-tested decision for the drop; neither fast path invents an alert (the chime still requires the play text/rollback to confirm). |
+| Alerts & sound | The chime plays **only for at-risk scoring plays and nullified scores** — never for a routine flag, challenge, review of a non-scoring play, or red-zone row. `boothAnnounceStep` is the pure two-level ladder (unit-tested): level 1 fires the instant a scoring play arrives with a pending flag/challenge/review (a sharper, faster lead-in plays), and level 2 fires when the verdict actually wipes the score (the rain chime) — including the upgrade from a level-1 risk on the same play. A risk that resolves cleanly (upheld/declined/resumed) never chimes again, and nothing repeats. |
+| Lowest latency | Score/status rides the 250 ms header feed. Three fast paths fire on that tick, before the paced per-game summary pass: (0) when the live `situation.lastPlay` becomes a booth event attached to a scoring play — the flagged-touchdown row itself, an `under review`/challenge row naming the score, or a row within three plays of it — that game's cached booth events are re-merged locally and the **at-risk alert (level 1) fires on the header cadence with zero provider requests**; (1) when the live `situation.lastPlay` changes to a flag/review/challenge/replay/nullified verdict, that game's cached booth events are re-merged and re-rendered immediately (no provider request, purely local); (2) when the header last play is a scoring play, a score-relevant review/flag/challenge/replay, or a booth event immediately after a scoring play, that one game's play-by-play is fetched immediately with a 500 ms per-game debounce (`boothScoreRiskReason`) so any potential nullification gets authoritative context without waiting for the all-games pass; and (3) when a live game's header total **drops** (the fastest proof that points came off the board), that one game's play-by-play is fetched immediately — bypassing the paced interval — so the authoritative nullifying row and the before→during→after trail are confirmed as soon as the provider has them. `boothScoreDropped` is the pure, unit-tested decision for the drop; neither fast path invents an alert (the chime still requires the play text/rollback to confirm). |
 | Polling | Score/status refresh from the ESPN scoreboard-header feed every **250 ms** while the tab is visible and a live game exists (`LIVE_SCORES_INTERVAL_MS`, one request in flight at a time; the header is a single small feed for the whole slate, so rows update at scoreboard speed without 39 per-game polls). Potential score-nullification games bypass the normal pass immediately, with duplicate same-play pulls debounced for **500 ms** (`LIVE_SCORE_RISK_REFETCH_MS`). Routine play-by-play scanning is scheduled per game by `boothRefreshPlan` with a **1000 ms** minimum interval per game (`LIVE_REVIEWS_INTERVAL_MS`), widened so a full live day never exceeds about 2.5 summary fetches per second (`BOOTH_BUSY_DAY_GAME_MS`, max 2 concurrent, max 8 per pass / 12 on the seeding pass). The full scoreboard reload runs every 15 s while any game is live and every 60 s otherwise (`SCOREBOARD_INTERVAL_MS` / `SCOREBOARD_IDLE_INTERVAL_MS`). A final is fetched exactly one more time after the clock stops, and games whose scoreboard entry says `playByPlayAvailable: false` are never polled. |
 
 **NCAA wording.** The college-football feed shares ESPN's play-by-play writer
@@ -227,11 +243,24 @@ Implementation notes:
 
 - An accepted foul that wipes a down is announced in feeds as **"No Play"**;
   the booth accepts this only when the same row or related scoring row names a
-  touchdown, field goal, safety, PAT, or 2-point conversion.
+  touchdown, field goal, safety, PAT, or 2-point conversion. (Re-verified
+  live on 2026-09-04 in event 401856776, seq 59.)
 - NCAA replay results are announced as **"upheld"** or **"overturned"** starting
   with the **2025** season (the old `confirmed` / `stands` language was retired).
   The booth matches both the new NCAA language and the older ESPN wording so
   2025 and pre-2025 games are both handled.
+- The manual's *literal* overturned script (§6-1-d-2) is
+  **"After further review, the ruling is [evidence]. Therefore, [impact]."** —
+  the word "overturned" may not appear at all, so the booth also matches
+  "no touchdown / no safety / no field goal / no extra point" verdict impacts
+  when a score word is present.
+- The challenge announcement script (§6-1-b) **always ends** with "The play is
+  under further review.", so `boothClassify` tests `challenged` **before**
+  `under review`; otherwise every real challenge row would be mis-filed as a
+  plain review.
+- NCAA head-coach challenges (one per game, two if the first succeeds,
+  exercised by taking a timeout — 2025 manual §5-1-b) are a real college
+  football mechanism and are classified as their own `challenge` kind.
 
 Verified wording evidence (used to build the classifiers, reviewed line by
 line):
@@ -386,7 +415,7 @@ Current verification performed on **2026-08-27**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-9. `npm test` passes **112 offline checks**, including syntax, URL construction,
+9. `npm test` passes **127 offline checks** (count updated 2026-09-05), including the at-risk scoring-play alert ladder, syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final
@@ -480,14 +509,16 @@ on this date" report; all claims re-verified live before and after the change):
     empty board; that was a harness scheduling artifact inflating the request
     flood, and after fixing the scheduler the honest reproduction is item 19 —
     recorded here because the earlier numbers circulated during review.
-21. The suite grew to **112** checks: `lastPlayBooth` behavior,
+21. The suite grew past **112** checks: `lastPlayBooth` behavior,
     `boothRefreshPlan` (live pacing floor, final-exactly-once,
     `playByPlayAvailable: false` skip, per-pass caps, seed pass ordering),
     provider-gate lane priority/cap/FIFO against a blocked pool, `isRateLimitError`,
     a stub-`fetch` test proving a 429 stops the transport chain before Reader
-    or proxies are touched, the nullified-only alert decision in
-    `boothAnnounceStep` (an `under review` play re-announces once when
-    OVERTURNED, and only nullified plays ever chime), defensive/special-teams
+    or proxies are touched, the alert decision in `boothAnnounceStep`
+    (historically nullified-only; since 2026-09-05 the two-level at-risk +
+    nullified ladder — an `under review` scoring play alerts at risk first and
+    re-announces once when OVERTURNED; routine plays never chime),
+    defensive/special-teams
     touchdown and safety recognition in `boothIsScoringPlay`, and a definedness
     scan over every scoreboard/booth
     wiring function, and relay single-flight coalescing.
@@ -525,6 +556,85 @@ on this date" report; all claims re-verified live before and after the change):
     special-teams-touchdown nullification end to end and the score-drop
     decision (108→112 checks); the perf harness still reports `39 of 39` games
     scanned, 156 feed events, and 0 uncaught errors.
+
+At-risk scoring-play alerts (2026-09-05) — the alert now fires **before the
+verdict**, the moment a scoring play has any penalty / review / challenge /
+replay review attached. Every source below was read line by line:
+
+24. **2025 NCAA All Divisions Instant Replay Coaches Manual** (ncaaorg S3 PDF,
+    fetched in full): the referee scripts are verbatim in the code comments —
+    replay-official stoppage "The play is under further review." (§6-1-b);
+    head-coach challenge "The (name of institution) head coach has challenged
+    the ruling of (state the ruling). The play is under further review."
+    (§6-1-b — which is why `boothClassify` now tests `challenged` before
+    `under review`); verdicts "After further review, the ruling on the field is
+    upheld." / "After further review, the ruling is [evidence]. Therefore,
+    [impact]." (§6-1-d). The manual also confirms NCAA coach's challenges
+    exist (one per game, second only if the first succeeds, initiated by
+    taking a timeout) and that a potential touchdown or safety is always
+    reviewable while field goals are reviewable only for crossbar/uprights
+    (§3-1) — matching the booth's score scope.
+25. **NCAA Rule 10 penalty enforcement** (sdcfoa.org's published NCAA rules
+    text, fetched and read): fouls during a touchdown/field-goal down can
+    keep, cancel or void the score — 10-2-5-d ("Team A shall have the option
+    of **canceling the score**…"), AR 6-3-2 III/IV ("**The score does not
+    count**"), AR 10-2-3 IV ("**void the score**"). This is the rule basis for
+    alerting at-risk on a flagged scoring play instead of waiting for the
+    enforcement outcome.
+26. **Live-feed captures on 2026-09-05** (via the page-fetch transport — this
+    sandbox still has no outbound network, exit `SSL_ERROR_SYSCALL`):
+    `site.web.api.espn.com/apis/v2/scoreboard/header` returned a live Boise
+    State @ Oregon event whose `situation.lastPlay` is a full play object
+    (`id`, `type.text "Timeout"`, `text`, `period.number`,
+    `clock.displayValue`, `team.id`, `scoreValue`, `start.team/yardLine`).
+    Two shape facts matter for the fast paths: the header lastPlay may omit
+    `start.yardsToEndzone`/`downDistanceText` (the booth never invents a field
+    position), and non-play rows (Timeout) do appear as lastPlay, so a
+    "play is under further review" row rides the same 250 ms channel.
+27. **Real penalty row captured verbatim** from the Core API plays collection
+    for event 401856776 (Colorado @ Georgia Tech, 2026-09-03, the game whose
+    fumble-return TD was ruled dead and whose second-quarter fumble ruling was
+    overturned on review — per the ESPN recap and contemporaneous reports):
+    `{"type":{"text":"Penalty"},"isPenalty":true,"text":"(07:38) No
+    Huddle-Shotgun #15 A.Mendoza pass incomplete short middle to #13 I.Fuhrmann
+    thrown to GT 15, 1ST DOWN, PENALTY CU  Pass Interference (#7 R.Fontenette)
+    11 yard from GT 04 to GT 15, 1ST DOWN. NO PLAY"}` — confirming the
+    embedded `PENALTY <team> <foul> (#n Player) <n> yard(s) from X to Y`
+    shape and the `NO PLAY` nullification wording on the live feed, plus a
+    `participants[].type:"penalized"` entry.
+28. **Feed irregularity flagged (provider):** in the same response, two
+    different plays shared `sequenceNumber:"58"` (a Timeout row id 401856776275
+    and a Punt row id 401856776273) — sequence numbers are not unique on the
+    live feed. The booth already keys events by play `id` first and treats
+    `seq` only as a fallback, and `boothContextIndex` disambiguates by kind and
+    text, so no mis-association occurs; recorded here for review.
+29. **Behavioral note (recall-first, by instruction):** a dead-ball foul after
+    a score (e.g. unsportsmanlike conduct after a touchdown) cannot nullify
+    that score, but it is published the same way as a live-ball foul on the
+    scoring down. Per the explicit requirement — "alerted on EVERY scoring play
+    that has a penalty, review, challenge, replay review" — the booth alerts on
+    both and then resolves automatically when play resumes with the points
+    kept. Flagged as a known, deliberate false-positive window.
+30. **Verification limitation flagged:** no live `under review`/challenge row
+    was captured mid-review from today's feed (the sampled windows contained
+    penalties and timeouts only). The review/challenge row wording in the
+    classifier is grounded in the official announcement scripts (item 24), the
+    previously verified ESPN/Wikipedia evidence, and unit tests; the manual
+    scripts are the authoritative source for what the referee says and ESPN's
+    college feed transcribes those announcements. Also flagged: GitHub Actions
+    could not be used for an automated wider live scan (the sandbox token is
+    git-only — the Actions dispatch API returns 403), and the sandbox has no
+    outbound network, so live checks ran through the page-fetch transport.
+31. The suite grew to **127 checks**: the at-risk ladder end to end (TD under
+    review before/after the verdict; flagged touchdown/field-goal rows;
+    coach's challenge of a touchdown; clean upheld resolution; routine flags
+    and reviews with no score attached never alert; a review far from a
+    completed score is not that score at risk; the At-risk filter/counts; the
+    full announce ladder risk→nullified), the manual-verbatim wording tests,
+    the challenge-vs-review classification order, and the sound-gating audit
+    (every `playBoothAlert` call must be an 'at-risk'/'nullified' alert kind).
+    The perf harness still reports 39/39 games scanned, 156 feed events,
+    0 uncaught errors, 0 rate-limits, queue depth ≤ 1.
 
 The booth verification list above (item 15) is the score/status source: ESPN
 NCAA header events mirror the NFL scoreboard header the NFL booth polls at

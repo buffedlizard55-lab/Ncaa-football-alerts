@@ -1550,6 +1550,7 @@
     ['challenge', 'Challenges'],
     ['replay', 'Replay'],
     ['review', 'Under review'],
+    ['risk', 'At risk'],
     ['nullified', 'Nullified']
   ];
   var DAY_BOOTH_FILTERS = BOOTH_FILTERS.concat([['redzone', 'Red zone']]);
@@ -1572,6 +1573,13 @@
   var BOOTH_PASS_MAX_REFRESH = 8;
   var BOOTH_SEED_PASS_MAX = 12;
   var BOOTH_BUSY_DAY_GAME_MS = 400;    // per-live-game spacing on busy days
+  // How many plays back a flag/review/challenge/replay row may sit from the
+  // scoring play it can rule on and still count as "that score is at risk".
+  // The stoppage happens before anything else can intervene (the try waits for
+  // the verdict; a foul on the scoring down is enforced immediately), so the
+  // window is tight on purpose: a routine flag three plays after a score
+  // (e.g. on the kickoff) cannot remove that score and must not alert.
+  var BOOTH_RISK_LOOKBACK = 3;
   // Global cap on provider transport attempts. A browser keeps ~6 open
   // connections per origin (documented Chromium behaviour), and the app
   // relay is same-origin, so the booth is deliberately limited to
@@ -1634,7 +1642,7 @@
   }
 
   function boothKindCounts(events) {
-    var counts = { all: (events || []).length, flag: 0, penalty: 0, challenge: 0, replay: 0, review: 0, nullified: 0, redzone: 0 };
+    var counts = { all: (events || []).length, flag: 0, penalty: 0, challenge: 0, replay: 0, review: 0, risk: 0, nullified: 0, redzone: 0 };
     (events || []).forEach(function (e) {
       if (!e) return;
       if (e.kind === 'penalty' || e.kind === 'flag') {
@@ -1643,6 +1651,7 @@
       } else if (e.kind != null && counts[e.kind] != null) {
         counts[e.kind] += 1;
       }
+      if (boothEventScoreAtRisk(e)) counts.risk += 1;
       if (boothEventNullifies(e)) counts.nullified += 1;
       if (e.redZone) counts.redzone += 1;
     });
@@ -1652,21 +1661,26 @@
   function boothEventShown(e, filter) {
     if (!filter || filter === 'all') return true;
     if (filter === 'nullified') return boothEventNullifies(e);
+    if (filter === 'risk') return boothEventScoreAtRisk(e);
     if (filter === 'redzone') return !!(e && e.redZone);
     if (filter === 'flag') return !!(e && (e.kind === 'penalty' || e.kind === 'flag'));
     return !!(e && e.kind === filter);
   }
 
   // The all-games live booth has two different jobs:
-  //   1) the LIVE feed is intentionally narrow and shows ONLY confirmed
-  //      nullified scoring plays (the user's alert surface);
+  //   1) the LIVE feed is the alert surface: it shows every scoring play whose
+  //      points are AT RISK (a penalty, coach's challenge, replay review or
+  //      under-review row attached to the score before a verdict exists) plus
+  //      every confirmed nullified scoring play;
   //   2) the tracking tabs remain broad for audit/review, so flags,
   //      challenges, replay, under-review, red-zone and nullified rows are
   //      still discoverable without mixing routine events into the live feed.
   // These helpers keep that split testable and prevent future UI refactors from
   // accidentally reintroducing routine flags into the live section.
   function dayBoothLiveEvents(events) {
-    return (events || []).filter(function (e) { return boothEventNullifies(e); });
+    return (events || []).filter(function (e) {
+      return boothEventNullifies(e) || boothEventScoreAtRisk(e);
+    });
   }
 
   function dayBoothTrackingEvents(events, filter) {
@@ -1711,21 +1725,24 @@
     var nullifiedBadge = (!e.removesPoints && isNullified)
       ? '<span class="badge removed">NULLIFIED</span>'
       : '';
-    var atRiskBadge = (isPending && (boothMentionsScore(e.text) || e.relatedScoringPlay))
+    // At-risk now comes from the engine's risk decision (a scoring play with a
+    // pending flag/review/challenge attached), not from a generic pending row.
+    var isRisk = !isNullified && boothEventScoreAtRisk(e);
+    var atRiskBadge = isRisk
       ? '<span class="badge review at-risk">SCORE AT RISK</span>'
       : (isPending ? '<span class="badge review">REVIEW IN PROGRESS</span>' : '');
-    var related = isNullified && e.relatedScoringPlay && e.relatedScoringPlay.text
-      ? '<span class="booth-note">' + esc(e.relatedScoringPlay.text) + '</span>'
+    var related = (isNullified || isRisk) && e.relatedScoringPlay && e.relatedScoringPlay.text
+      ? '<span class="booth-note' + (isRisk ? ' at-risk' : '') + '">' + esc(e.relatedScoringPlay.text) + '</span>'
       : '';
-    var stateCls = isNullified ? ' removed' : (isPending ? ' at-risk' : '');
+    var stateCls = isNullified ? ' removed' : ((isRisk || isPending) ? ' at-risk' : '');
 
     return '<div class="booth-state' + stateCls + '">' +
       '<span class="bsh-label">Score</span> ' +
       '<span class="bsh-before">' + esc(before) + '</span> ' +
       '<span class="bsh-arrow">→</span> ' +
-      '<span class="bsh-during' + (e.removesPoints ? ' removed' : (isPending ? ' at-risk' : '')) + '">' + esc(during) + '</span> ' +
+      '<span class="bsh-during' + (e.removesPoints ? ' removed' : ((isRisk || isPending) ? ' at-risk' : '')) + '">' + esc(during) + '</span> ' +
       '<span class="bsh-arrow">→</span> ' +
-      '<span class="bsh-after' + (e.removesPoints ? ' removed' : '') + '">' + (isPending ? '? (REVIEW)' : esc(after)) + '</span> ' +
+      '<span class="bsh-after' + (e.removesPoints ? ' removed' : '') + '">' + ((isRisk || isPending) ? '? (PENDING)' : esc(after)) + '</span> ' +
       removedBadge +
       nullifiedBadge +
       atRiskBadge +
@@ -1770,7 +1787,8 @@
     var t = String(text || '');
     if (!t || !boothMentionsScore(t)) return false;
     if (/\bnullified\b/i.test(t)) return true;                 // explicit wording
-    if (/\bno play\b/i.test(t)) return true;                   // accepted foul wipes the down
+    if (/\bno play\b/i.test(t)) return true;                   // accepted foul wipes the down (verified live 2026-09-04: "... 1ST DOWN. NO PLAY")
+    if (/\bno (touchdown|safety|field goal|extra point)s?\b/i.test(t)) return true; // 2025 manual §6-1-d-2 verdict script: "After further review, the ruling is [evidence]. Therefore, [impact]" — an overturned score can be worded "no touchdown" with no "overturned" in the text
     if (/\breversed\b/i.test(t) || /\boverturned\b/i.test(t) || /\boverruled\b/i.test(t)) return true; // replay verdict
     if (/\bvoid the score\b/i.test(t) || /\berased\b/i.test(t)) return true;   // rulebook / write-up wording
     return false;
@@ -1786,21 +1804,100 @@
     return nullifiedScoreText(event.text);
   }
 
-  // Pure, testable decision for the live alert. `seen` tracks the last
-  // announced state for a feed key: absent = never seen, false = seen while
-  // NOT nullified, true = already alerted because it is (or became) nullified.
-  // A play that first appears as "under review" (not nullified) and is later
-  // OVERTURNED is re-announced once — on its final nullified state — so every
-  // nullified scoring play fires the alert exactly once. Returns null when the
-  // item should stay silent, otherwise { key, nullified } (the state to store).
-  function boothAnnounceStep(seen, key, isNullified) {
+  // A score is AT RISK when a booth event that can take it off the board is
+  // attached to a scoring play and no final decision exists yet — exactly the
+  // moment the user asked to be alerted: a touchdown/field goal/safety/PAT/2-pt
+  // is on the board AND a penalty, coach's challenge, replay review or
+  // under-review row names it (or sits within BOOTH_RISK_LOOKBACK plays of it).
+  // Wording verified line by line against the official sources in the README:
+  //   - 2025 NCAA Instant Replay Manual §6-1-b: the referee announces
+  //     "The play is under further review." (replay official) / "The (name of
+  //     institution) head coach has challenged the ruling of (state the
+  //     ruling). The play is under further review." — pending state.
+  //   - NCAA Rule 10 (10-2-5, AR 6-3-2 III/IV, AR 10-2-3 IV): fouls during a
+  //     touchdown/field goal down can keep, cancel or void the score, so a
+  //     flag on a scoring play is genuinely undecided until enforcement.
+  // This is the RAW predicate (no play-list context): the event's own text
+  // must name a score, or a scoring play must sit inside the tight risk window
+  // behind it (event.riskScoringPlay, filled by boothEventContext). An event
+  // that already nullifies is never "at risk" — the verdict is in, and the
+  // nullified alert path owns it.
+  function boothEventRiskPending(event) {
+    if (!event) return false;
+    if (boothEventNullifies(event)) return false;
+    var mentionsScore = boothMentionsScore(event.text) || !!event.riskScoringPlay;
+    if (!mentionsScore) return false;
+    var kind = event.kind;
+    if (kind !== 'penalty' && kind !== 'flag' &&
+        kind !== 'review' && kind !== 'challenge' && kind !== 'replay') return false;
+    var res = event.result;
+    // "under further review" → pending; a flag/replay row with no verdict word
+    // yet → also pending. Any decided wording (upheld/confirmed/stands/
+    // declined/offsetting/overturned) means the score's fate is known.
+    return res === 'pending' || res === '';
+  }
+
+  // An at-risk event resolves as soon as the provider publishes the verdict or
+  // resumes play: within the next few rows, either a verdict row lands
+  // (upheld/overturned/declined/…), or a non-booth play carries an explicit
+  // running score — proof the game moved on with the points kept. A pending
+  // "under review" row is normally the newest row, so nothing resolves until
+  // the feed actually answers. Nullification is detected separately by the
+  // running-score rollback in boothScoreEffect / nullifiedScoreText.
+  function boothRiskResolvedAhead(plays, index) {
+    if (!plays || index == null) return false;
+    for (var i = index + 1; i < plays.length && i <= index + 3; i += 1) {
+      var p = plays[i];
+      if (!p) continue;
+      if (/timeout/i.test(boothPlayType(p))) continue;
+      var res = boothResult(boothPlayText(p));
+      if (res && res !== 'pending') return true;                       // verdict row landed
+      if (!boothClassify(p) && boothHasExplicitScore(p)) return true;  // play resumed with a published score
+    }
+    return false;
+  }
+
+  // Public predicate: a contextualized event carries the resolved `atRisk`
+  // flag (computed by boothEventContext with the forward-resolution check);
+  // a raw boothEvent without context falls back to the pending-only decision.
+  function boothEventScoreAtRisk(event) {
+    if (!event) return false;
+    if (typeof event.atRisk === 'boolean') return event.atRisk;
+    return boothEventRiskPending(event);
+  }
+
+  // The alert ladder for one booth event:
+  //   0 = silent (routine flag / review with no score attached),
+  //   1 = SCORE AT RISK — the scoring play has a penalty/review/challenge/
+  //       replay attached and the decision is still pending (alert NOW, before
+  //       the verdict — this is the latency-critical half),
+  //   2 = NULLIFIED — the score came off the board (the original alert).
+  // Nullified outranks at-risk so the final state always wins.
+  function boothEventAlertLevel(event) {
+    if (boothEventNullifies(event)) return 2;
+    if (boothEventScoreAtRisk(event)) return 1;
+    return 0;
+  }
+
+  // Pure, testable decision for the live alert. `seen` tracks the highest
+  // announced level per feed key (0 = never seen, 1 = announced at risk,
+  // 2 = announced nullified). An alert fires only when the level RISES:
+  //   - a scoring play that appears with a flag/review/challenge alerts at
+  //     level 1 immediately (before any verdict exists);
+  //   - if it is later nullified (verdict or running-score rollback), it
+  //     re-alerts once at level 2 — the nullified tracking the user had;
+  //   - a risk that resolves cleanly (upheld / declined / penalty enforced
+  //     with the score kept) never alerts again;
+  //   - a play first seen already nullified alerts once at level 2.
+  // Returns null when the item should stay silent, otherwise { key, level }.
+  function boothAnnounceStep(seen, key, level) {
     if (!key) return null;
-    var prior = seen ? seen[key] : null;
-    if (prior === true) return null;                    // already alerted for this nullified state
-    if (prior === false && !isNullified) return null;   // seen non-nullified, still non-nullified
-    var next = !!isNullified;
-    if (seen) seen[key] = next;
-    return { key: key, nullified: next };
+    var lvl = (level === true || level === 2) ? 2 : (level ? 1 : 0);
+    var priorRaw = seen ? seen[key] : null;
+    var prior = (priorRaw === true) ? 2 : (typeof priorRaw === 'number' ? priorRaw : 0);
+    if (lvl <= prior) return null;
+    if (seen) seen[key] = lvl;
+    return { key: key, level: lvl };
   }
 
   // Classify the kind of a booth event. Operates on text and type, never on a
@@ -1809,8 +1906,14 @@
     if (!p) return '';
     var type = boothPlayType(p).toLowerCase();
     var text = boothPlayText(p);
-    if (/\bunder (further )?review\b/i.test(text) || type.indexOf('under review') !== -1) return 'review';
+    // Order matters and is wording-verified against the official script in the
+    // 2025 NCAA Instant Replay Manual §6-1-b: a head-coach challenge is ALWAYS
+    // announced as "The (institution) head coach has challenged the ruling of
+    // (ruling). The play is under further review." — the trailing sentence
+    // would otherwise swallow the row into the plain 'review' kind. Challenge
+    // is therefore tested before "under review".
     if (/\bchallenged\b/i.test(text) || /\bchallenge by\b/i.test(text) || type.indexOf('challenge') !== -1) return 'challenge';
+    if (/\bunder (further )?review\b/i.test(text) || type.indexOf('under review') !== -1) return 'review';
     if (/\breplay (official|review)\b/i.test(text) || /\bruling on the field\b/i.test(text) ||
         /\b(was|is) reversed\b/i.test(text) || /\b(was|is) overturned\b/i.test(text) ||
         /\b(was|is) overruled\b/i.test(text) || /\bupheld\b/i.test(text) ||
@@ -1938,7 +2041,9 @@
       team: null, // filled by boothEventContext via teamMap
       yardsToEndzone: null, // filled below
       redZone: false,
-      nullified: nullifiedScoreText(p.text)
+      nullified: nullifiedScoreText(p.text),
+      riskScoringPlay: null, // filled by boothEventContext (tight risk window)
+      atRisk: null // filled by boothEventContext (boolean once the play list is known)
     };
   }
 
@@ -2083,6 +2188,18 @@
     if (!event) return null;
     var effect = boothScoreEffect(plays, index);
     var related = boothNearestScoringPlay(plays, index);
+    // Tight association for the at-risk decision: only a scoring play within
+    // BOOTH_RISK_LOOKBACK rows of this flag/review/challenge counts as "this
+    // booth event can take that score off the board". A flag published on a
+    // kickoff/punt row (the common "foul on the kick after the score" shape,
+    // verified in the summary fixture) is excluded: a foul during the kick
+    // cannot remove the prior touchdown, try or field goal. Return-touchdown
+    // rows ("Kickoff Return Touchdown") are NOT excluded — a flagged return
+    // score is itself at risk through its own text.
+    var tight = null;
+    if (!/^(kickoff|punt|free kick)$/i.test(String(event.type || '').trim())) {
+      tight = boothNearestScoringPlay(plays, index, BOOTH_RISK_LOOKBACK);
+    }
     var t = boothTeamOf(teamMap, event.teamId);
     var withScores = Object.assign({}, event, {
       team: t,
@@ -2097,9 +2214,11 @@
       removesPoints: effect.removesPoints,
       pointsRemoved: effect.pointsRemoved,
       removedTeam: effect.team,
-      relatedScoringPlay: related
+      relatedScoringPlay: related,
+      riskScoringPlay: tight
     });
     withScores.nullified = boothEventNullifies(withScores);
+    withScores.atRisk = boothEventRiskPending(withScores) && !boothRiskResolvedAhead(plays, index);
     return withScores;
   }
 
@@ -2400,8 +2519,11 @@
       ncaaContestsOf: ncaaContestsOf, findNCAAContestForGame: findNCAAContestForGame,
       BOOTH_KINDS: BOOTH_KINDS, BOOTH_KIND_LABEL: BOOTH_KIND_LABEL, BOOTH_RESULT_LABEL: BOOTH_RESULT_LABEL,
       BOOTH_FILTERS: BOOTH_FILTERS, DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS, BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
+      BOOTH_RISK_LOOKBACK: BOOTH_RISK_LOOKBACK,
       boothClassify: boothClassify, boothResult: boothResult, boothMentionsScore: boothMentionsScore,
       nullifiedScoreText: nullifiedScoreText, boothEventNullifies: boothEventNullifies,
+      boothEventRiskPending: boothEventRiskPending, boothRiskResolvedAhead: boothRiskResolvedAhead,
+      boothEventScoreAtRisk: boothEventScoreAtRisk, boothEventAlertLevel: boothEventAlertLevel,
       boothAnnounceStep: boothAnnounceStep,
       boothScoreEffect: boothScoreEffect, boothEventContext: boothEventContext, boothEvent: boothEvent,
       boothEvents: boothEvents, dayBoothFeed: dayBoothFeed, reconcileDayBoothFeed: reconcileDayBoothFeed,
@@ -2456,8 +2578,9 @@
     seenPlayIds: {},
     pollers: [],
     // Live booth. booth.feed holds the day-wide audit list; the all-games
-    // live section renders only nullified scoring plays from it, while the
-    // separate tracking tabs and per-game tabs can still read every flag,
+    // live section renders scoring plays AT RISK (flag/review/challenge/
+    // replay attached, verdict pending) plus nullified scoring plays, while
+    // the separate tracking tabs and per-game tabs can still read every flag,
     // challenge, replay, under-review and red-zone event. booth.teamMaps is a
     // gameId -> teamMap so red-zone resolution can find team abbreviations.
     booth: {
@@ -2468,7 +2591,7 @@
       feed: [],              // reconciled day feed (dayBoothFeed shape)
       eventsByGame: {},      // gameId -> booth events for that game
       playsByGame: {},       // gameId -> normalized plays (raw cache, for sub-second live re-merge)
-      nullifiedByGame: {},   // gameId -> newest nullified event info ({removesPoints, points})
+      alertByGame: {},       // gameId -> newest alertable info ({level, removesPoints, points})
       teamMaps: {},          // gameId -> { teamId: {abbr, displayName, logo, color} }
       gamesByKey: {},        // gameId -> { id, shortName, awayAbbr, homeAbbr, date, live }
       lastAnnounced: {},     // gameId:eventKey -> announced sound key
@@ -2688,7 +2811,7 @@
       state.booth.lastLivePlays = {};
       state.booth.lastHeaderScores = {};
       state.booth.lastFetch = {};
-      state.booth.nullifiedByGame = {};
+      state.booth.alertByGame = {};
       state.booth.lastPass = null;
       state.booth.count = 0;
     } else if (showSpinner !== false) {
@@ -3060,8 +3183,13 @@
 
     var liveBooth = lastPlayBooth(g, state.booth.eventsByGame);
     var reviewBadge = (liveBooth && liveBooth.kind === 'review') ? '<span class="badge review">REVIEW</span>' : '';
-    var nullified = state.booth.nullifiedByGame && state.booth.nullifiedByGame[String(g.id)];
-    var nullBadge = nullified ? '<span class="badge removed">' + (nullified.removesPoints ? '−' + nullified.points + ' PTS' : 'NULLIFIED') + '</span>' : '';
+    var alertInfo = state.booth.alertByGame && state.booth.alertByGame[String(g.id)];
+    var nullBadge = (alertInfo && alertInfo.level === 2)
+      ? '<span class="badge removed">' + (alertInfo.removesPoints ? '−' + alertInfo.points + ' PTS' : 'NULLIFIED') + '</span>'
+      : '';
+    var riskBadge = (alertInfo && alertInfo.level === 1)
+      ? '<span class="badge review at-risk">SCORE AT RISK</span>'
+      : '';
 
     function teamSide(side, cls) {
       var t = g[side];
@@ -3100,8 +3228,8 @@
     }
 
     var meta = [];
-    if (reviewBadge || nullBadge) {
-      meta.push('<div style="display:flex;gap:4px;flex-wrap:wrap;">' + reviewBadge + nullBadge + '</div>');
+    if (reviewBadge || nullBadge || riskBadge) {
+      meta.push('<div style="display:flex;gap:4px;flex-wrap:wrap;">' + reviewBadge + riskBadge + nullBadge + '</div>');
     }
     if (g.broadcast) meta.push('<div><span class="gr-tv">' + esc(g.broadcast) + '</span>' + (g.neutralSite ? '<span>neutral</span>' : '') + '</div>');
     if (g.venueName) meta.push('<div>' + esc(g.venueCity ? g.venueName + ', ' + g.venueCity : g.venueName) + '</div>');
@@ -3115,7 +3243,9 @@
       meta.push('<div class="gr-leaders">' + leadParts.join(' • ') + '</div>');
     }
 
-    var rowCls = 'game-row state-' + ((sv.kind === 'live' || sv.kind === 'halftime') ? 'live' : sv.kind) + (nullified ? ' has-nullified' : '');
+    var rowCls = 'game-row state-' + ((sv.kind === 'live' || sv.kind === 'halftime') ? 'live' : sv.kind) +
+      ((alertInfo && alertInfo.level === 2) ? ' has-nullified' : '') +
+      ((alertInfo && alertInfo.level === 1) ? ' has-risk' : '');
 
     return '<article class="' + rowCls + '" data-id="' + esc(g.id) + '" role="link" tabindex="0" aria-label="' + esc(g.name) + '">' +
       '<div class="gr-status">' + stHtml + '</div>' +
@@ -3758,8 +3888,9 @@
   }
 
   // Shared tail of every booth refresh: rebuild a game's events, update the
-  // per-row NULLIFIED badge, reconcile the day feed, announce any nullified
-  // score (the only thing that ever chimes), and repaint. `game` is the parsed
+  // per-row AT-RISK / NULLIFIED badges, reconcile the day feed, announce any
+  // score at risk or nullified score (the only things that ever chime), and
+  // repaint. `game` is the parsed
   // scoreboard event; `plays` is the normalized play list (already including
   // the live last play when this is the fast path). Idempotent: re-running it
   // with the same data does not duplicate feed rows (dayBoothFeed + reconcile)
@@ -3768,14 +3899,7 @@
     var id = String(game.id);
     var tm = state.booth.teamMaps[id] || boothTeamMapFromGame(game);
     var events = rememberGameBooth(game, plays, tm);
-    var lastNullified = null;
-    for (var j = events.length - 1; j >= 0; j -= 1) {
-      if (boothEventNullifies(events[j])) { lastNullified = events[j]; break; }
-    }
-    state.booth.nullifiedByGame[id] = lastNullified ? {
-      removesPoints: !!lastNullified.removesPoints,
-      points: lastNullified.pointsRemoved || 0
-    } : null;
+    state.booth.alertByGame[id] = boothLatestAlert(events);
     var gk = state.booth.gamesByKey[id] || {};
     var perGame = [{
       id: id,
@@ -3807,12 +3931,35 @@
     return game;
   }
 
+  // Newest alertable booth state for one game (drives the per-row scoreboard
+  // badges): level 2 = a nullified scoring play, level 1 = a scoring play at
+  // risk with the verdict still pending, null = nothing alertable. Only the
+  // newest event counts — the badge reflects the current state of the game,
+  // not its history.
+  function boothLatestAlert(events) {
+    for (var j = (events || []).length - 1; j >= 0; j -= 1) {
+      var e = events[j];
+      var level = boothEventAlertLevel(e);
+      if (level > 0) {
+        return {
+          level: level,
+          removesPoints: !!e.removesPoints,
+          points: e.pointsRemoved || 0
+        };
+      }
+    }
+    return null;
+  }
+
   // Sub-second fast path (lowest-latency alert): re-merge the live header's
   // last play for ONE game into its cached booth events, re-announce, and
   // re-render — no per-game summary fetch. The header feed ticks every 250 ms;
-  // wiring this here means a "play is under review" / flag / overturned verdict
-  // reaches the alert sound and the feed on the header cadence instead of
-  // waiting for the paced 1 s per-game PBP pass. It is purely local (no
+  // wiring this here means a scoring play that arrives WITH a flag, an "under
+  // review" / challenge row, or an overturned/nullified verdict reaches the
+  // alert sound and the feed on the header cadence instead of waiting for the
+  // paced 1 s per-game PBP pass. This is the "alert me the moment points are
+  // in danger, before the verdict" path: boothEventAlertLevel fires level 1
+  // (SCORE AT RISK) directly off the merged row. It is purely local (no
   // provider request) and respects the paused flag.
   function refreshLiveBoothForGame(id) {
     if (state.view !== 'scoreboard' || state.booth.paused) return;
@@ -3902,7 +4049,7 @@
         if (g && g.id != null) byId[String(g.id)] = g;
         if (g && g.status && g.status.state === 'in' && g.playByPlayAvailable !== false) liveScannable += 1;
       });
-      if (!state.booth.nullifiedByGame) state.booth.nullifiedByGame = {};
+      if (!state.booth.alertByGame) state.booth.alertByGame = {};
       var perPass = mode === 'seed' ? BOOTH_SEED_PASS_MAX : BOOTH_PASS_MAX_REFRESH;
       var plan;
       if (mode === 'seed') {
@@ -3928,17 +4075,7 @@
             var fetched = await fetchPlaysForGame(game);
             if (run !== boothRun || state.view !== 'scoreboard') return; // invalidated mid-fetch
             var events = rememberGameBooth(game, fetched.plays);
-            var lastNullified = null;
-            for (var j = events.length - 1; j >= 0; j -= 1) {
-              if (boothEventNullifies(events[j])) {
-                lastNullified = events[j];
-                break;
-              }
-            }
-            state.booth.nullifiedByGame[id] = lastNullified ? {
-              removesPoints: !!lastNullified.removesPoints,
-              points: lastNullified.pointsRemoved || 0
-            } : null;
+            state.booth.alertByGame[id] = boothLatestAlert(events);
             state.booth.lastFetch[id] = { t: Date.now(), wasLive: !!(game.status && game.status.state === 'in') };
             state.booth.lastPass.fetched += 1;
             state.booth.lastError = null;
@@ -3984,12 +4121,14 @@
     return true;
   }
 
-  // Detect newly discovered nullified / red-zone events and play a short
-  // chime (when sound is on). boothAnnounceStep makes the decision: a play
-  // already announced as nullified stays silent, but a "under review" play that
-  // is later OVERTURNED is re-announced once for its final nullified state, so
-  // every nullified scoring play alerts the user exactly once. Only nullified
-  // scoring plays ever set shouldAlert — routine flags and reviews never chime.
+  // Detect newly alertable booth events and play the chime (when sound is
+  // on). boothAnnounceStep decides by level: 1 = a scoring play just came in
+  // with a pending flag / challenge / replay review (SCORE AT RISK — alerts
+  // immediately, before any verdict), 2 = a score actually came off the board
+  // (NULLIFIED — alerts, including the upgrade from a level-1 risk). A risk
+  // that resolves cleanly (upheld / declined / play resumed with the points
+  // kept) never chimes again. Routine flags, reviews of non-scoring plays and
+  // red-zone rows never chime at all.
   function boothEventSoundKey(item) {
     if (item && item.key != null) return String(item.key);
     return item ? ((item.gameId || '') + ':' + (item.id || (item.seq || '')) + ':' + (item.kind || '')) : '';
@@ -4005,7 +4144,7 @@
     }
   }
 
-  function playBoothAlert() {
+  function playBoothAlert(kind) {
     var ctx = state.booth.audioContext;
     if (!ctx) return;
     try {
@@ -4059,6 +4198,27 @@
         osc.start(t);
         osc.stop(t + 0.3);
       });
+
+      // --- Score-at-risk lead-in: three fast, high plips in the first
+      // half-second so "points are in danger right now" is instantly
+      // distinguishable from the calmer nullified chime. ---
+      if (kind === 'risk') {
+        [{ at: 0.02, freq: 1660 }, { at: 0.16, freq: 1660 }, { at: 0.30, freq: 1660 }].forEach(function (plip) {
+          var osc = ctx.createOscillator();
+          var gain = ctx.createGain();
+          var t = start + plip.at;
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(plip.freq, t);
+          osc.frequency.linearRampToValueAtTime(plip.freq * 0.6, t + 0.09);
+          gain.gain.setValueAtTime(0.0001, t);
+          gain.gain.linearRampToValueAtTime(0.09, t + 0.01);
+          gain.gain.linearRampToValueAtTime(0.0001, t + 0.14);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(t);
+          osc.stop(t + 0.18);
+        });
+      }
     } catch (e) {}
   }
 
@@ -4091,17 +4251,21 @@
   }
 
   function announceNewBoothEvents(fresh) {
-    var shouldAlert = false;
+    var nullifiedAlert = false;
+    var riskAlert = false;
     (fresh || []).forEach(function (item) {
       if (!item) return;
       var key = boothEventSoundKey(item);
-      var step = boothAnnounceStep(state.booth.lastAnnounced, key, boothEventNullifies(item));
+      var step = boothAnnounceStep(state.booth.lastAnnounced, key, boothEventAlertLevel(item));
       if (!step) return;
-      if (step.nullified) shouldAlert = true;
+      if (step.level === 2) nullifiedAlert = true;
+      else if (step.level === 1) riskAlert = true;
     });
-    if (shouldAlert && !state.booth.paused && state.booth.soundOn) {
-      playBoothAlert();
-    }
+    if (state.booth.paused || !state.booth.soundOn) return;
+    // A nullified verdict is the final truth; if both a fresh risk and a fresh
+    // nullified state arrive in one batch, the nullified chime leads.
+    if (nullifiedAlert) playBoothAlert('nullified');
+    else if (riskAlert) playBoothAlert('risk');
   }
 
   // Filter a booth event list by the active booth filter.
@@ -4138,18 +4302,21 @@
     var liveTag = liveNow ? '<span class="badge live">LIVE</span>' : '';
     var rz = e.redZone ? '<span class="badge rz">RZ</span>' : '';
     var isNullified = boothEventNullifies(e);
+    var isRisk = !isNullified && boothEventScoreAtRisk(e);
     var nullChip = (isNullified && !e.removesPoints)
       ? '<span class="badge removed">NULLIFIED</span>'
       : '';
+    var riskChip = isRisk ? '<span class="badge review at-risk">AT RISK</span>' : '';
     var stateHtml = boothScoreTrailHTML(e, e.awayAbbr, e.homeAbbr);
     var aria = esc(e.shortName) + ', ' + esc(kind) + ': ' + esc(e.text) +
       (e.removesPoints ? ', removed ' + esc(e.pointsRemoved) + ' points' : '') +
       (isNullified && !e.removesPoints ? ', score nullified' : '') +
+      (isRisk ? ', scoring play at risk' : '') +
       (e.redZone ? ', in the red zone' : '') +
       '. Open this game.';
 
     var kindCls = esc(e.kind || 'penalty');
-    var removedCls = isNullified ? ' pts-removed' : '';
+    var removedCls = isNullified ? ' pts-removed' : (isRisk ? ' score-risk' : '');
 
     return '<button type="button" class="day-msg booth-msg ' + kindCls + removedCls + '" data-id="' + esc(e.gameId) + '" aria-label="' + aria + '">' +
       '<div class="booth-msg-top">' +
@@ -4157,6 +4324,7 @@
       liveTag +
       '<span class="badge ' + kindCls + '">' + esc(kind) + '</span>' +
       rz +
+      riskChip +
       nullChip +
       (result ? '<span class="badge result ' + esc(e.result) + '">' + esc(result) + '</span>' : '') +
       '<span class="booth-when">' + esc(when) + '</span>' +
@@ -4247,33 +4415,41 @@
     var pbpSecs = Math.max(LIVE_REVIEWS_INTERVAL_MS, liveScannable * BOOTH_BUSY_DAY_GAME_MS) / 1000;
     var pbpLabel = pbpSecs % 1 ? pbpSecs.toFixed(1).replace(/\.0$/, '') + 's' : pbpSecs + 's';
 
-    var foot = 'LIVE shows only nullified scoring plays · flags/challenges/replay/under-review/red-zone stay in separate tracking tabs · pulled from ESPN play-by-play · ' +
-      'tracks score before → during → after when a score comes off the board · ' +
-      'scoring scope: touchdown, field goal, safety, PAT & 2-pt · score/status 0.25s · score-risk fetch ≤0.5s · play-by-play ' + pbpLabel + '/game' +
+    var foot = 'LIVE shows scoring plays at risk (flag · challenge · replay review · under review on the play) and nullified scores · routine flags stay in the tracking tabs · pulled from ESPN play-by-play · ' +
+      'tracks score before → during → after · scoring scope: touchdown, field goal, safety, PAT & 2-pt · score/status 0.25s · score-risk fetch ≤0.5s · play-by-play ' + pbpLabel + '/game' +
       (scannable ? ' · games scanned ' + scanned + ' of ' + scannable : '') +
       (liveCount ? ' · ' + liveCount + ' game' + (liveCount === 1 ? '' : 's') + ' live' : '');
 
-    // Top banner listing the day's nullified scores
+    // Top banner listing the day's at-risk and nullified scores
     var nullifiedAll = items.filter(boothEventNullifies);
+    var riskAll = items.filter(function (e) { return boothEventScoreAtRisk(e); });
     var topBanner = '';
-    if (nullifiedAll.length) {
-      var summary = nullifiedAll.slice(0, 3).map(function (e) {
-        var pts = e.removesPoints ? ' −' + e.pointsRemoved + 'pts' : '';
-        return esc((e.shortName || '') + (pts || ''));
-      }).join(', ');
-      var more = nullifiedAll.length > 3 ? ' +' + (nullifiedAll.length - 3) + ' more' : '';
-      topBanner = '<div class="booth-banner removed-banner day-removed-banner">' +
-        '<span class="badge removed">' + nullifiedAll.length + ' NULLIFIED</span>' +
-        '<span>Scores taken off the board: ' + summary + more + ' – filter Nullified.</span>' +
-        '</div>';
+    if (riskAll.length || nullifiedAll.length) {
+      var parts = [];
+      if (riskAll.length) {
+        parts.push('<span class="badge review at-risk">' + riskAll.length + ' AT RISK</span>' +
+          '<span>Scoring plays with a pending flag/review/challenge: ' +
+          riskAll.slice(0, 3).map(function (e) { return esc(e.shortName || ''); }).join(', ') +
+          (riskAll.length > 3 ? ' +' + (riskAll.length - 3) + ' more' : '') + ' – filter At risk.</span>');
+      }
+      if (nullifiedAll.length) {
+        var summary = nullifiedAll.slice(0, 3).map(function (e) {
+          var pts = e.removesPoints ? ' −' + e.pointsRemoved + 'pts' : '';
+          return esc((e.shortName || '') + (pts || ''));
+        }).join(', ');
+        var more = nullifiedAll.length > 3 ? ' +' + (nullifiedAll.length - 3) + ' more' : '';
+        parts.push('<span class="badge removed">' + nullifiedAll.length + ' NULLIFIED</span>' +
+          '<span>Scores taken off the board: ' + summary + more + ' – filter Nullified.</span>');
+      }
+      topBanner = '<div class="booth-banner removed-banner day-removed-banner">' + parts.join(' ') + '</div>';
     }
 
     var liveBody;
     if (!liveItems.length) {
       liveBody = '<div class="booth-empty">' +
         (scanned < scannable
-          ? 'Scanning today’s games for nullified scoring plays… routine flags and reviews are held in the tabs below.'
-          : 'No nullified scoring plays today — no touchdown, field goal, safety, PAT or 2-pt conversion has been taken off the board.') +
+          ? 'Scanning today’s games — a scoring play with a flag, challenge or replay review (at risk) or a score taken off the board (nullified) will appear and alert here immediately.'
+          : 'No scoring plays at risk or nullified today — no touchdown, field goal, safety, PAT or 2-pt conversion has a pending flag/review/challenge, and none has been taken off the board.') +
         '</div>';
     } else {
       liveBody = '<div class="day-feed">' +
@@ -4304,8 +4480,8 @@
         '</div>';
     }
 
-    var body = '<section class="booth-live-only" aria-label="Live nullified scoring plays">' +
-      '<div class="booth-section-title"><span>Live nullified scoring plays</span><small>Only these rows can alert.</small></div>' +
+    var body = '<section class="booth-live-only" aria-label="Live scoring plays at risk and nullified">' +
+      '<div class="booth-section-title"><span>Live scoring alerts</span><small>Scoring plays at risk (pending flag / challenge / review) and nullified — only these rows alert.</small></div>' +
       liveBody +
       '</section>' +
       '<section class="booth-tracking-tabs" aria-label="Tracked flags, reviews and red-zone events">' +
@@ -4316,13 +4492,13 @@
 
     var soundOn = !!state.booth.soundOn;
     var soundTitle = soundOn
-      ? 'Alert sound ON - a gentle rain sound plays only when a score is nullified. Click to mute.'
-      : 'Alert sound OFF - click to enable nullified-score alerts.';
+      ? 'Alert sound ON - plays the moment a scoring play has a pending flag/challenge/review (at risk), and again when a score is nullified. Click to mute.'
+      : 'Alert sound OFF - click to enable at-risk and nullified-scoring alerts.';
 
     return '<div class="booth">' +
       '<div class="booth-head">' +
       '<div class="booth-head-main">' +
-      '<span class="booth-title"><span class="dot"></span> Live booth · nullified scoring plays · all games</span>' +
+      '<span class="booth-title"><span class="dot"></span> Live booth · scoring plays at risk &amp; nullified · all games</span>' +
       '<div class="booth-sub">' + esc(foot) + '</div>' +
       '</div>' +
       '<button type="button" class="day-sound-btn' + (soundOn ? ' on' : '') + '" title="' + esc(soundTitle) + '">' +
@@ -4377,6 +4553,14 @@
     var livePending = !!(state.game && state.game.status && state.game.status.state === 'in' && lastPlay &&
       (boothClassify(lastPlay) === 'review' || boothResult(lastText) === 'pending'));
 
+    var riskEvents = events.filter(function (e) { return boothEventScoreAtRisk(e); });
+    var riskBanner = riskEvents.length
+      ? '<div class="booth-banner">' +
+        '<span class="badge review at-risk">' + riskEvents.length + ' AT RISK</span>' +
+        '<span>Scoring play' + (riskEvents.length === 1 ? '' : 's') + ' with a pending flag / challenge / review – verdict not yet decided.</span>' +
+        '</div>'
+      : '';
+
     var nullifiedEvents = events.filter(boothEventNullifies);
     var nullifiedBanner = (!livePending && nullifiedEvents.length)
       ? '<div class="booth-banner removed-banner">' +
@@ -4413,7 +4597,7 @@
         '</div>';
     }
 
-    var banner = underReviewBanner + nullifiedBanner + rzBanner;
+    var banner = underReviewBanner + riskBanner + nullifiedBanner + rzBanner;
 
     var body;
     if (!visible.length) {
@@ -4790,11 +4974,15 @@
       rows.forEach(function (p) {
         var bEvent = boothById[String(p.id)];
         var isNullified = boothEventNullifies(bEvent);
+        var isRisk = !isNullified && boothEventScoreAtRisk(bEvent);
         var cls = 'pb-row';
         if (isNullified) cls += ' pts-removed';
+        else if (isRisk) cls += ' score-risk';
         var tags = '';
         if (isNullified) {
           tags = '<span class="pb-tag removed">' + (bEvent && bEvent.removesPoints ? '−' + bEvent.pointsRemoved + ' PTS REMOVED' : 'NULLIFIED') + '</span>';
+        } else if (isRisk) {
+          tags = '<span class="pb-tag review">SCORE AT RISK</span>';
         } else if (p.scoringPlay) {
           cls += ' score';
           tags = '<span class="pb-tag ' + (String(p.scoringType || '').indexOf('TD') >= 0 ? 'td' : 'fg') + '">' + esc(p.scoringType || 'SCORE') + '</span>';
@@ -4955,6 +5143,8 @@
         filter: state.booth.filter,
         paused: state.booth.paused,
         perGame: Object.keys(state.booth.eventsByGame).length,
+        atRisk: (state.booth.feed || []).filter(function (e) { return boothEventScoreAtRisk(e); }).length,
+        nullified: (state.booth.feed || []).filter(function (e) { return boothEventNullifies(e); }).length,
         pass: state.booth.lastPass,
         passInFlight: !!state.booth.passInFlight,
         pbpIntervalMs: state.booth.pbpIntervalMs,
@@ -5251,11 +5441,16 @@
     BOOTH_FILTERS: BOOTH_FILTERS,
     DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS,
     BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
+    BOOTH_RISK_LOOKBACK: BOOTH_RISK_LOOKBACK,
     boothClassify: boothClassify,
     boothResult: boothResult,
     boothMentionsScore: boothMentionsScore,
     nullifiedScoreText: nullifiedScoreText,
     boothEventNullifies: boothEventNullifies,
+    boothEventRiskPending: boothEventRiskPending,
+    boothRiskResolvedAhead: boothRiskResolvedAhead,
+    boothEventScoreAtRisk: boothEventScoreAtRisk,
+    boothEventAlertLevel: boothEventAlertLevel,
     boothAnnounceStep: boothAnnounceStep,
     boothScoreEffect: boothScoreEffect,
     boothEventContext: boothEventContext,
