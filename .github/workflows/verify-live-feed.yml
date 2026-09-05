@@ -1,0 +1,109 @@
+name: Live feed verification (temporary)
+
+# Temporary, manually dispatched verification job. Scans the live ESPN
+# college-football feed for real review / challenge / penalty / nullified
+# play rows and prints them (plus nearby context) to the run log for
+# line-by-line classifier verification. Not part of app runtime.
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Scoreboard date YYYYMMDD (Eastern)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Scan live feed for booth rows
+        run: |
+          cat > /tmp/scan.js <<'EOF'
+          const DAY = process.env.SCAN_DATE || new Date().toISOString().slice(0,10).replace(/-/g,'');
+          const UA = { headers: { 'user-agent': 'Mozilla/5.0 (verification script; scoreboard app)' } };
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+          async function get(url) {
+            for (let a = 0; a < 3; a++) {
+              try {
+                const r = await fetch(url, UA);
+                if (r.status === 429) { await sleep(1500); continue; }
+                if (!r.ok) throw new Error(r.status + ' ' + url);
+                return await r.json();
+              } catch (e) { if (a === 2) throw e; await sleep(1000); }
+            }
+          }
+          function rowOf(p) {
+            return {
+              id: p.id, seq: p.sequenceNumber, type: p.type && p.type.text,
+              typeId: p.type && p.type.id, text: p.text, scoringPlay: p.scoringPlay,
+              scoreValue: p.scoreValue, isPenalty: p.isPenalty,
+              awayScore: p.awayScore, homeScore: p.homeScore,
+              period: p.period && p.period.number, clock: p.clock && p.clock.displayValue,
+              start: p.start && { yardsToEndzone: p.start.yardsToEndzone, downDistanceText: p.start.downDistanceText },
+              modified: p.modified
+            };
+          }
+          (async () => {
+            console.log('SCAN_DATE=' + DAY);
+            // 1) scoreboard for the day
+            const sb = await get('https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard?dates=' + DAY + '&limit=300');
+            const evs = (sb.events || []).filter(e => e.status && e.status.type && (e.status.type.state === 'in' || e.status.type.state === 'post'));
+            console.log('SCOREBOARD events=' + (sb.events||[]).length + ' scannable=' + evs.length);
+            const rx = /review|challeng|PENALTY|nullif|overturn|revers(ed|ing)|upheld|No Play|official/i;
+            const scoringRx = /touchdown|field goal|safety|extra point|two-point|PAT/i;
+            let matchedGames = 0, totalPlays = 0;
+            for (const e of evs.slice(0, 40)) {
+              try {
+                let plays = [], page = 1;
+                for (;;) {
+                  const d = await get('https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/' + e.id + '/competitions/' + e.id + '/plays?limit=100&page=' + page);
+                  const items = d.items || [];
+                  plays = plays.concat(items);
+                  if (page >= (d.pageCount || 1)) break;
+                  page++;
+                  await sleep(120);
+                }
+                totalPlays += plays.length;
+                const hits = [];
+                plays.forEach((p, i) => {
+                  const t = p.text || '';
+                  const isBoothish = rx.test(t) || (p.type && rx.test(p.type.text || '')) || p.isPenalty;
+                  const scoreish = p.scoringPlay || scoringRx.test(t) || (p.type && scoringRx.test(p.type.text || ''));
+                  if (isBoothish || (scoreish && p.isPenalty)) {
+                    hits.push({ i, row: rowOf(p), context: plays.slice(Math.max(0, i - 3), i + 4).map(rowOf) });
+                  }
+                });
+                if (hits.length) {
+                  matchedGames++;
+                  const name = e.shortName || e.name;
+                  console.log('\n=== GAME ' + e.id + ' ' + name + ' (' + e.status.type.state + ') plays=' + plays.length + ' hits=' + hits.length);
+                  hits.slice(0, 8).forEach(h => {
+                    console.log('HIT at index ' + h.i + ': ' + JSON.stringify(h.row));
+                    h.context.forEach((c, j) => console.log('  ctx' + (h.i - 3 + j) + ': ' + JSON.stringify(c)));
+                  });
+                }
+                await sleep(150);
+              } catch (err) { console.log('GAME ' + e.id + ' error: ' + err.message); }
+            }
+            console.log('\nTOTAL plays scanned=' + totalPlays + ' matchedGames=' + matchedGames);
+            // 2) header feed situation snapshot (first live games)
+            try {
+              const hdr = await get('https://site.web.api.espn.com/apis/v2/scoreboard/header?sport=football&league=college-football');
+              const hevs = [];
+              (hdr.sports || []).forEach(s => (s.leagues || []).forEach(l => (l.events || []).forEach(ev => hevs.push(ev))));
+              const live = hevs.filter(ev => ev.status === 'in');
+              console.log('HEADER events=' + hevs.length + ' live=' + live.length);
+              live.slice(0, 6).forEach(ev => {
+                const lp = ev.situation && ev.situation.lastPlay;
+                if (lp) console.log('HEADER lastPlay ' + ev.id + ' ' + ev.shortName + ': ' + JSON.stringify({ id: lp.id, type: lp.type && lp.type.text, text: lp.text, scoringPlay: lp.scoringPlay, isPenalty: lp.isPenalty, awayScore: lp.awayScore, homeScore: lp.homeScore, start: lp.start }));
+              });
+            } catch (err) { console.log('HEADER error: ' + err.message); }
+          })().catch(e => { console.error('FATAL ' + e.message); process.exit(1); });
+          EOF
+          node /tmp/scan.js
+        env:
+          SCAN_DATE: ${{ github.event.inputs.date }}
