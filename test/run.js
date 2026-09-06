@@ -1423,6 +1423,132 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.LANE_BOOTH, 2);
   });
 
+  // ---- lowest-latency wiring: adaptive header cadence, hot verdict loop,
+  // worker metronome, cache-busted fast fetches (2026-09-05) ----
+  test('liveTickerIntervalMs picks the 200ms hot header cadence only while a score is at risk', () => {
+    assert.strictEqual(NB.LIVE_SCORES_INTERVAL_MS, 250);
+    assert.strictEqual(NB.LIVE_SCORES_HOT_INTERVAL_MS, 200);
+    assert.strictEqual(NB.liveTickerIntervalMs(0), 250, 'no hot games -> base cadence');
+    assert.strictEqual(NB.liveTickerIntervalMs(3), 200, 'any hot game -> hot cadence');
+    assert.strictEqual(NB.liveTickerIntervalMs(1, 1000, 200), 200, 'explicit overrides honored');
+    assert.strictEqual(NB.liveTickerIntervalMs(0, 1000, 200), 1000);
+    assert.ok(NB.LIVE_SCORES_HOT_INTERVAL_MS < NB.LIVE_SCORES_INTERVAL_MS, 'hot must be faster than base');
+    assert.ok(NB.LIVE_TICKER_STEP_MS <= NB.LIVE_SCORES_HOT_INTERVAL_MS, 'metronome must resolve the hot cadence');
+    assert.ok(NB.LIVE_HEADER_TIMEOUT_MS < 4000, 'header timeout must bound a degraded transport chain');
+  });
+
+  test('boothHasUnresolvedRisk: only a pending at-risk scoring play keeps a game hot', () => {
+    const atRisk = { kind: 'review', text: 'The play is under further review.', result: 'pending', atRisk: true };
+    const nullified = { kind: 'replay', text: 'After further review, the ruling is overturned. Therefore, no touchdown.', atRisk: false, removesPoints: true };
+    const routine = { kind: 'penalty', text: 'PENALTY MIZ Holding, 10 yards', atRisk: false };
+    assert.strictEqual(NB.boothHasUnresolvedRisk([atRisk]), true);
+    assert.strictEqual(NB.boothHasUnresolvedRisk([routine, atRisk]), true);
+    assert.strictEqual(NB.boothHasUnresolvedRisk([routine]), false, 'a routine flag is never hot');
+    assert.strictEqual(NB.boothHasUnresolvedRisk([nullified]), false, 'a decided nullified row is not unresolved risk');
+    assert.strictEqual(NB.boothHasUnresolvedRisk([]), false);
+    assert.strictEqual(NB.boothHasUnresolvedRisk(null), false);
+  });
+
+  test('boothHotGameIds: unresolved-risk first, armed window second, expired windows dropped, cap honored', () => {
+    const now = 1000000;
+    const riskEv = [{ kind: 'review', text: 'The play is under further review.', result: 'pending', atRisk: true }];
+    const clean = [{ kind: 'penalty', text: 'PENALTY MIZ Holding, 10 yards', atRisk: false }];
+    const eventsByGame = {
+      g1: clean, g2: riskEv, g3: clean, g4: clean, g5: clean
+    };
+    // g1/g3 armed by the header fast path; g1 still inside its window, g3 expired.
+    const hotUntil = { g1: now + 5000, g3: now - 1 };
+    assert.deepStrictEqual(NB.boothHotGameIds(eventsByGame, hotUntil, now, 4), ['g2', 'g1'],
+      'risk game first, then live windows; expired window and un-armed games excluded');
+    // Cap: 3 risk/window games, cap 2 -> the risk game plus the first window id.
+    const hotUntil2 = { g1: now + 5000, g4: now + 9999 };
+    assert.deepStrictEqual(NB.boothHotGameIds(eventsByGame, hotUntil2, now, 2), ['g2', 'g1']);
+    // More risk games than the cap: deterministic id order, capped.
+    const many = { a: riskEv, b: riskEv, c: riskEv };
+    assert.deepStrictEqual(NB.boothHotGameIds(many, {}, now, 2), ['a', 'b']);
+    assert.deepStrictEqual(NB.boothHotGameIds({}, {}, now, 4), []);
+    assert.ok(NB.LIVE_HOT_GAME_INTERVAL_MS <= 800 && NB.LIVE_HOT_GAME_INTERVAL_MS >= 250,
+      'hot cadence must beat the busy-day pacing (15.6s on 39 games) decisively');
+    assert.ok(NB.LIVE_HOT_WINDOW_MS > 0 && NB.LIVE_HOT_MAX_WINDOW_MS > NB.LIVE_HOT_WINDOW_MS,
+      'the armed window needs an absolute per-episode cap');
+  });
+
+  test('live merge: a stale header copy of the scoring play must not resolve a pending review (harness-found regression, 2026-09-05)', () => {
+    // The fast paths create this transition deliberately: the immediate PBP
+    // fetch lands a summary that already contains TD + "under further
+    // review", while the slower header feed still publishes the TD itself as
+    // lastPlay. The stale TD copy used to be appended AFTER the review row
+    // (or replace it with a bogus seq), making boothRiskResolvedAhead read
+    // "play resumed with a published score" — the at-risk alert never fired.
+    const plays = [
+      boothNorm({ id: 't1', sequenceNumber: '1', text: '#2x D.Smith pass complete for 8 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 't2', sequenceNumber: '2', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 't3', sequenceNumber: '3', text: 'The play is under further review.', type: { text: 'Timeout' }, awayScore: 0, homeScore: 7 })
+    ];
+    const liveVariants = [
+      boothNorm({ id: 'hdr-noseq', sequenceNumber: undefined, text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }), // real header shape: no sequenceNumber
+      boothNorm({ id: 'hdr-seq0', sequenceNumber: '0', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 'hdr-oob', sequenceNumber: '950', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }) // out-of-band seq must not move the row
+    ];
+    liveVariants.forEach((liveTD) => {
+      const evs = NB.boothEvents(plays, liveTD, {});
+      const review = evs.find((e) => e.text.indexOf('further review') !== -1);
+      assert.ok(review, 'the review row must be a booth event');
+      assert.strictEqual(review.atRisk, true, 'the pending review of the TD must stay AT RISK for live copy id=' + liveTD.id);
+      assert.strictEqual(NB.boothEventAlertLevel(review), 1, 'alert level 1 (score at risk), not resolved/nullified');
+      assert.strictEqual(review.relatedScoringPlay && review.relatedScoringPlay.text, '#88 H.Loop rush for 50 yards TOUCHDOWN');
+    });
+    // And once the verdict lands behind it, the same review row resolves and
+    // the nullified row (not the review row) owns the alert.
+    const verdictPlays = plays.concat([
+      boothNorm({ id: 't4', sequenceNumber: '4', text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.', type: { text: 'Play Overturned' }, awayScore: 0, homeScore: 0 })
+    ]);
+    const evs2 = NB.boothEvents(verdictPlays, liveVariants[0], {});
+    const review2 = evs2.find((e) => e.text.indexOf('further review') !== -1);
+    const verdict2 = evs2.find((e) => e.text.indexOf('nullified') !== -1);
+    assert.strictEqual(review2.atRisk, false, 'verdict landed: the risk is resolved');
+    assert.ok(NB.boothEventNullifies(verdict2), 'the verdict row nullifies');
+    assert.strictEqual(NB.boothEventAlertLevel(verdict2), 2);
+    assert.strictEqual(verdict2.pointsRemoved, 7);
+  });
+
+  test('freshBustUrl appends the provider-accepted _= buster without breaking the query', () => {
+    assert.strictEqual(NB.freshBustUrl('https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401856668', 123),
+      'https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401856668&_=123');
+    assert.strictEqual(NB.freshBustUrl('https://example.com/plays?limit=400', 7),
+      'https://example.com/plays?limit=400&_=7');
+    assert.strictEqual(NB.freshBustUrl('https://example.com/no-query', 9), 'https://example.com/no-query?_=9');
+    assert.ok(NB.freshBustUrl('https://example.com/x').indexOf('_=') !== -1, 'default timestamp when none given');
+    assert.strictEqual(NB.freshBustUrl(''), '');
+  });
+
+  test('live ticker wiring: worker metronome drives the header poll + hot loop and survives a hidden tab', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
+    assert.match(src, /function createTickerClock\s*\(/, 'worker metronome must exist');
+    assert.match(src, /new Worker\(url\)/, 'a dedicated worker must deliver the ticks');
+    assert.match(src, /function liveTickerStep\s*\(/);
+    assert.match(src, /startLiveTicker\(\);?\s*\n?\s*}/, 'the scoreboard pollers must start the ticker');
+    assert.match(src, /stopPolling\(\)\s*\{\s*\n\s*stopLiveTicker\(\);/, 'stopPolling must tear the ticker down');
+    assert.match(src, /var hotCount = boothHotLoopTick\(\);/, 'the tick runs the hot loop every step');
+    assert.match(src, /liveTickerNextHeaderAt = now \+ liveTickerIntervalMs\(hotCount\);/, 'the header cadence must adapt to the hot count');
+    // The old hidden-tab hole: the 250 ms header interval used to bail on
+    // document.hidden, so a backgrounded tab stopped reading the feed exactly
+    // when an alert had to fire (and Chrome aligns hidden DOM timers to 1s /
+    // 1min — see README). The ticker step must not re-introduce that guard.
+    const step = src.slice(src.indexOf('function liveTickerStep('), src.indexOf('function startLiveTicker('));
+    assert.ok(!/document\.hidden/.test(step), 'the ticker step must run while the tab is hidden');
+    // Hidden tabs alert but skip paints; the announce call stays outside the paint guard.
+    const apply = src.slice(src.indexOf('function applyBoothGame('), src.indexOf('function boothGameFromId('));
+    assert.ok(apply.indexOf('announceNewBoothEvents(fresh);') < apply.indexOf('if (!pageHidden())'), 'alerts must fire before any paint guard');
+    assert.match(src, /function refreshLiveScores/, 'header poll entry point exists');
+    const rls = src.slice(src.indexOf('async function refreshLiveScores'), src.indexOf('function dayBoothPoll'));
+    assert.ok(!/document\.hidden/.test(rls), 'refreshLiveScores must read the feed regardless of visibility (pageHidden only skips paints)');
+    assert.match(src, /Object\.keys\(scoreRiskDirty\)\.forEach\(function \(gid\) \{\s*\n\s*armBoothHotGame\(gid\);/, 'a header-detected at-risk score must arm the hot loop');
+    assert.match(src, /Object\.keys\(scoreDropDirty\)\.forEach\(function \(gid\) \{\s*\n\s*armBoothHotGame\(gid\);/, 'a header-detected score drop must arm the hot loop');
+    // Fast/hot fetches must bypass the relay micro-cache and the booth lane queue.
+    assert.match(src, /await fetchPlaysForGame\(game, \{ fresh: true, lane: LANE_AUX \}\);/, 'fast paths fetch fresh on the secondary lane');
+  });
+
   test('scoreboard wiring helpers are all defined (lastPlayBooth regression: an undefined reference in game-row rendering blanked the whole scoreboard)', () => {
     const src = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
     assert.match(src, /function lastPlayBooth\s*\(/, 'lastPlayBooth must be defined');

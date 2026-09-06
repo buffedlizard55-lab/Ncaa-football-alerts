@@ -254,6 +254,61 @@ const NEXT_EVENTS = [0, 1, 2].map(i => {
 });
 
 // ---- summaries: big, play-bearing, with review + nullified-score rows ----
+// ---- scripted at-risk hot window (latency measurement, added 2026-09-05) ----
+// At a chosen virtual time, one live game publishes a touchdown that is
+// immediately under review (an UNRESOLVED at-risk score — nothing resolves
+// it), and a few seconds later the verdict nullifies it. This measures end
+// to end how fast the all-games feed surfaces (1) the at-risk alert and
+// (2) the nullified verdict: exactly the latency the hot verdict loop,
+// adaptive header cadence and worker ticker exist to cut. The runner text is
+// tagged 'H.Loop' so the measurement cannot match the static fixture rows.
+const HOT_GAME = GAMES[0];
+let hotPhase = 'idle'; // idle -> risk -> verdict
+const hotHeader = { lastPlay: null };
+const HOT = { summaryFetches: 0, riskAlertMs: null, verdictAlertMs: null, routineWouldBeMs: null };
+function setHotPhase(phase) {
+  hotPhase = phase;
+  SUMMARY_CACHE.clear(); // the hot game's summary content changes with the phase
+  if (phase === 'risk') {
+    HOT_GAME.hScore += 7; // the TD is on the board while the review pends
+    hotHeader.lastPlay = {
+      id: HOT_GAME.id + '-hotrisk',
+      // Real header lastPlays carry no sequenceNumber (verified live
+      // 2026-09-05) — the merge must place the row by identity, not seq.
+      text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true,
+      type: { id: '43', text: 'Rushing Touchdown', abbreviation: 'TD' },
+      period: { number: 2 }, clock: { displayValue: '5:12' },
+      // Score fields mirror the summary's RUNNING totals for this play (the
+      // away total at this point in the synthetic drive is 0) — a real
+      // provider keeps lastPlay and play-by-play totals consistent, and the
+      // booth's rollback math rightly reads any discrepancy as a score
+      // correction.
+      awayScore: 0, homeScore: HOT_GAME.hScore, scoreValue: 6, isPenalty: false,
+      teamParticipants: [{ team: { id: Number(HOT_GAME.hm[0]) }, id: String(HOT_GAME.hm[0]), type: 'offense' }]
+    };
+  } else if (phase === 'verdict') {
+    HOT_GAME.hScore -= 7; // points off the board
+    hotHeader.lastPlay = {
+      id: HOT_GAME.id + '-hotverdict',
+      text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.',
+      type: { id: '98', text: 'Play Overturned', abbreviation: 'OVR' },
+      period: { number: 2 }, clock: { displayValue: '4:58' },
+      awayScore: 0, homeScore: HOT_GAME.hScore, scoreValue: 0, isPenalty: false,
+      teamParticipants: [{ team: { id: Number(HOT_GAME.hm[0]) }, id: String(HOT_GAME.hm[0]), type: 'offense' }]
+    };
+  }
+}
+function hotRows(push, h) {
+  // The flagged score: points on the board, review pending, no verdict.
+  // During 'verdict', the overturn + enforcement rows land and the running
+  // score rolls back — the nullified shape the booth must alert on.
+  push({ text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { id: '43', text: 'Rushing Touchdown', abbreviation: 'TD' }, scoreValue: 6, awayScore: 0, homeScore: h + 7, start: { down: 2, distance: 3, yardLine: 50, yardsToEndzone: 50, downDistanceText: '2nd & 3', possessionText: 'MID 50', team: { id: Number(HOT_GAME.hm[0]) } }, end: { down: 0, distance: 0, yardLine: 0, yardsToEndzone: 0, downDistanceText: '', possessionText: '', team: { id: Number(HOT_GAME.hm[0]) } } });
+  push({ text: 'The play is under further review.', type: { id: '90', text: 'Timeout', abbreviation: 'TO' }, awayScore: 0, homeScore: h + 7 });
+  if (hotPhase === 'verdict') {
+    push({ text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.', type: { id: '98', text: 'Play Overturned', abbreviation: 'OVR' }, awayScore: 0, homeScore: h });
+    push({ text: `PENALTY ${HOT_GAME.hm[3]} Holding (#61 T.Baker) 10 yards from ${HOT_GAME.hm[1]}50 to ${HOT_GAME.hm[1]}40`, isPenalty: true, type: { id: '97', text: 'Penalty', abbreviation: 'PEN' }, penalty: { yards: 10, type: { text: 'Holding' } }, awayScore: 0, homeScore: h });
+  }
+}
 function buildSummary(g) {
   const plays = [];
   let seq = 0, a = 0, h = 0;
@@ -269,6 +324,9 @@ function buildSummary(g) {
   // A trailing-phrase flag on a kickoff — the other verified booth case.
   push({ text: `#${99} K.Boyd kickoff 65 yards to the ${g.aw[1]}00 #11 D.Fowlkes return 33 yards to the ${g.aw[1]}33, End Of Play PENALTY ${g.aw[3]} Holding (#45 C.Weselman) 7 yards from ${g.aw[1]}14 to ${g.aw[1]}07`, isPenalty: false });
   for (let i = 0; i < 6; i++) push({ text: `#${20 + i} D.Smith pass complete to #7 L.Jones for ${5 + i * 3} yards` });
+  // The scripted at-risk window rides at the END of the play list so the
+  // pending review row is the newest play (nothing resolves it ahead).
+  if (String(g.id) === HOT_GAME.id && hotPhase !== 'idle') hotRows(push, h);
   // padding to realistic payload size
   const target = SUMMARY_KB * 1024;
   const base = {
@@ -301,7 +359,9 @@ function headerPayload() {
       status: g.live ? 'in' : 'final',
       fullStatus: { clock: g.live ? 391 : 0, displayClock: g.live ? '6:31' : '0:00', period: 2, type: { id: g.live ? '2' : '3', name: g.live ? 'STATUS_IN_PROGRESS' : 'STATUS_FINAL', state: g.live ? 'in' : 'post', completed: !g.live, description: g.live ? 'In Progress' : 'Final', detail: '', shortDetail: '' } },
       competitors: [{ id: Number(g.aw[0]), homeAway: 'away', score: String(g.aScore), winner: false }, { id: Number(g.hm[0]), homeAway: 'home', score: String(g.hScore), winner: g.live ? false : g.hScore > g.aScore }],
-      situation: g.live ? { lastPlay: { id: `${g.id}-live`, sequenceNumber: '900', text: `#${22} L.Bell rush for 6 yards`, type: { id: '51', text: 'Rushing', abbreviation: 'RUSH' }, period: { number: 2 }, clock: { displayValue: '6:28' }, awayScore: g.aScore, homeScore: g.hScore, isPenalty: false, teamParticipants: [{ team: { id: Number(g.hm[0]) }, id: String(g.hm[0]), type: 'offense' }] } } : undefined
+      situation: g.live ? { lastPlay: (String(g.id) === HOT_GAME.id && hotPhase !== 'idle')
+        ? hotHeader.lastPlay
+        : { id: `${g.id}-live`, sequenceNumber: '900', text: `#${22} L.Bell rush for 6 yards`, type: { id: '51', text: 'Rushing', abbreviation: 'RUSH' }, period: { number: 2 }, clock: { displayValue: '6:28' }, awayScore: g.aScore, homeScore: g.hScore, isPenalty: false, teamParticipants: [{ team: { id: Number(g.hm[0]) }, id: String(g.hm[0]), type: 'offense' }] } } : undefined
     })) }] }]
   });
 }
@@ -353,6 +413,7 @@ async function serveProvider(url) {
   } else if (p === '/apis/site/v2/sports/football/college-football/summary') {
     M.summaryRequestsTotal++;
     const ev = u.searchParams.get('event');
+    if (ev === HOT_GAME.id) HOT.summaryFetches++;
     const s = summaryFor(ev);
     if (!s) { status = 404; body = 'not found'; } else body = s;
   } else if (p === '/apis/v2/scoreboard/header') {
@@ -563,6 +624,7 @@ async function run() {
   // Let boot + first load settle, then a scripted day switch at ~+30 s.
   const step = 20;
   let switchedDay = false, backToDay = false, firstSwitchPaintedAt = null;
+  let hotDone = false;
   while (vnow < endAt) {
     await pump(vnow + 1000 * step);
     if (DEBUG && NB.state) {
@@ -580,6 +642,35 @@ async function run() {
     if (switchedDay && !backToDay && M.daySwitch.paintedAt !== null && vnow >= M.daySwitch.paintedAt + 5000) {
       backToDay = true;
       globalThis.location.hash = '#/' + DAY;
+    }
+    // Scripted at-risk hot window at +3 min: flagged touchdown -> pending
+    // review (unresolved) -> verdict that nullifies it. Measured with 50 ms
+    // resolution against the app's real timers, transports and rate limiter.
+    if (!hotDone && vnow - V_START >= 180000) {
+      hotDone = true;
+      const feedHas = (pred) => (NB.state.booth.feed || []).some(pred);
+      const hotEv = (e) => !!e && String(e.gameId) === HOT_GAME.id &&
+        (String(e.text || '').indexOf('H.Loop') !== -1 ||
+         String((e.relatedScoringPlay && e.relatedScoringPlay.text) || '').indexOf('H.Loop') !== -1); // the at-risk row is the review row; it names the score via relatedScoringPlay
+      const liveCount = GAMES.filter((g2) => g2.live).length;
+      setHotPhase('risk');
+      const riskT0 = vnow;
+      while (vnow < riskT0 + 20000 && !feedHas((e) => hotEv(e) && NB.boothEventScoreAtRisk(e))) await pump(vnow + 50);
+      HOT.riskAlertMs = vnow - riskT0;
+      if (HOT.riskAlertMs >= 20000 && process.env.HOT_DEBUG) {
+        console.error('[hot-debug] feed rows for the hot game:');
+        (NB.state.booth.feed || []).filter((e) => String(e.gameId) === HOT_GAME.id).slice(-8).forEach((e) => console.error('[hot-debug]', JSON.stringify({ id: e.id, kind: e.kind, text: String(e.text).slice(0, 70), atRisk: e.atRisk, result: e.result, removesPoints: e.removesPoints, nullified: e.nullified, risk: NB.boothEventScoreAtRisk(e), nullifies: NB.boothEventNullifies(e), alertLevel: NB.boothEventAlertLevel(e), related: (e.relatedScoringPlay && e.relatedScoringPlay.text || '').slice(0, 40) })));
+        console.error('[hot-debug] hotUntil:', JSON.stringify(NB.state.booth.hotUntil), 'livePlays:', Object.keys(NB.state.booth.lastLivePlays || {}).length, 'lastPass:', JSON.stringify(NB.state.booth.lastPass));
+      }
+      // Hold the pending-review window ~12 s total so the hot loop's steady
+      // cadence (and its load profile) is exercised, not just the first fetch.
+      if (vnow < riskT0 + 12000) await pump(riskT0 + 12000);
+      setHotPhase('verdict');
+      const verT0 = vnow;
+      while (vnow < verT0 + 20000 && !feedHas((e) => hotEv(e) && NB.boothEventNullifies(e))) await pump(vnow + 50);
+      HOT.verdictAlertMs = vnow - verT0;
+      HOT.routineWouldBeMs = liveCount * 400; // busy-day per-game interval the hot loop bypasses
+      hotPhase = 'idle'; // the rest of the run returns to routine pacing
     }
   }
   // Snapshot booth state.
@@ -608,6 +699,12 @@ async function run() {
     },
     browserPools: Object.fromEntries([...Object.entries(M.maxQueueDepthByHost)].filter(([k]) => !k.includes('#wait')).map(([k, v]) => [k, { queuePeak: v }])),
     booth: { feedEvents: M.boothFeedFinal, gamesScanned: M.boothGamesFinal },
+    hotWindowMs: {
+      riskAlert: HOT.riskAlertMs,
+      nullifiedVerdictAlert: HOT.verdictAlertMs,
+      routinePerGameIntervalWithoutHotLoop: HOT.routineWouldBeMs,
+      hotGameSummaryFetches: HOT.summaryFetches
+    },
     uncaughtCount: M.uncaught.length,
     uncaughtSample: M.uncaught.slice(0, 5)
   };
