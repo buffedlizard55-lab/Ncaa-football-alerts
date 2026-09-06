@@ -1423,6 +1423,247 @@ function waitForPort(url, ms) {
     assert.strictEqual(NB.LANE_BOOTH, 2);
   });
 
+  // ---- lowest-latency wiring: adaptive header cadence, hot verdict loop,
+  // worker metronome, cache-busted fast fetches (2026-09-05) ----
+  test('liveTickerIntervalMs picks the 200ms hot header cadence only while a score is at risk', () => {
+    assert.strictEqual(NB.LIVE_SCORES_INTERVAL_MS, 250);
+    assert.strictEqual(NB.LIVE_SCORES_HOT_INTERVAL_MS, 200);
+    assert.strictEqual(NB.liveTickerIntervalMs(0), 250, 'no hot games -> base cadence');
+    assert.strictEqual(NB.liveTickerIntervalMs(3), 200, 'any hot game -> hot cadence');
+    assert.strictEqual(NB.liveTickerIntervalMs(1, 1000, 200), 200, 'explicit overrides honored');
+    assert.strictEqual(NB.liveTickerIntervalMs(0, 1000, 200), 1000);
+    assert.ok(NB.LIVE_SCORES_HOT_INTERVAL_MS < NB.LIVE_SCORES_INTERVAL_MS, 'hot must be faster than base');
+    assert.ok(NB.LIVE_TICKER_STEP_MS <= NB.LIVE_SCORES_HOT_INTERVAL_MS, 'metronome must resolve the hot cadence');
+    assert.ok(NB.LIVE_HEADER_TIMEOUT_MS < 4000, 'header timeout must bound a degraded transport chain');
+  });
+
+  test('boothHasUnresolvedRisk: only a pending at-risk scoring play keeps a game hot', () => {
+    const atRisk = { kind: 'review', text: 'The play is under further review.', result: 'pending', atRisk: true };
+    const nullified = { kind: 'replay', text: 'After further review, the ruling is overturned. Therefore, no touchdown.', atRisk: false, removesPoints: true };
+    const routine = { kind: 'penalty', text: 'PENALTY MIZ Holding, 10 yards', atRisk: false };
+    assert.strictEqual(NB.boothHasUnresolvedRisk([atRisk]), true);
+    assert.strictEqual(NB.boothHasUnresolvedRisk([routine, atRisk]), true);
+    assert.strictEqual(NB.boothHasUnresolvedRisk([routine]), false, 'a routine flag is never hot');
+    assert.strictEqual(NB.boothHasUnresolvedRisk([nullified]), false, 'a decided nullified row is not unresolved risk');
+    assert.strictEqual(NB.boothHasUnresolvedRisk([]), false);
+    assert.strictEqual(NB.boothHasUnresolvedRisk(null), false);
+  });
+
+  test('boothHotGameIds: unresolved-risk first, armed window second, expired windows dropped, cap honored', () => {
+    const now = 1000000;
+    const riskEv = [{ kind: 'review', text: 'The play is under further review.', result: 'pending', atRisk: true }];
+    const clean = [{ kind: 'penalty', text: 'PENALTY MIZ Holding, 10 yards', atRisk: false }];
+    const eventsByGame = {
+      g1: clean, g2: riskEv, g3: clean, g4: clean, g5: clean
+    };
+    // g1/g3 armed by the header fast path; g1 still inside its window, g3 expired.
+    const hotUntil = { g1: now + 5000, g3: now - 1 };
+    assert.deepStrictEqual(NB.boothHotGameIds(eventsByGame, hotUntil, now, 4), ['g2', 'g1'],
+      'risk game first, then live windows; expired window and un-armed games excluded');
+    // Cap: 3 risk/window games, cap 2 -> the risk game plus the first window id.
+    const hotUntil2 = { g1: now + 5000, g4: now + 9999 };
+    assert.deepStrictEqual(NB.boothHotGameIds(eventsByGame, hotUntil2, now, 2), ['g2', 'g1']);
+    // More risk games than the cap: deterministic id order, capped.
+    const many = { a: riskEv, b: riskEv, c: riskEv };
+    assert.deepStrictEqual(NB.boothHotGameIds(many, {}, now, 2), ['a', 'b']);
+    assert.deepStrictEqual(NB.boothHotGameIds({}, {}, now, 4), []);
+    assert.ok(NB.LIVE_HOT_GAME_INTERVAL_MS <= 800 && NB.LIVE_HOT_GAME_INTERVAL_MS >= 250,
+      'hot cadence must beat the busy-day pacing (15.6s on 39 games) decisively');
+    assert.ok(NB.LIVE_HOT_WINDOW_MS > 0 && NB.LIVE_HOT_MAX_WINDOW_MS > NB.LIVE_HOT_WINDOW_MS,
+      'the armed window needs an absolute per-episode cap');
+  });
+
+  test('boothClockMs parses quarter-clock displayValues and rejects junk', () => {
+    assert.strictEqual(NB.boothClockMs('5:19'), 5 * 60 * 1000 + 19 * 1000);
+    assert.strictEqual(NB.boothClockMs('15:00'), 15 * 60 * 1000);
+    assert.strictEqual(NB.boothClockMs('0:59'), 59 * 1000);
+    assert.strictEqual(NB.boothClockMs('1:05:00'), 65 * 60 * 1000);
+    assert.strictEqual(NB.boothClockMs(''), null);
+    assert.strictEqual(NB.boothClockMs(null), null);
+    assert.strictEqual(NB.boothClockMs('2nd & 10'), null);
+  });
+
+  test('boothEventAt: exact wallclock first, monotone estimates within a game, kickoff/zero fallbacks', () => {
+    const K = Date.parse('2026-09-05T16:00:00Z');
+    const exact = Date.parse('2026-09-05T21:41:09Z');
+    // 1. The provider's own wallclock always wins.
+    assert.strictEqual(NB.boothEventAt({ time: exact, quarter: 1, clock: '14:00' }, K), exact);
+    // 2. Estimate rises with quarter and with elapsed clock inside a quarter.
+    const q1Early = NB.boothEventAt({ quarter: 1, clock: '14:00' }, K);
+    const q1Late = NB.boothEventAt({ quarter: 1, clock: '2:00' }, K);
+    const q2 = NB.boothEventAt({ quarter: 2, clock: '14:00' }, K);
+    const q4 = NB.boothEventAt({ quarter: 4, clock: '0:01' }, K);
+    const ot = NB.boothEventAt({ quarter: 5, clock: '14:00' }, K);
+    assert.ok(q1Early > K && q1Late > q1Early && q2 > q1Late && q4 > q2 && ot > q4, 'monotone within a game: ' + [q1Early, q1Late, q2, q4, ot].join(','));
+    assert.strictEqual(q1Early, K + 60 * 1000); // 15:00-14:00 = one minute elapsed
+    assert.strictEqual(q2, K + NB.BOOTH_QUARTER_WALL_MS + 60 * 1000);
+    // No clock -> quarter fully elapsed (sorts after any clocked row of that quarter).
+    const noClock = NB.boothEventAt({ quarter: 2 }, K);
+    assert.ok(noClock > q2 && noClock <= K + 2 * NB.BOOTH_QUARTER_WALL_MS);
+    // 3. No quarter -> kickoff; no kickoff -> 0; nothing -> 0.
+    assert.strictEqual(NB.boothEventAt({ quarter: 0 }, K), K);
+    assert.strictEqual(NB.boothEventAt({ quarter: 2, clock: '5:00' }, 0), 0);
+    assert.strictEqual(NB.boothEventAt(null, K), 0);
+  });
+
+  test('the all-games feed is ordered chronologically by happened time, not discovery order', () => {
+    // Game gB (late kickoff) is fetched FIRST; its nullified verdict happened
+    // at 21:45Z. Game gA (early kickoff) is fetched SECOND; its at-risk review
+    // happened around 16:27Z. Discovery order would show the later play on
+    // top; chronological order must show the earlier play first.
+    const tLate = Date.parse('2026-09-05T21:45:00Z');
+    const evLate = { id: 'b1', seq: 5, kind: 'replay', text: 'After further review, the ruling on the field is overturned. The play is nullified.', quarter: 4, clock: '1:02', time: tLate, atRisk: false, removesPoints: true, pointsRemoved: 7 };
+    const evEarly = { id: 'a1', seq: 3, kind: 'review', text: 'The play is under further review.', quarter: 2, clock: '8:00', time: 0, atRisk: true, removesPoints: false, pointsRemoved: 0 };
+    const gB = { id: 'gB', shortName: 'B @ Y', awayAbbr: 'B', homeAbbr: 'Y', date: '2026-09-05T21:00:00Z', live: true, events: [evLate] };
+    const gA = { id: 'gA', shortName: 'A @ X', awayAbbr: 'A', homeAbbr: 'X', date: '2026-09-05T16:00:00Z', live: true, events: [evEarly] };
+    const fresh = NB.dayBoothFeed([gB, gA]);           // discovery order: gB first
+    assert.strictEqual(fresh[0].gameId, 'gB', 'pre-sort feed keeps discovery order');
+    const feed = NB.reconcileDayBoothFeed([], fresh);  // reconcile owns the chronological order
+    assert.strictEqual(feed.length, 2);
+    assert.strictEqual(feed[0].gameId, 'gA', 'the earlier happened play sorts first (estimate 16:27Z < exact 21:45Z)');
+    assert.strictEqual(feed[1].gameId, 'gB');
+    assert.ok(feed[0].at < feed[1].at);
+    // The LIVE alert surface preserves that order.
+    const live = NB.dayBoothLiveEvents(feed);
+    assert.deepStrictEqual(live.map((e) => e.gameId), ['gA', 'gB']);
+    // Deterministic + stable: reconciling an in-place update of the SAME row
+    // (verdict text changes, same key, same at) keeps the identical order.
+    const evLateUpdate = Object.assign({}, evLate, { text: 'After further review, the ruling on the field is overturned. Therefore, no touchdown.' });
+    const again = NB.reconcileDayBoothFeed(feed, NB.dayBoothFeed([gB, gA].map((g) => g.id === 'gB' ? Object.assign({}, g, { events: [evLateUpdate] }) : g)));
+    assert.deepStrictEqual(again.map((e) => e.gameId), ['gA', 'gB'], 'in-place update keeps chronological position');
+    assert.ok(again[1].text.indexOf('no touchdown') !== -1, 'the updated row content replaced the old one');
+  });
+
+  test('a live header copy without wallclock never clobbers the cached play timestamp', () => {
+    const W = '2026-09-05T21:38:44Z';
+    const cached = boothNorm({ id: 'p9', sequenceNumber: '9', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, wallclock: W, awayScore: 0, homeScore: 0 });
+    const liveCopy = boothNorm({ id: 'hdr-p9', sequenceNumber: undefined, text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0 });
+    assert.strictEqual(cached.time, Date.parse(W));
+    assert.strictEqual(liveCopy.time, 0, 'header rows carry no wallclock (verified live)');
+    const evs = NB.boothEvents([cached], liveCopy, {});
+    const ev = evs.find((e) => e.text.indexOf('PENALTY TA&M') !== -1);
+    assert.strictEqual(ev.time, Date.parse(W), 'the merged row keeps the cached exact wallclock');
+    // And the row a header copy REPLACED by id keeps it too (Object.assign guard).
+    const liveSameId = boothNorm({ id: 'p9', sequenceNumber: '9', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0 });
+    const evs2 = NB.boothEvents([cached], liveSameId, {});
+    assert.strictEqual(evs2.find((e) => e.text.indexOf('PENALTY TA&M') !== -1).time, Date.parse(W));
+  });
+
+  test('boothETLabel renders a real wallclock in ET and never renders an estimate or junk', () => {
+    // 2026-09-05T21:41:09Z is 5:41 PM Eastern (UTC-4, daylight time).
+    const label = NB.boothETLabel(Date.parse('2026-09-05T21:41:09Z'));
+    assert.ok(/ET$/.test(label), label);
+    assert.ok(/5:41/.test(label), label);
+    assert.strictEqual(NB.boothETLabel(0), '');
+    assert.strictEqual(NB.boothETLabel(undefined), '');
+    assert.strictEqual(NB.boothETLabel(NaN), '');
+  });
+
+  test('live merge: a stale header copy of the scoring play must not resolve a pending review (harness-found regression, 2026-09-05)', () => {
+    // The fast paths create this transition deliberately: the immediate PBP
+    // fetch lands a summary that already contains TD + "under further
+    // review", while the slower header feed still publishes the TD itself as
+    // lastPlay. The stale TD copy used to be appended AFTER the review row
+    // (or replace it with a bogus seq), making boothRiskResolvedAhead read
+    // "play resumed with a published score" — the at-risk alert never fired.
+    const plays = [
+      boothNorm({ id: 't1', sequenceNumber: '1', text: '#2x D.Smith pass complete for 8 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 't2', sequenceNumber: '2', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 't3', sequenceNumber: '3', text: 'The play is under further review.', type: { text: 'Timeout' }, awayScore: 0, homeScore: 7 })
+    ];
+    const liveVariants = [
+      boothNorm({ id: 'hdr-noseq', sequenceNumber: undefined, text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }), // real header shape: no sequenceNumber
+      boothNorm({ id: 'hdr-seq0', sequenceNumber: '0', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 'hdr-oob', sequenceNumber: '950', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }) // out-of-band seq must not move the row
+    ];
+    liveVariants.forEach((liveTD) => {
+      const evs = NB.boothEvents(plays, liveTD, {});
+      const review = evs.find((e) => e.text.indexOf('further review') !== -1);
+      assert.ok(review, 'the review row must be a booth event');
+      assert.strictEqual(review.atRisk, true, 'the pending review of the TD must stay AT RISK for live copy id=' + liveTD.id);
+      assert.strictEqual(NB.boothEventAlertLevel(review), 1, 'alert level 1 (score at risk), not resolved/nullified');
+      assert.strictEqual(review.relatedScoringPlay && review.relatedScoringPlay.text, '#88 H.Loop rush for 50 yards TOUCHDOWN');
+    });
+    // And once the verdict lands behind it, the same review row resolves and
+    // the nullified row (not the review row) owns the alert.
+    const verdictPlays = plays.concat([
+      boothNorm({ id: 't4', sequenceNumber: '4', text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.', type: { text: 'Play Overturned' }, awayScore: 0, homeScore: 0 })
+    ]);
+    const evs2 = NB.boothEvents(verdictPlays, liveVariants[0], {});
+    const review2 = evs2.find((e) => e.text.indexOf('further review') !== -1);
+    const verdict2 = evs2.find((e) => e.text.indexOf('nullified') !== -1);
+    assert.strictEqual(review2.atRisk, false, 'verdict landed: the risk is resolved');
+    assert.ok(NB.boothEventNullifies(verdict2), 'the verdict row nullifies');
+    assert.strictEqual(NB.boothEventAlertLevel(verdict2), 2);
+    assert.strictEqual(verdict2.pointsRemoved, 7);
+  });
+
+  test('an enforcement flag after a decided verdict never re-flags the score at risk (harness-found, 2026-09-05)', () => {
+    // TD -> under review -> OVERTURNED verdict -> penalty enforcement row.
+    // The enforcement flag sits within the risk lookback of the touchdown,
+    // but the verdict between them already decided the score: it must NOT
+    // alert again as a new at-risk score (the nullified verdict owns it).
+    const plays = [
+      boothNorm({ id: 'e1', sequenceNumber: '1', text: '#2x D.Smith pass complete for 8 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'e2', sequenceNumber: '2', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 'e3', sequenceNumber: '3', text: 'The play is under further review.', type: { text: 'Timeout' }, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 'e4', sequenceNumber: '4', text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.', type: { text: 'Play Overturned' }, awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'e5', sequenceNumber: '5', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, penalty: { yards: 10, type: { text: 'Holding' } }, awayScore: 0, homeScore: 0 })
+    ];
+    const evs = NB.boothEvents(plays, null, {});
+    const flag = evs.find((e) => String(e.text).indexOf('PENALTY TA&M') !== -1);
+    const verdict = evs.find((e) => String(e.text).indexOf('nullified') !== -1);
+    assert.ok(flag && verdict, 'both rows must be booth events');
+    assert.strictEqual(flag.atRisk, false, 'the enforcement flag must not re-flag the decided score');
+    assert.strictEqual(NB.boothEventAlertLevel(flag), 0, 'no alert level for the enforcement flag');
+    assert.strictEqual(NB.boothEventAlertLevel(verdict), 2, 'the nullified verdict owns the alert');
+    // The same flag DIRECTLY after the score (no verdict between, points
+    // still on the board) still alerts at risk.
+    const pendingFlag = boothNorm({ id: 'e5p', sequenceNumber: '5', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, penalty: { yards: 10, type: { text: 'Holding' } }, awayScore: 0, homeScore: 7 });
+    const noVerdict = [plays[0], plays[1], pendingFlag];
+    const evs2 = NB.boothEvents(noVerdict, null, {});
+    const flag2 = evs2.find((e) => String(e.text).indexOf('PENALTY TA&M') !== -1);
+    assert.strictEqual(flag2.atRisk, true, 'a flag with no decided verdict between it and the score is still at risk');
+    assert.strictEqual(NB.boothEventAlertLevel(flag2), 1);
+  });
+
+  test('freshBustUrl appends the provider-accepted _= buster without breaking the query', () => {
+    assert.strictEqual(NB.freshBustUrl('https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401856668', 123),
+      'https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401856668&_=123');
+    assert.strictEqual(NB.freshBustUrl('https://example.com/plays?limit=400', 7),
+      'https://example.com/plays?limit=400&_=7');
+    assert.strictEqual(NB.freshBustUrl('https://example.com/no-query', 9), 'https://example.com/no-query?_=9');
+    assert.ok(NB.freshBustUrl('https://example.com/x').indexOf('_=') !== -1, 'default timestamp when none given');
+    assert.strictEqual(NB.freshBustUrl(''), '');
+  });
+
+  test('live ticker wiring: worker metronome drives the header poll + hot loop and survives a hidden tab', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
+    assert.match(src, /function createTickerClock\s*\(/, 'worker metronome must exist');
+    assert.match(src, /new Worker\(url\)/, 'a dedicated worker must deliver the ticks');
+    assert.match(src, /function liveTickerStep\s*\(/);
+    assert.match(src, /startLiveTicker\(\);?\s*\n?\s*}/, 'the scoreboard pollers must start the ticker');
+    assert.match(src, /stopPolling\(\)\s*\{\s*\n\s*stopLiveTicker\(\);/, 'stopPolling must tear the ticker down');
+    assert.match(src, /var hotCount = boothHotLoopTick\(\);/, 'the tick runs the hot loop every step');
+    assert.match(src, /liveTickerNextHeaderAt = now \+ liveTickerIntervalMs\(hotCount\);/, 'the header cadence must adapt to the hot count');
+    // The old hidden-tab hole: the 250 ms header interval used to bail on
+    // document.hidden, so a backgrounded tab stopped reading the feed exactly
+    // when an alert had to fire (and Chrome aligns hidden DOM timers to 1s /
+    // 1min — see README). The ticker step must not re-introduce that guard.
+    const step = src.slice(src.indexOf('function liveTickerStep('), src.indexOf('function startLiveTicker('));
+    assert.ok(!/document\.hidden/.test(step), 'the ticker step must run while the tab is hidden');
+    // Hidden tabs alert but skip paints; the announce call stays outside the paint guard.
+    const apply = src.slice(src.indexOf('function applyBoothGame('), src.indexOf('function boothGameFromId('));
+    assert.ok(apply.indexOf('announceNewBoothEvents(fresh);') < apply.indexOf('if (!pageHidden())'), 'alerts must fire before any paint guard');
+    assert.match(src, /function refreshLiveScores/, 'header poll entry point exists');
+    const rls = src.slice(src.indexOf('async function refreshLiveScores'), src.indexOf('function dayBoothPoll'));
+    assert.ok(!/document\.hidden/.test(rls), 'refreshLiveScores must read the feed regardless of visibility (pageHidden only skips paints)');
+    assert.match(src, /Object\.keys\(scoreRiskDirty\)\.forEach\(function \(gid\) \{\s*\n\s*armBoothHotGame\(gid\);/, 'a header-detected at-risk score must arm the hot loop');
+    assert.match(src, /Object\.keys\(scoreDropDirty\)\.forEach\(function \(gid\) \{\s*\n\s*armBoothHotGame\(gid\);/, 'a header-detected score drop must arm the hot loop');
+    // Fast/hot fetches must bypass the relay micro-cache and the booth lane queue.
+    assert.match(src, /await fetchPlaysForGame\(game, \{ fresh: true, lane: LANE_AUX \}\);/, 'fast paths fetch fresh on the secondary lane');
+  });
+
   test('scoreboard wiring helpers are all defined (lastPlayBooth regression: an undefined reference in game-row rendering blanked the whole scoreboard)', () => {
     const src = fs.readFileSync(path.join(ROOT, 'app.js'), 'utf8');
     assert.match(src, /function lastPlayBooth\s*\(/, 'lastPlayBooth must be defined');

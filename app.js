@@ -1557,8 +1557,31 @@
 
   var LIVE_HEADER_URL = 'https://site.web.api.espn.com/apis/v2/scoreboard/header?sport=football&league=college-football';
   var LIVE_SCORES_INTERVAL_MS = 250;   // 0.25s score/status cadence (serial: one header fetch in flight)
+  var LIVE_SCORES_HOT_INTERVAL_MS = 200; // 0.2s header cadence while ANY scoring play is at risk (liveTickerIntervalMs)
   var LIVE_REVIEWS_INTERVAL_MS = 1000; // 1s per-game play-by-play cadence floor
   var LIVE_SCORE_RISK_REFETCH_MS = 500; // immediate score-at-risk PBP confirmation debounce per game
+  // Hot-game verdict loop: while a game's cached booth contains an unresolved
+  // at-risk score (flag/challenge/review pending on a scoring play), that ONE
+  // game's play-by-play is re-fetched at LIVE_HOT_GAME_INTERVAL_MS through the
+  // secondary lane, bypassing the busy-day pacing that otherwise spreads 39
+  // live games over liveGames * BOOTH_BUSY_DAY_GAME_MS. This is the safety
+  // net for the case the 150/250 ms header last-play cannot cover: a verdict
+  // row that is published and immediately superseded by the next play (try,
+  // kickoff), so the header's lastPlay skips it. Bound: at most
+  // LIVE_HOT_GAME_MAX games, each window armed by an at-risk detection and
+  // re-armed while the risk genuinely persists, with an absolute cap per
+  // at-risk episode so a provider bug can never poll forever.
+  var LIVE_HOT_GAME_INTERVAL_MS = 800;
+  var LIVE_HOT_GAME_MAX = 4;
+  var LIVE_HOT_WINDOW_MS = 75000;      // hot window armed/re-armed per at-risk detection
+  var LIVE_HOT_MAX_WINDOW_MS = 360000; // absolute cap per at-risk episode (6 min)
+  // Ticker resolution. The live tick (header poll + hot loop) is driven by a
+  // Web Worker metronome at this resolution so a hidden tab keeps ticking
+  // (see createTickerClock for the documented browser behavior).
+  var LIVE_TICKER_STEP_MS = 50;
+  // The header fetch must never stall the tick behind a dead transport chain;
+  // 2 s bounds one attempt while staying far above a healthy round trip.
+  var LIVE_HEADER_TIMEOUT_MS = 2000;
   var SCOREBOARD_INTERVAL_MS = 15000;  // 15s scoreboard poll (live days)
   var SCOREBOARD_IDLE_INTERVAL_MS = 60000; // 60s scoreboard poll once nothing is live
   // Booth load policy (fixes the starvation the day board hit on a full
@@ -1580,6 +1603,19 @@
   // window is tight on purpose: a routine flag three plays after a score
   // (e.g. on the kickoff) cannot remove that score and must not alert.
   var BOOTH_RISK_LOOKBACK = 3;
+  // Chronological ordering of the all-games feed. The provider publishes an
+  // absolute `wallclock` on most plays (verified in the captured fixtures —
+  // but NOT on every play), and the live header lastPlay carries none, so
+  // ordering needs a documented fallback chain (boothEventAt):
+  //   1. the play's own wallclock (exact);
+  //   2. else an ESTIMATE from the game's kickoff + quarter + game clock
+  //      (BOOTH_QUARTER_WALL_MS wall minutes per quarter is an
+  //      approximation — exact for ordering WITHIN a game, approximate
+  //      across games only for the rows the provider left without a
+  //      wallclock; never displayed as a time);
+  //   3. else the kickoff itself.
+  var BOOTH_QUARTER_WALL_MS = 20 * 60 * 1000;  // estimated wall minutes per quarter (ordering only)
+  var BOOTH_QUARTER_GAME_MS = 15 * 60 * 1000;  // NCAA game clock per quarter
   // Global cap on provider transport attempts. A browser keeps ~6 open
   // connections per origin (documented Chromium behaviour), and the app
   // relay is same-origin, so the booth is deliberately limited to
@@ -1639,6 +1675,128 @@
   function boothFastFetchKey(play, reason) {
     if (!play || !reason) return '';
     return [reason, play.id != null ? play.id : '', play.seq != null ? play.seq : '', play.text || '', play.awayScore != null ? play.awayScore : '', play.homeScore != null ? play.homeScore : ''].join('|');
+  }
+
+  // Adaptive header cadence (pure decision): the serial 250 ms poll is the
+  // normal floor, but while ANY live game has a scoring play at risk the
+  // header feed ticks at LIVE_SCORES_HOT_INTERVAL_MS, so the verdict row — or
+  // a booth event attaching to another scoring play — is seen that much
+  // sooner. The header is ONE small request for the whole slate, so the hot
+  // bump costs ~4 extra requests/second only while a verdict is pending.
+  function liveTickerIntervalMs(hotCount, baseMs, hotMs) {
+    var base = baseMs != null ? baseMs : LIVE_SCORES_INTERVAL_MS;
+    var hot = hotMs != null ? hotMs : LIVE_SCORES_HOT_INTERVAL_MS;
+    return (Number(hotCount) || 0) > 0 ? Math.max(50, hot) : base;
+  }
+
+  // True while a game's cached booth still contains an unresolved at-risk
+  // scoring play: the score is on the board, a flag / coach's challenge /
+  // replay review is attached, and no verdict or resumed play has resolved
+  // it. Nullified rows are decided and therefore not "unresolved risk".
+  function boothHasUnresolvedRisk(events) {
+    return (events || []).some(function (e) {
+      return !!e && boothEventScoreAtRisk(e) && !boothEventNullifies(e);
+    });
+  }
+
+  // Which games the hot verdict loop should poll, as a pure decision over the
+  // booth caches (unit-tested offline):
+  //   - any game whose cached events still contain an unresolved at-risk
+  //     score (that is the verdict being waited on), or
+  //   - any game inside its armed hot window — armed when the fast header
+  //     feed showed a scoring play with a flag/review attached, BEFORE the
+  //     play-by-play has confirmed the risk, so detection gaps (header
+  //     lastPlay moving on) cannot cool a genuinely pending review.
+  // Unresolved-risk games sort ahead of window-only games; deterministic id
+  // order inside each group; capped at `max`.
+  function boothHotGameIds(eventsByGame, hotUntil, nowMs, max) {
+    var now = nowMs != null ? nowMs : Date.now();
+    var risk = [];
+    var windowed = [];
+    Object.keys(eventsByGame || {}).forEach(function (id) {
+      if (boothHasUnresolvedRisk(eventsByGame[id])) { risk.push(id); return; }
+      var until = (hotUntil || {})[id];
+      if (until != null && Number(until) > now) windowed.push(id);
+    });
+    risk.sort();
+    windowed.sort();
+    return risk.concat(windowed).slice(0, Math.max(1, max || 1));
+  }
+
+  // Cache-buster for latency-critical fetches. The same-origin relay
+  // micro-caches successful responses per exact URL (RELAY_CACHE_TTL_MS,
+  // 1 s by default) and the browser honors HTTP caching, so a fast-path pull
+  // of a hot game could otherwise be handed a body the routine pass just
+  // cached. This appends the same `_=timestamp` buster the serial header poll
+  // already uses; the provider accepts the extra parameter on the summary
+  // endpoint too (verified against a live game on 2026-09-05 — see README).
+  function freshBustUrl(url, ts) {
+    var u = String(url || '');
+    if (!u) return u;
+    return u + (u.indexOf('?') === -1 ? '?_=' : '&_=') + (ts != null ? ts : Date.now());
+  }
+
+  // ---- Chronological ordering of the all-games feed ---------------------------
+  // The live alert surface must show alerts in the order the plays HAPPENED,
+  // not the order the polls discovered them (a 39-game pass fetches games in
+  // plan order, so discovery order is effectively arbitrary across games).
+  // Every feed item carries `at`, computed by boothEventAt:
+  //   1. the play's provider-published `wallclock` (exact — normalizePlay
+  //      parses it to ms; verified present on most, not all, captured plays);
+  //   2. else kickoff + (quarter-1) * BOOTH_QUARTER_WALL_MS + elapsed game
+  //      clock in the quarter — an estimate that is exact for ordering
+  //      WITHIN a game and approximate across games (documented, never
+  //      displayed as a time);
+  //   3. else the kickoff timestamp itself.
+
+  // 'MM:SS' (or 'H:MM:SS') quarter-clock displayValue -> REMAINING ms.
+  function boothClockMs(clock) {
+    var m = String(clock || '').match(/^(\d+):(\d{2})(?::(\d{2}))?$/);
+    if (!m) return null;
+    if (m[3] != null) return (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) * 1000;
+    return (Number(m[1]) * 60 + Number(m[2])) * 1000;
+  }
+
+  function boothEventAt(event, kickoffMs) {
+    if (!event) return 0;
+    if (event.time) {
+      var t = Number(event.time) || 0;
+      if (t) return t;                       // exact provider wallclock
+    }
+    var k = Number(kickoffMs) || 0;
+    if (!k) return 0;
+    var q = Number(event.quarter) || 0;
+    if (q < 1) return k;                     // no quarter info: kickoff
+    var remaining = boothClockMs(event.clock);
+    var elapsedInQuarter = remaining == null ? BOOTH_QUARTER_GAME_MS : Math.max(0, BOOTH_QUARTER_GAME_MS - remaining);
+    return k + (q - 1) * BOOTH_QUARTER_WALL_MS + elapsedInQuarter;
+  }
+
+  // Eastern-time label for a REAL wallclock only ('9:41 PM ET'). Never pass
+  // the estimated `at` value — approximations must not be displayed as times.
+  function boothETLabel(ms) {
+    var n = Number(ms) || 0;
+    if (!n || isNaN(n)) return '';
+    try {
+      return new Date(n).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' }) + ' ET';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  // Ascending happened-time order (oldest first, newest last — the feed is a
+  // chat-style surface that autoscrolls to the bottom). Ties break by
+  // kickoff, then the feed key, so the order is deterministic and stable
+  // across re-renders and in-place row updates.
+  function boothFeedChronoCompare(a, b) {
+    if (!a || !b) return 0;
+    var atA = Number(a.at) || 0, atB = Number(b.at) || 0;
+    if (atA !== atB) return atA - atB;
+    var kA = Number(a.kickoff) || 0, kB = Number(b.kickoff) || 0;
+    if (kA !== kB) return kA - kB;
+    var sA = String(a.key != null ? a.key : ''), sB = String(b.key != null ? b.key : '');
+    if (sA === sB) return 0;
+    return sA < sB ? -1 : 1;
   }
 
   function boothKindCounts(events) {
@@ -1846,10 +2004,17 @@
   // running-score rollback in boothScoreEffect / nullifiedScoreText.
   function boothRiskResolvedAhead(plays, index) {
     if (!plays || index == null) return false;
+    var own = boothNearestScoringPlay(plays, index, BOOTH_RISK_LOOKBACK);
     for (var i = index + 1; i < plays.length && i <= index + 3; i += 1) {
       var p = plays[i];
       if (!p) continue;
       if (/timeout/i.test(boothPlayType(p))) continue;
+      // A row identical to the scoring play under review is a provider
+      // re-issue / stale header copy of THAT play (same text, still a scoring
+      // play), not the game resuming — a resumed game publishes a DIFFERENT
+      // play (try, kickoff, next snap). Without this guard a stale copy
+      // sitting after a pending review row falsely "resolves" the risk.
+      if (own && boothIsScoringPlay(p) && boothPlayText(p) === own.text) continue;
       var res = boothResult(boothPlayText(p));
       if (res && res !== 'pending') return true;                       // verdict row landed
       if (!boothClassify(p) && boothHasExplicitScore(p)) return true;  // play resumed with a published score
@@ -2031,6 +2196,7 @@
       result: boothResult(p.text),
       quarter: p.period,
       clock: p.clock,
+      time: p.time || 0, // provider wallclock (ms) — the exact chronological order key
       downDistance: p.downDistance || '',
       awayScore: p.awayScore != null ? p.awayScore : null,
       homeScore: p.homeScore != null ? p.homeScore : null,
@@ -2201,6 +2367,21 @@
       tight = boothNearestScoringPlay(plays, index, BOOTH_RISK_LOOKBACK);
     }
     var t = boothTeamOf(teamMap, event.teamId);
+    // A flag/review that follows its scoring play can only put that score AT
+    // RISK if nothing between them has already decided it: an overturned /
+    // upheld / declined verdict row between the score and this row settles
+    // the score's fate (the enforcement flag that follows an overturned
+    // touchdown must not re-alert as a NEW at-risk score). Found by the
+    // harness scripted verdict window (2026-09-05).
+    var decidedBetween = false;
+    if (tight && tight.index != null) {
+      for (var b = tight.index + 1; b < index; b += 1) {
+        var bp = plays[b];
+        if (!bp) continue;
+        var bres = boothResult(boothPlayText(bp));
+        if (bres && bres !== 'pending') { decidedBetween = true; break; }
+      }
+    }
     var withScores = Object.assign({}, event, {
       team: t,
       yardsToEndzone: boothYardsToEndzone(plays[index], teamMap),
@@ -2218,7 +2399,7 @@
       riskScoringPlay: tight
     });
     withScores.nullified = boothEventNullifies(withScores);
-    withScores.atRisk = boothEventRiskPending(withScores) && !boothRiskResolvedAhead(plays, index);
+    withScores.atRisk = boothEventRiskPending(withScores) && !boothRiskResolvedAhead(plays, index) && !decidedBetween;
     return withScores;
   }
 
@@ -2249,13 +2430,53 @@
     if (!lastPlay) return ctx;
     var key = lastPlay.id != null ? String(lastPlay.id) : '';
     var at = -1;
+    var keepSeq = false;
     if (key) {
       for (var i = 0; i < ctx.length; i += 1) {
         if (ctx[i] && ctx[i].id != null && String(ctx[i].id) === key) { at = i; break; }
       }
     }
+    if (at < 0) {
+      // An id miss does NOT prove the live row is newer than the cache: the
+      // header feed can lag a just-fetched summary (exactly the flag->review
+      // transition the fast paths create). A cached play with the same
+      // type+text+scoreValue is the same physical play re-issued — replace it
+      // in place instead of appending a stale copy after newer rows. Found
+      // live by the harness scripted at-risk window: a stale scoring-play
+      // copy appended AFTER a pending "under review" row made the risk look
+      // resolved (no at-risk alert) — see README verification list.
+      var sig = [boothPlayType(lastPlay), boothPlayText(lastPlay), lastPlay.scoreValue != null ? String(lastPlay.scoreValue) : ''].join('|');
+      if (sig !== '||') {
+        for (var j = ctx.length - 1; j >= 0; j -= 1) {
+          var q = ctx[j];
+          if (!q) continue;
+          var qsig = [boothPlayType(q), boothPlayText(q), q.scoreValue != null ? String(q.scoreValue) : ''].join('|');
+          if (qsig === sig) {
+            at = j;
+            keepSeq = true; // the signature match proves this IS the cached play; its position is the truth even if the live copy carries an out-of-band sequence number
+            break;
+          }
+        }
+      }
+    }
     if (at >= 0) {
-      ctx[at] = lastPlay;
+      // Replace in place, but keep the CACHED row's sequence position: the
+      // live header lastPlay frequently carries no sequenceNumber (verified
+      // live 2026-09-05 — the header row has id/text/type/clock but no
+      // sequenceNumber), so the raw copy would normalize to seq 0 and the
+      // sort below would fling the newest play to the FRONT of the list,
+      // distorting every around-the-event computation (nearest scoring play,
+      // rollback scans, risk resolution). The provider's own re-issue of a
+      // play keeps one stable position; the live copy only refreshes fields.
+      var orig = ctx[at];
+      var merged = Object.assign({}, orig, lastPlay);
+      if (keepSeq || lastPlay.seq == null || lastPlay.seq === '' || Number(lastPlay.seq) === 0) merged.seq = orig.seq;
+      // Same rule for the wallclock: the live header copy carries no
+      // wallclock (verified live 2026-09-05), so without this guard it would
+      // zero the cached play's exact timestamp and knock the row out of
+      // chronological order onto the estimated fallback.
+      if (!merged.time) merged.time = orig.time;
+      ctx[at] = merged;
     } else {
       var copy = Object.assign({}, lastPlay);
       if (copy.seq == null || copy.seq === '') {
@@ -2306,6 +2527,7 @@
           : String(g.id) + ':seq:' + (e.seq != null ? e.seq : '') + ':' + e.kind + ':' + (e.text || '');
         if (seen[key]) return;
         seen[key] = true;
+        var kickoff = g.date ? (Date.parse(g.date) || 0) : 0;
         out.push(Object.assign({}, e, {
           key: key,
           gameId: g.id,
@@ -2313,6 +2535,8 @@
           awayAbbr: g.awayAbbr || '',
           homeAbbr: g.homeAbbr || '',
           date: g.date || null,
+          kickoff: kickoff,
+          at: boothEventAt(e, kickoff),   // happened-time key (see boothEventAt)
           liveGame: !!g.live
         }));
       });
@@ -2320,10 +2544,14 @@
     return out;
   }
 
-  // Preserve chat discovery order while replacing items whose source play was
-  // updated in place (for example "under review" becoming "overturned").
-  // Items no longer present in `fresh` stay in history; genuinely new keys are
-  // appended.
+  // Keep every discovered item exactly once (in-place updates replace their
+  // row), then order the whole feed CHRONOLOGICALLY by when each play
+  // HAPPENED (boothFeedChronoCompare: wallclock, then the documented
+  // kickoff+quarter estimate, then kickoff, then key). Discovery order used
+  // to be preserved here, which interleaved games by fetch order — a later
+  // nullification fetched first would sit above an earlier at-risk review
+  // fetched second. Sorting after every reconcile keeps the order stable:
+  // an in-place update carries the same `at` and lands back where it was.
   function reconcileDayBoothFeed(existing, fresh) {
     var out = (existing || []).slice();
     var positions = {};
@@ -2340,6 +2568,7 @@
       if (key) positions[key] = out.length;
       out.push(item);
     });
+    out.sort(boothFeedChronoCompare);
     return out;
   }
 
@@ -2520,6 +2749,7 @@
       BOOTH_KINDS: BOOTH_KINDS, BOOTH_KIND_LABEL: BOOTH_KIND_LABEL, BOOTH_RESULT_LABEL: BOOTH_RESULT_LABEL,
       BOOTH_FILTERS: BOOTH_FILTERS, DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS, BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
       BOOTH_RISK_LOOKBACK: BOOTH_RISK_LOOKBACK,
+      BOOTH_QUARTER_WALL_MS: BOOTH_QUARTER_WALL_MS, BOOTH_QUARTER_GAME_MS: BOOTH_QUARTER_GAME_MS,
       boothClassify: boothClassify, boothResult: boothResult, boothMentionsScore: boothMentionsScore,
       nullifiedScoreText: nullifiedScoreText, boothEventNullifies: boothEventNullifies,
       boothEventRiskPending: boothEventRiskPending, boothRiskResolvedAhead: boothRiskResolvedAhead,
@@ -2532,9 +2762,15 @@
       boothIsScoringPlay: boothIsScoringPlay, boothNearestScoringPlay: boothNearestScoringPlay,
       boothKindCounts: boothKindCounts, boothEventShown: boothEventShown, boothScoreTrailHTML: boothScoreTrailHTML,
       boothScoreDropped: boothScoreDropped, boothScoreRiskReason: boothScoreRiskReason, boothFastFetchKey: boothFastFetchKey,
+      liveTickerIntervalMs: liveTickerIntervalMs, boothHotGameIds: boothHotGameIds,
+      boothHasUnresolvedRisk: boothHasUnresolvedRisk, freshBustUrl: freshBustUrl,
+      boothClockMs: boothClockMs, boothEventAt: boothEventAt, boothETLabel: boothETLabel, boothFeedChronoCompare: boothFeedChronoCompare,
       lastPlayBooth: lastPlayBooth, boothRefreshPlan: boothRefreshPlan, createProviderGate: createProviderGate,
       isRateLimitError: isRateLimitError,
       scorePair: scorePair, LIVE_HEADER_URL: LIVE_HEADER_URL, LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
+      LIVE_SCORES_HOT_INTERVAL_MS: LIVE_SCORES_HOT_INTERVAL_MS, LIVE_HOT_GAME_INTERVAL_MS: LIVE_HOT_GAME_INTERVAL_MS,
+      LIVE_HOT_GAME_MAX: LIVE_HOT_GAME_MAX, LIVE_HOT_WINDOW_MS: LIVE_HOT_WINDOW_MS, LIVE_HOT_MAX_WINDOW_MS: LIVE_HOT_MAX_WINDOW_MS,
+      LIVE_TICKER_STEP_MS: LIVE_TICKER_STEP_MS, LIVE_HEADER_TIMEOUT_MS: LIVE_HEADER_TIMEOUT_MS,
       LIVE_REVIEWS_INTERVAL_MS: LIVE_REVIEWS_INTERVAL_MS, LIVE_SCORE_RISK_REFETCH_MS: LIVE_SCORE_RISK_REFETCH_MS, SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS,
       SCOREBOARD_IDLE_INTERVAL_MS: SCOREBOARD_IDLE_INTERVAL_MS,
       BOOTH_PASS_MAX_REFRESH: BOOTH_PASS_MAX_REFRESH, BOOTH_SEED_PASS_MAX: BOOTH_SEED_PASS_MAX,
@@ -2605,7 +2841,10 @@
       lastHeaderScores: {},  // gameId -> {away,home} last header totals (for score-drop fast trigger)
       fastFetchKeys: {},     // gameId -> last immediate score-at-risk fetch key
       fastFetchAt: {},       // gameId -> ms timestamp for immediate fetch debounce
-      fastFetchInFlight: {}  // gameId -> true while immediate confirmation is running
+      fastFetchInFlight: {}, // gameId -> true while immediate confirmation is running
+      hotUntil: {},          // gameId -> ms timestamp the hot verdict loop stays armed
+      hotArmedAt: {},        // gameId -> ms timestamp of the current at-risk episode (absolute cap base)
+      hotLastFetch: {}       // gameId -> ms timestamp of the last hot-loop fetch
     }
   };
   CONFERENCES.forEach(function (c) { state.confs[c.id] = true; });
@@ -2639,6 +2878,7 @@
 
   /* ---------------- Polling ---------------- */
   function stopPolling() {
+    stopLiveTicker();
     state.pollers.forEach(clearInterval);
     state.pollers = [];
   }
@@ -2812,6 +3052,9 @@
       state.booth.lastHeaderScores = {};
       state.booth.lastFetch = {};
       state.booth.alertByGame = {};
+      state.booth.hotUntil = {};
+      state.booth.hotArmedAt = {};
+      state.booth.hotLastFetch = {};
       state.booth.lastPass = null;
       state.booth.count = 0;
     } else if (showSpinner !== false) {
@@ -2916,12 +3159,95 @@
     state.pollers.push(setInterval(function () {
       if (!document.hidden) loadScoreboard(false);
     }, delay));
-    state.pollers.push(setInterval(function () {
-      if (document.hidden) return;
-      var anyLive = state.games.some(function (g) { return g.status && g.status.state === 'in'; });
-      if (anyLive) refreshLiveScores();
-    }, LIVE_SCORES_INTERVAL_MS));
+    // The header poll + hot verdict loop ride the worker-metronome ticker:
+    // it keeps running when the tab is hidden (alerts must fire then) and
+    // speeds up to LIVE_SCORES_HOT_INTERVAL_MS while any score is at risk.
+    startLiveTicker();
   }
+
+  // ---- Live ticker (worker metronome) ---------------------------------------
+  // Why a worker: Chrome-family browsers throttle DOM timers of a HIDDEN page
+  // — wake ups align to 1/second, and a page hidden >5 minutes whose timer
+  // chain is ≥5 deep and that has been silent for 30s is woken only once per
+  // MINUTE (verified line by line against developer.chrome.com's
+  // timer-throttling-in-chrome-88 post and the chromestatus entry, which
+  // scopes the feature to "wake ups from DOM Timers ... in a page that has
+  // been hidden" — see README). An alert surface is silent and hidden exactly
+  // when its header poll matters most, so the old 250 ms setInterval was
+  // effectively a 1/minute poll in the background. A dedicated worker's
+  // postMessage delivery is a message task, not a DOM-timer wake-up, so the
+  // page keeps ticking; fetch() and Web Audio are not timer-throttled. The
+  // audible chime additionally re-qualifies the page for the 1/second group
+  // for 30s after any alert (the blog's "made noises" exemption). When
+  // Workers are unavailable (Node tests, ancient browsers) a plain
+  // setInterval fallback drives the identical step.
+  function pageHidden() {
+    return typeof document !== 'undefined' && !!document.hidden;
+  }
+
+  var liveTicker = null;
+  var liveTickerNextHeaderAt = 0;
+  var liveTickerHotCount = 0;
+
+  function createTickerClock(stepMs, onTick) {
+    function fallbackTimer() {
+      var id = setInterval(onTick, stepMs);
+      return { stop: function () { clearInterval(id); }, worker: false };
+    }
+    if (typeof Worker === 'undefined' || typeof Blob === 'undefined' ||
+        typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') {
+      return fallbackTimer();
+    }
+    try {
+      var src = 'setInterval(function () { postMessage(1); }, ' + Number(stepMs) + ');';
+      var url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+      var w = new Worker(url);
+      w.onmessage = function () { onTick(); };
+      return {
+        stop: function () {
+          try { w.terminate(); } catch (e) {}
+          try { URL.revokeObjectURL(url); } catch (e2) {}
+        },
+        worker: true
+      };
+    } catch (e) {
+      return fallbackTimer();
+    }
+  }
+
+  // One metronome step: run the hot verdict loop (its own interval math gates
+  // fetches), then poll the header feed when due. The interval adapts to the
+  // hot count, and the poll runs while hidden — refreshLiveScores only skips
+  // DOM paints there, never the feed read or the alert.
+  function liveTickerStep() {
+    if (state.view !== 'scoreboard') return;
+    var now = Date.now();
+    var hotCount = boothHotLoopTick();
+    liveTickerHotCount = hotCount;
+    var anyLive = state.games.some(function (g) { return g.status && g.status.state === 'in'; });
+    if (!anyLive || state.booth.paused) {
+      liveTickerNextHeaderAt = now + LIVE_SCORES_INTERVAL_MS;
+      return;
+    }
+    if (now < liveTickerNextHeaderAt || liveHeaderInFlight) return;
+    liveTickerNextHeaderAt = now + liveTickerIntervalMs(hotCount);
+    refreshLiveScores();
+  }
+
+  function startLiveTicker() {
+    stopLiveTicker();
+    liveTickerNextHeaderAt = 0;
+    liveTickerHotCount = 0;
+    liveTicker = createTickerClock(LIVE_TICKER_STEP_MS, liveTickerStep);
+  }
+
+  function stopLiveTicker() {
+    if (liveTicker) {
+      liveTicker.stop();
+      liveTicker = null;
+    }
+  }
+
 
   function weekForDate(calendar, dateStr) {
     var dt = new Date(dateStr.slice(0, 4) + '-' + dateStr.slice(4, 6) + '-' + dateStr.slice(6, 8) + 'T12:00:00Z');
@@ -3378,6 +3704,7 @@
     opts = opts || {};
     var url = espnCorePlaysUrl(eventId);
     if (!url) return null;
+    if (opts.fresh) url = freshBustUrl(url);
     var rawItems = [];
     var viaProxy = false;
     var proxy = null;
@@ -3825,18 +4152,25 @@
   // carries the full normalized plays incl. start.yardsToEndzone + penalties
   // the booth needs), then the verified Core API plays index, then the NCAA
   // fallback (text/penalty only — no field position). Returns normalized plays.
-  async function fetchPlaysForGame(game) {
+  // opts.fresh appends a cache-buster so a latency-critical pull cannot be
+  // served the routine pass's micro-cached body; opts.lane selects the
+  // provider-gate lane (the booth's fast/hot paths use the secondary lane so
+  // they are never queued behind a routine 8-game booth pass).
+  async function fetchPlaysForGame(game, opts) {
+    opts = opts || {};
+    var lane = opts.lane == null ? LANE_BOOTH : opts.lane;
     if (!game || !game.id) return { plays: [], source: game && game.source ? game.source : 'espn' };
     var id = String(game.id);
     // 1) ESPN summary plays.
     try {
-      var r = await espnFetch(summaryUrl(id), 10000, { lane: LANE_BOOTH });
+      var summaryUrl_ = opts.fresh ? freshBustUrl(summaryUrl(id)) : summaryUrl(id);
+      var r = await espnFetch(summaryUrl_, 10000, { lane: lane });
       var d = parseSummary(r.data);
       if (d.plays.length) return { plays: d.plays, detail: d, source: 'espn' };
     } catch (e) { /* try the next source */ }
     // 2) Core API plays (small, paginated; the historical backfill path).
     try {
-      var core = await fetchCorePlays(id, { lane: LANE_BOOTH });
+      var core = await fetchCorePlays(id, { lane: lane, fresh: !!opts.fresh });
       if (core && core.plays.length) return { plays: core.plays, source: 'espn-core' };
     } catch (e) { /* try the NCAA fallback */ }
     // 3) NCAA fallback for NCAA-source games that refuse the ESPN endpoints.
@@ -3918,9 +4252,13 @@
     announceNewBoothEvents(fresh);
     // Refresh both the day feed and the per-row REVIEW / NULLIFIED badges
     // without waiting for a score/status change to repaint the scoreboard.
-    renderDayBooth();
-    renderScoreboard();
-    renderDiag();
+    // The alert above always runs — hidden tabs are the whole point of the
+    // worker ticker — only the DOM paint waits for the visibility repaint.
+    if (!pageHidden()) {
+      renderDayBooth();
+      renderScoreboard();
+      renderDiag();
+    }
   }
 
   function boothGameFromId(id) {
@@ -3982,7 +4320,11 @@
     state.booth.fastFetchAt[id] = now;
     state.booth.fastFetchInFlight[id] = true;
     try {
-      var fetched = await fetchPlaysForGame(game);
+      // fresh: bypass the relay/browser micro-cache so the confirmation gets
+      // the provider's current body, not the routine pass's cached one.
+      // LANE_AUX: a fast path must never queue behind the booth lane's
+      // routine 8-game pass — the secondary lane preempts it.
+      var fetched = await fetchPlaysForGame(game, { fresh: true, lane: LANE_AUX });
       if (state.view !== 'scoreboard') return;
       applyBoothGame(game, fetched.plays);
       state.booth.lastFetch[id] = { t: Date.now(), wasLive: !!(game.status && game.status.state === 'in'), fast: reason || 'immediate' };
@@ -4019,6 +4361,72 @@
     refreshLiveBoothImmediate(id, 'score-drop', 'score-drop:' + String(id) + ':' + Date.now(), true);
   }
 
+  // ---- Hot-game verdict loop -------------------------------------------------
+  // The paced all-games pass re-fetches each live game at
+  // max(1s, liveGames * 400ms) — polite on a 39-game Saturday, but far too
+  // slow while a scoring play is WAITING ON A VERDICT: on a full slate that
+  // is 15.6s between looks at the very game whose points are in danger. The
+  // hot loop gives at-risk games their own 800ms cadence (LIVE_HOT_GAME_
+  // INTERVAL_MS) through the secondary provider lane, with a cache-busted
+  // fetch, running even when the tab is hidden (alerts matter most then).
+  // It only READS the verified feeds faster; it never invents an alert —
+  // announceNewBoothEvents still decides on the play text / score rollback.
+
+  // Arm (or re-arm) one game's hot window. Called when the fast header feed
+  // flags a potential at-risk/nullified score and by the tick scan while a
+  // cached risk is genuinely unresolved. The absolute per-episode cap
+  // (LIVE_HOT_MAX_WINDOW_MS) stops a provider bug that never publishes a
+  // verdict from polling one game forever.
+  function armBoothHotGame(id) {
+    if (id == null) return;
+    var idStr = String(id);
+    var now = Date.now();
+    var first = state.booth.hotArmedAt[idStr];
+    if (first == null || now - first > LIVE_HOT_MAX_WINDOW_MS) {
+      state.booth.hotArmedAt[idStr] = now; // a new at-risk episode
+    }
+    state.booth.hotUntil[idStr] = Math.min(now + LIVE_HOT_WINDOW_MS, state.booth.hotArmedAt[idStr] + LIVE_HOT_MAX_WINDOW_MS);
+  }
+
+  // One hot-loop step (every LIVE_TICKER_STEP_MS). Re-arms windows for games
+  // whose cached booth still shows an unresolved at-risk score, drops state
+  // for games that left the slate, then fetches due hot games — each at most
+  // one immediate fetch per LIVE_HOT_GAME_INTERVAL_MS (fastFetchAt is shared
+  // with the score-risk fast path, so the two never double-fetch), at most 2
+  // fast fetches in flight. Returns the hot-game count for the adaptive
+  // header cadence (liveTickerIntervalMs).
+  function boothHotLoopTick() {
+    if (state.view !== 'scoreboard' || state.booth.paused) return 0;
+    var now = Date.now();
+    var known = {};
+    (state.games || []).forEach(function (g) { if (g && g.id != null) known[String(g.id)] = true; });
+    Object.keys(state.booth.eventsByGame).forEach(function (gid) {
+      if (!known[gid]) {
+        delete state.booth.hotUntil[gid];
+        delete state.booth.hotArmedAt[gid];
+        return;
+      }
+      if (boothHasUnresolvedRisk(state.booth.eventsByGame[gid])) armBoothHotGame(gid);
+    });
+    var hot = boothHotGameIds(state.booth.eventsByGame, state.booth.hotUntil, now, LIVE_HOT_GAME_MAX);
+    var inFlight = 0;
+    Object.keys(state.booth.fastFetchInFlight).forEach(function (k) {
+      if (state.booth.fastFetchInFlight[k]) inFlight += 1;
+    });
+    hot.forEach(function (gid) {
+      if (inFlight >= 2) return;                       // keep the fast lane narrow
+      if (state.booth.fastFetchInFlight[gid]) return;  // one per game
+      if (now - (state.booth.hotLastFetch[gid] || 0) < LIVE_HOT_GAME_INTERVAL_MS) return;
+      if (now - (state.booth.fastFetchAt[gid] || 0) < LIVE_HOT_GAME_INTERVAL_MS) return; // a fast path just fetched it
+      var game = boothGameFromId(gid);
+      if (!game) { delete state.booth.hotUntil[gid]; return; }
+      state.booth.hotLastFetch[gid] = now;
+      inFlight += 1;
+      refreshLiveBoothImmediate(gid, 'hot-loop', 'hot-loop:' + gid + ':' + now, true);
+    });
+    return hot.length;
+  }
+
   // Recompute the cached booth for the currently open game (used whenever its
   // play-by-play refreshes live).
   function rebuildGameBoothFromDetail() {
@@ -4040,6 +4448,17 @@
   async function buildDayBooth(mode) {
     if (state.booth.passInFlight) return state.booth.feed;
     var run = boothRun;
+    // While a verdict is pending somewhere (a hot game exists), the hot loop
+    // owns the booth's request budget: routine poll passes defer so the hot
+    // game's 0.8 s authoritative cadence and the 0.2 s header cadence are
+    // never the reason a provider throttles us. Seed passes still run so a
+    // freshly selected day always loads; any NEW at-risk play in another game
+    // is still caught instantly by the (hotter) header fast path.
+    if (mode !== 'seed' &&
+        boothHotGameIds(state.booth.eventsByGame, state.booth.hotUntil, Date.now(), LIVE_HOT_GAME_MAX).length) {
+      state.booth.lastPass = { mode: 'poll-deferred-hot', at: Date.now(), requested: 0, fetched: 0 };
+      return state.booth.feed;
+    }
     state.booth.passInFlight = true;
     try {
       var currentGames = state.games || [];
@@ -4279,7 +4698,10 @@
 
   function dayBoothMsgHTML(e, liveNow) {
     var q = periodLabel(e.quarter);
-    var when = [q, e.clock].filter(Boolean).join(' · ');
+    // Chronological proof on the row itself: the provider's real wallclock in
+    // ET (never the estimated ordering fallback — approximations are not
+    // displayed as times).
+    var when = [q, e.clock, boothETLabel(e.time)].filter(Boolean).join(' · ');
     var kind = BOOTH_KIND_LABEL[e.kind] || e.kind;
     var result = e.result ? (BOOTH_RESULT_LABEL[e.result] || e.result) : '';
     var duringScore = (e.duringAwayScore != null && e.duringHomeScore != null)
@@ -4341,7 +4763,7 @@
 
   function boothMsgHTML(e, isNew) {
     var q = periodLabel(e.quarter);
-    var when = [q, e.clock].filter(Boolean).join(' · ');
+    var when = [q, e.clock, boothETLabel(e.time)].filter(Boolean).join(' · ');
     var kind = BOOTH_KIND_LABEL[e.kind] || e.kind;
     var result = e.result ? (BOOTH_RESULT_LABEL[e.result] || e.result) : '';
     var duringScore = (e.duringAwayScore != null && e.duringHomeScore != null)
@@ -4405,10 +4827,13 @@
     var scanned = Object.keys(state.booth.eventsByGame).length;
 
     // Cadence copy states what the wiring actually does: the header feed ticks
-    // every 0.25 s (serialised, so its real rate is one fetch at a time), and
-    // each game's play-by-play re-fetches at max(1 s, liveGames * 0.25 s) —
-    // 1 s on a light slate, gently paced on a 30-game Saturday so the
-    // scoreboard's own requests never queue behind a 39-summary stampede.
+    // every 0.25 s (0.2 s while any scoring play is at risk), serialized so
+    // its real rate is one fetch at a time, and each game's play-by-play
+    // re-fetches at max(1 s, liveGames * 0.4 s) — 1 s on a light slate,
+    // gently paced on a 30-game Saturday so the scoreboard's own requests
+    // never queue behind a 39-summary stampede. A game whose score is at
+    // risk is exempt from that pacing: the hot verdict loop re-fetches it
+    // every 0.8 s while its verdict pends.
     var liveScannable = state.games.filter(function (g) {
       return g.status && g.status.state === 'in' && g.playByPlayAvailable !== false;
     }).length;
@@ -4416,7 +4841,7 @@
     var pbpLabel = pbpSecs % 1 ? pbpSecs.toFixed(1).replace(/\.0$/, '') + 's' : pbpSecs + 's';
 
     var foot = 'LIVE shows scoring plays at risk (flag · challenge · replay review · under review on the play) and nullified scores · routine flags stay in the tracking tabs · pulled from ESPN play-by-play · ' +
-      'tracks score before → during → after · scoring scope: touchdown, field goal, safety, PAT & 2-pt · score/status 0.25s · score-risk fetch ≤0.5s · play-by-play ' + pbpLabel + '/game' +
+      'tracks score before → during → after · scoring scope: touchdown, field goal, safety, PAT & 2-pt · score/status 0.25s (0.2s while any score is at risk) · score-risk fetch ≤0.5s · at-risk verdict fetch 0.8s · play-by-play ' + pbpLabel + '/game' +
       (scannable ? ' · games scanned ' + scanned + ' of ' + scannable : '') +
       (liveCount ? ' · ' + liveCount + ' game' + (liveCount === 1 ? '' : 's') + ' live' : '');
 
@@ -4637,7 +5062,10 @@
     liveHeaderInFlight = true;
     try {
       var url = LIVE_HEADER_URL + '&_=' + Date.now();
-      var r = await espnFetch(url, 4000, { lane: LANE_AUX });
+      // LIVE_HEADER_TIMEOUT_MS bounds one attempt so a dead transport chain
+      // cannot stall the serial ticker for many seconds; a healthy round trip
+      // is far below it.
+      var r = await espnFetch(url, LIVE_HEADER_TIMEOUT_MS, { lane: LANE_AUX });
       var evs = liveHeaderEvents(r.data);
       var byId = {};
       evs.forEach(function (e) { if (e && e.id != null) byId[String(e.id)] = e; });
@@ -4726,18 +5154,26 @@
       // Lowest-latency path: merge the changed live play into that game's booth
       // events and announce any nullified score before the paced PBP pass runs.
       Object.keys(liveBoothDirty).forEach(refreshLiveBoothForGame);
-      // If the 250 ms header feed shows a score or score-adjacent booth event,
-      // pull PBP immediately so any later overturn/No Play has context without
-      // waiting for the next scheduled all-games pass.
+      // If the 150/250 ms header feed shows a score or score-adjacent booth
+      // event, pull PBP immediately so any later overturn/No Play has context
+      // without waiting for the next scheduled all-games pass, and ARM the
+      // hot verdict loop — this game now gets its own 800 ms cadence until
+      // the verdict resolves.
       Object.keys(scoreRiskDirty).forEach(function (gid) {
+        armBoothHotGame(gid);
         refreshLiveBoothForScoreRisk(gid, scoreRiskDirty[gid].play, scoreRiskDirty[gid].reason);
       });
       // A header score drop means points left the board; pull that game's
-      // play-by-play forward for the fastest authoritative confirmation.
+      // play-by-play forward for the fastest authoritative confirmation and
+      // keep the hot loop on it until the nullifying row is confirmed.
       Object.keys(scoreDropDirty).forEach(function (gid) {
+        armBoothHotGame(gid);
         refreshLiveBoothForScoreDrop(gid);
       });
       if (changed) {
+        // Hidden tabs still read the feed and alert; only the paint waits for
+        // the visibilitychange repaint.
+        if (pageHidden()) return;
         if (state.view === 'scoreboard') renderScoreboard();
         else if (state.view === 'game') render();
       }
@@ -5149,6 +5585,9 @@
         passInFlight: !!state.booth.passInFlight,
         pbpIntervalMs: state.booth.pbpIntervalMs,
         scoreRiskRefetchMs: LIVE_SCORE_RISK_REFETCH_MS,
+        hotGames: boothHotGameIds(state.booth.eventsByGame, state.booth.hotUntil, Date.now(), LIVE_HOT_GAME_MAX),
+        headerIntervalMs: liveTickerIntervalMs(liveTickerHotCount),
+        tickerWorker: !!(liveTicker && liveTicker.worker),
         fastFetchInFlight: Object.keys(state.booth.fastFetchInFlight || {}).filter(function (id) { return state.booth.fastFetchInFlight[id]; }),
         lastError: state.booth.lastError,
         gate: providerGate.stats()
@@ -5349,6 +5788,11 @@
       if (document.visibilityState !== 'hidden') {
         if (state.view === 'scoreboard') {
           refreshLiveScores();
+          // Hidden tabs kept reading the feed via the worker ticker but only
+          // alerted — repaint everything the skipped paints owe the user.
+          renderDayBooth();
+          renderScoreboard();
+          renderDiag();
           // A due-only pass — returning focus must not re-seed every game of
           // the day on top of the scoreboard reload below.
           buildDayBooth('poll').then(function () { if (state.view === 'scoreboard') renderDayBooth(); }).catch(function () {});
@@ -5442,6 +5886,8 @@
     DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS,
     BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
     BOOTH_RISK_LOOKBACK: BOOTH_RISK_LOOKBACK,
+    BOOTH_QUARTER_WALL_MS: BOOTH_QUARTER_WALL_MS,
+    BOOTH_QUARTER_GAME_MS: BOOTH_QUARTER_GAME_MS,
     boothClassify: boothClassify,
     boothResult: boothResult,
     boothMentionsScore: boothMentionsScore,
@@ -5470,6 +5916,14 @@
     boothScoreDropped: boothScoreDropped,
     boothScoreRiskReason: boothScoreRiskReason,
     boothFastFetchKey: boothFastFetchKey,
+    liveTickerIntervalMs: liveTickerIntervalMs,
+    boothHotGameIds: boothHotGameIds,
+    boothHasUnresolvedRisk: boothHasUnresolvedRisk,
+    freshBustUrl: freshBustUrl,
+    boothClockMs: boothClockMs,
+    boothEventAt: boothEventAt,
+    boothETLabel: boothETLabel,
+    boothFeedChronoCompare: boothFeedChronoCompare,
     lastPlayBooth: lastPlayBooth,
     boothRefreshPlan: boothRefreshPlan,
     createProviderGate: createProviderGate,
@@ -5478,6 +5932,13 @@
     scorePair: scorePair,
     LIVE_HEADER_URL: LIVE_HEADER_URL,
     LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
+    LIVE_SCORES_HOT_INTERVAL_MS: LIVE_SCORES_HOT_INTERVAL_MS,
+    LIVE_HOT_GAME_INTERVAL_MS: LIVE_HOT_GAME_INTERVAL_MS,
+    LIVE_HOT_GAME_MAX: LIVE_HOT_GAME_MAX,
+    LIVE_HOT_WINDOW_MS: LIVE_HOT_WINDOW_MS,
+    LIVE_HOT_MAX_WINDOW_MS: LIVE_HOT_MAX_WINDOW_MS,
+    LIVE_TICKER_STEP_MS: LIVE_TICKER_STEP_MS,
+    LIVE_HEADER_TIMEOUT_MS: LIVE_HEADER_TIMEOUT_MS,
     LIVE_REVIEWS_INTERVAL_MS: LIVE_REVIEWS_INTERVAL_MS,
     LIVE_SCORE_RISK_REFETCH_MS: LIVE_SCORE_RISK_REFETCH_MS,
     SCOREBOARD_INTERVAL_MS: SCOREBOARD_INTERVAL_MS,
