@@ -1473,6 +1473,92 @@ function waitForPort(url, ms) {
       'the armed window needs an absolute per-episode cap');
   });
 
+  test('boothClockMs parses quarter-clock displayValues and rejects junk', () => {
+    assert.strictEqual(NB.boothClockMs('5:19'), 5 * 60 * 1000 + 19 * 1000);
+    assert.strictEqual(NB.boothClockMs('15:00'), 15 * 60 * 1000);
+    assert.strictEqual(NB.boothClockMs('0:59'), 59 * 1000);
+    assert.strictEqual(NB.boothClockMs('1:05:00'), 65 * 60 * 1000);
+    assert.strictEqual(NB.boothClockMs(''), null);
+    assert.strictEqual(NB.boothClockMs(null), null);
+    assert.strictEqual(NB.boothClockMs('2nd & 10'), null);
+  });
+
+  test('boothEventAt: exact wallclock first, monotone estimates within a game, kickoff/zero fallbacks', () => {
+    const K = Date.parse('2026-09-05T16:00:00Z');
+    const exact = Date.parse('2026-09-05T21:41:09Z');
+    // 1. The provider's own wallclock always wins.
+    assert.strictEqual(NB.boothEventAt({ time: exact, quarter: 1, clock: '14:00' }, K), exact);
+    // 2. Estimate rises with quarter and with elapsed clock inside a quarter.
+    const q1Early = NB.boothEventAt({ quarter: 1, clock: '14:00' }, K);
+    const q1Late = NB.boothEventAt({ quarter: 1, clock: '2:00' }, K);
+    const q2 = NB.boothEventAt({ quarter: 2, clock: '14:00' }, K);
+    const q4 = NB.boothEventAt({ quarter: 4, clock: '0:01' }, K);
+    const ot = NB.boothEventAt({ quarter: 5, clock: '14:00' }, K);
+    assert.ok(q1Early > K && q1Late > q1Early && q2 > q1Late && q4 > q2 && ot > q4, 'monotone within a game: ' + [q1Early, q1Late, q2, q4, ot].join(','));
+    assert.strictEqual(q1Early, K + 60 * 1000); // 15:00-14:00 = one minute elapsed
+    assert.strictEqual(q2, K + NB.BOOTH_QUARTER_WALL_MS + 60 * 1000);
+    // No clock -> quarter fully elapsed (sorts after any clocked row of that quarter).
+    const noClock = NB.boothEventAt({ quarter: 2 }, K);
+    assert.ok(noClock > q2 && noClock <= K + 2 * NB.BOOTH_QUARTER_WALL_MS);
+    // 3. No quarter -> kickoff; no kickoff -> 0; nothing -> 0.
+    assert.strictEqual(NB.boothEventAt({ quarter: 0 }, K), K);
+    assert.strictEqual(NB.boothEventAt({ quarter: 2, clock: '5:00' }, 0), 0);
+    assert.strictEqual(NB.boothEventAt(null, K), 0);
+  });
+
+  test('the all-games feed is ordered chronologically by happened time, not discovery order', () => {
+    // Game gB (late kickoff) is fetched FIRST; its nullified verdict happened
+    // at 21:45Z. Game gA (early kickoff) is fetched SECOND; its at-risk review
+    // happened around 16:27Z. Discovery order would show the later play on
+    // top; chronological order must show the earlier play first.
+    const tLate = Date.parse('2026-09-05T21:45:00Z');
+    const evLate = { id: 'b1', seq: 5, kind: 'replay', text: 'After further review, the ruling on the field is overturned. The play is nullified.', quarter: 4, clock: '1:02', time: tLate, atRisk: false, removesPoints: true, pointsRemoved: 7 };
+    const evEarly = { id: 'a1', seq: 3, kind: 'review', text: 'The play is under further review.', quarter: 2, clock: '8:00', time: 0, atRisk: true, removesPoints: false, pointsRemoved: 0 };
+    const gB = { id: 'gB', shortName: 'B @ Y', awayAbbr: 'B', homeAbbr: 'Y', date: '2026-09-05T21:00:00Z', live: true, events: [evLate] };
+    const gA = { id: 'gA', shortName: 'A @ X', awayAbbr: 'A', homeAbbr: 'X', date: '2026-09-05T16:00:00Z', live: true, events: [evEarly] };
+    const fresh = NB.dayBoothFeed([gB, gA]);           // discovery order: gB first
+    assert.strictEqual(fresh[0].gameId, 'gB', 'pre-sort feed keeps discovery order');
+    const feed = NB.reconcileDayBoothFeed([], fresh);  // reconcile owns the chronological order
+    assert.strictEqual(feed.length, 2);
+    assert.strictEqual(feed[0].gameId, 'gA', 'the earlier happened play sorts first (estimate 16:27Z < exact 21:45Z)');
+    assert.strictEqual(feed[1].gameId, 'gB');
+    assert.ok(feed[0].at < feed[1].at);
+    // The LIVE alert surface preserves that order.
+    const live = NB.dayBoothLiveEvents(feed);
+    assert.deepStrictEqual(live.map((e) => e.gameId), ['gA', 'gB']);
+    // Deterministic + stable: reconciling an in-place update of the SAME row
+    // (verdict text changes, same key, same at) keeps the identical order.
+    const evLateUpdate = Object.assign({}, evLate, { text: 'After further review, the ruling on the field is overturned. Therefore, no touchdown.' });
+    const again = NB.reconcileDayBoothFeed(feed, NB.dayBoothFeed([gB, gA].map((g) => g.id === 'gB' ? Object.assign({}, g, { events: [evLateUpdate] }) : g)));
+    assert.deepStrictEqual(again.map((e) => e.gameId), ['gA', 'gB'], 'in-place update keeps chronological position');
+    assert.ok(again[1].text.indexOf('no touchdown') !== -1, 'the updated row content replaced the old one');
+  });
+
+  test('a live header copy without wallclock never clobbers the cached play timestamp', () => {
+    const W = '2026-09-05T21:38:44Z';
+    const cached = boothNorm({ id: 'p9', sequenceNumber: '9', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, wallclock: W, awayScore: 0, homeScore: 0 });
+    const liveCopy = boothNorm({ id: 'hdr-p9', sequenceNumber: undefined, text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0 });
+    assert.strictEqual(cached.time, Date.parse(W));
+    assert.strictEqual(liveCopy.time, 0, 'header rows carry no wallclock (verified live)');
+    const evs = NB.boothEvents([cached], liveCopy, {});
+    const ev = evs.find((e) => e.text.indexOf('PENALTY TA&M') !== -1);
+    assert.strictEqual(ev.time, Date.parse(W), 'the merged row keeps the cached exact wallclock');
+    // And the row a header copy REPLACED by id keeps it too (Object.assign guard).
+    const liveSameId = boothNorm({ id: 'p9', sequenceNumber: '9', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, awayScore: 0, homeScore: 0 });
+    const evs2 = NB.boothEvents([cached], liveSameId, {});
+    assert.strictEqual(evs2.find((e) => e.text.indexOf('PENALTY TA&M') !== -1).time, Date.parse(W));
+  });
+
+  test('boothETLabel renders a real wallclock in ET and never renders an estimate or junk', () => {
+    // 2026-09-05T21:41:09Z is 5:41 PM Eastern (UTC-4, daylight time).
+    const label = NB.boothETLabel(Date.parse('2026-09-05T21:41:09Z'));
+    assert.ok(/ET$/.test(label), label);
+    assert.ok(/5:41/.test(label), label);
+    assert.strictEqual(NB.boothETLabel(0), '');
+    assert.strictEqual(NB.boothETLabel(undefined), '');
+    assert.strictEqual(NB.boothETLabel(NaN), '');
+  });
+
   test('live merge: a stale header copy of the scoring play must not resolve a pending review (harness-found regression, 2026-09-05)', () => {
     // The fast paths create this transition deliberately: the immediate PBP
     // fetch lands a summary that already contains TD + "under further

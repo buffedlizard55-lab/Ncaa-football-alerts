@@ -1603,6 +1603,19 @@
   // window is tight on purpose: a routine flag three plays after a score
   // (e.g. on the kickoff) cannot remove that score and must not alert.
   var BOOTH_RISK_LOOKBACK = 3;
+  // Chronological ordering of the all-games feed. The provider publishes an
+  // absolute `wallclock` on most plays (verified in the captured fixtures —
+  // but NOT on every play), and the live header lastPlay carries none, so
+  // ordering needs a documented fallback chain (boothEventAt):
+  //   1. the play's own wallclock (exact);
+  //   2. else an ESTIMATE from the game's kickoff + quarter + game clock
+  //      (BOOTH_QUARTER_WALL_MS wall minutes per quarter is an
+  //      approximation — exact for ordering WITHIN a game, approximate
+  //      across games only for the rows the provider left without a
+  //      wallclock; never displayed as a time);
+  //   3. else the kickoff itself.
+  var BOOTH_QUARTER_WALL_MS = 20 * 60 * 1000;  // estimated wall minutes per quarter (ordering only)
+  var BOOTH_QUARTER_GAME_MS = 15 * 60 * 1000;  // NCAA game clock per quarter
   // Global cap on provider transport attempts. A browser keeps ~6 open
   // connections per origin (documented Chromium behaviour), and the app
   // relay is same-origin, so the booth is deliberately limited to
@@ -1721,6 +1734,69 @@
     var u = String(url || '');
     if (!u) return u;
     return u + (u.indexOf('?') === -1 ? '?_=' : '&_=') + (ts != null ? ts : Date.now());
+  }
+
+  // ---- Chronological ordering of the all-games feed ---------------------------
+  // The live alert surface must show alerts in the order the plays HAPPENED,
+  // not the order the polls discovered them (a 39-game pass fetches games in
+  // plan order, so discovery order is effectively arbitrary across games).
+  // Every feed item carries `at`, computed by boothEventAt:
+  //   1. the play's provider-published `wallclock` (exact — normalizePlay
+  //      parses it to ms; verified present on most, not all, captured plays);
+  //   2. else kickoff + (quarter-1) * BOOTH_QUARTER_WALL_MS + elapsed game
+  //      clock in the quarter — an estimate that is exact for ordering
+  //      WITHIN a game and approximate across games (documented, never
+  //      displayed as a time);
+  //   3. else the kickoff timestamp itself.
+
+  // 'MM:SS' (or 'H:MM:SS') quarter-clock displayValue -> REMAINING ms.
+  function boothClockMs(clock) {
+    var m = String(clock || '').match(/^(\d+):(\d{2})(?::(\d{2}))?$/);
+    if (!m) return null;
+    if (m[3] != null) return (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) * 1000;
+    return (Number(m[1]) * 60 + Number(m[2])) * 1000;
+  }
+
+  function boothEventAt(event, kickoffMs) {
+    if (!event) return 0;
+    if (event.time) {
+      var t = Number(event.time) || 0;
+      if (t) return t;                       // exact provider wallclock
+    }
+    var k = Number(kickoffMs) || 0;
+    if (!k) return 0;
+    var q = Number(event.quarter) || 0;
+    if (q < 1) return k;                     // no quarter info: kickoff
+    var remaining = boothClockMs(event.clock);
+    var elapsedInQuarter = remaining == null ? BOOTH_QUARTER_GAME_MS : Math.max(0, BOOTH_QUARTER_GAME_MS - remaining);
+    return k + (q - 1) * BOOTH_QUARTER_WALL_MS + elapsedInQuarter;
+  }
+
+  // Eastern-time label for a REAL wallclock only ('9:41 PM ET'). Never pass
+  // the estimated `at` value — approximations must not be displayed as times.
+  function boothETLabel(ms) {
+    var n = Number(ms) || 0;
+    if (!n || isNaN(n)) return '';
+    try {
+      return new Date(n).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/New_York' }) + ' ET';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  // Ascending happened-time order (oldest first, newest last — the feed is a
+  // chat-style surface that autoscrolls to the bottom). Ties break by
+  // kickoff, then the feed key, so the order is deterministic and stable
+  // across re-renders and in-place row updates.
+  function boothFeedChronoCompare(a, b) {
+    if (!a || !b) return 0;
+    var atA = Number(a.at) || 0, atB = Number(b.at) || 0;
+    if (atA !== atB) return atA - atB;
+    var kA = Number(a.kickoff) || 0, kB = Number(b.kickoff) || 0;
+    if (kA !== kB) return kA - kB;
+    var sA = String(a.key != null ? a.key : ''), sB = String(b.key != null ? b.key : '');
+    if (sA === sB) return 0;
+    return sA < sB ? -1 : 1;
   }
 
   function boothKindCounts(events) {
@@ -2120,6 +2196,7 @@
       result: boothResult(p.text),
       quarter: p.period,
       clock: p.clock,
+      time: p.time || 0, // provider wallclock (ms) — the exact chronological order key
       downDistance: p.downDistance || '',
       awayScore: p.awayScore != null ? p.awayScore : null,
       homeScore: p.homeScore != null ? p.homeScore : null,
@@ -2394,6 +2471,11 @@
       var orig = ctx[at];
       var merged = Object.assign({}, orig, lastPlay);
       if (keepSeq || lastPlay.seq == null || lastPlay.seq === '' || Number(lastPlay.seq) === 0) merged.seq = orig.seq;
+      // Same rule for the wallclock: the live header copy carries no
+      // wallclock (verified live 2026-09-05), so without this guard it would
+      // zero the cached play's exact timestamp and knock the row out of
+      // chronological order onto the estimated fallback.
+      if (!merged.time) merged.time = orig.time;
       ctx[at] = merged;
     } else {
       var copy = Object.assign({}, lastPlay);
@@ -2445,6 +2527,7 @@
           : String(g.id) + ':seq:' + (e.seq != null ? e.seq : '') + ':' + e.kind + ':' + (e.text || '');
         if (seen[key]) return;
         seen[key] = true;
+        var kickoff = g.date ? (Date.parse(g.date) || 0) : 0;
         out.push(Object.assign({}, e, {
           key: key,
           gameId: g.id,
@@ -2452,6 +2535,8 @@
           awayAbbr: g.awayAbbr || '',
           homeAbbr: g.homeAbbr || '',
           date: g.date || null,
+          kickoff: kickoff,
+          at: boothEventAt(e, kickoff),   // happened-time key (see boothEventAt)
           liveGame: !!g.live
         }));
       });
@@ -2459,10 +2544,14 @@
     return out;
   }
 
-  // Preserve chat discovery order while replacing items whose source play was
-  // updated in place (for example "under review" becoming "overturned").
-  // Items no longer present in `fresh` stay in history; genuinely new keys are
-  // appended.
+  // Keep every discovered item exactly once (in-place updates replace their
+  // row), then order the whole feed CHRONOLOGICALLY by when each play
+  // HAPPENED (boothFeedChronoCompare: wallclock, then the documented
+  // kickoff+quarter estimate, then kickoff, then key). Discovery order used
+  // to be preserved here, which interleaved games by fetch order — a later
+  // nullification fetched first would sit above an earlier at-risk review
+  // fetched second. Sorting after every reconcile keeps the order stable:
+  // an in-place update carries the same `at` and lands back where it was.
   function reconcileDayBoothFeed(existing, fresh) {
     var out = (existing || []).slice();
     var positions = {};
@@ -2479,6 +2568,7 @@
       if (key) positions[key] = out.length;
       out.push(item);
     });
+    out.sort(boothFeedChronoCompare);
     return out;
   }
 
@@ -2659,6 +2749,7 @@
       BOOTH_KINDS: BOOTH_KINDS, BOOTH_KIND_LABEL: BOOTH_KIND_LABEL, BOOTH_RESULT_LABEL: BOOTH_RESULT_LABEL,
       BOOTH_FILTERS: BOOTH_FILTERS, DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS, BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
       BOOTH_RISK_LOOKBACK: BOOTH_RISK_LOOKBACK,
+      BOOTH_QUARTER_WALL_MS: BOOTH_QUARTER_WALL_MS, BOOTH_QUARTER_GAME_MS: BOOTH_QUARTER_GAME_MS,
       boothClassify: boothClassify, boothResult: boothResult, boothMentionsScore: boothMentionsScore,
       nullifiedScoreText: nullifiedScoreText, boothEventNullifies: boothEventNullifies,
       boothEventRiskPending: boothEventRiskPending, boothRiskResolvedAhead: boothRiskResolvedAhead,
@@ -2673,6 +2764,7 @@
       boothScoreDropped: boothScoreDropped, boothScoreRiskReason: boothScoreRiskReason, boothFastFetchKey: boothFastFetchKey,
       liveTickerIntervalMs: liveTickerIntervalMs, boothHotGameIds: boothHotGameIds,
       boothHasUnresolvedRisk: boothHasUnresolvedRisk, freshBustUrl: freshBustUrl,
+      boothClockMs: boothClockMs, boothEventAt: boothEventAt, boothETLabel: boothETLabel, boothFeedChronoCompare: boothFeedChronoCompare,
       lastPlayBooth: lastPlayBooth, boothRefreshPlan: boothRefreshPlan, createProviderGate: createProviderGate,
       isRateLimitError: isRateLimitError,
       scorePair: scorePair, LIVE_HEADER_URL: LIVE_HEADER_URL, LIVE_SCORES_INTERVAL_MS: LIVE_SCORES_INTERVAL_MS,
@@ -4606,7 +4698,10 @@
 
   function dayBoothMsgHTML(e, liveNow) {
     var q = periodLabel(e.quarter);
-    var when = [q, e.clock].filter(Boolean).join(' · ');
+    // Chronological proof on the row itself: the provider's real wallclock in
+    // ET (never the estimated ordering fallback — approximations are not
+    // displayed as times).
+    var when = [q, e.clock, boothETLabel(e.time)].filter(Boolean).join(' · ');
     var kind = BOOTH_KIND_LABEL[e.kind] || e.kind;
     var result = e.result ? (BOOTH_RESULT_LABEL[e.result] || e.result) : '';
     var duringScore = (e.duringAwayScore != null && e.duringHomeScore != null)
@@ -4668,7 +4763,7 @@
 
   function boothMsgHTML(e, isNew) {
     var q = periodLabel(e.quarter);
-    var when = [q, e.clock].filter(Boolean).join(' · ');
+    var when = [q, e.clock, boothETLabel(e.time)].filter(Boolean).join(' · ');
     var kind = BOOTH_KIND_LABEL[e.kind] || e.kind;
     var result = e.result ? (BOOTH_RESULT_LABEL[e.result] || e.result) : '';
     var duringScore = (e.duringAwayScore != null && e.duringHomeScore != null)
@@ -5791,6 +5886,8 @@
     DAY_BOOTH_FILTERS: DAY_BOOTH_FILTERS,
     BOOTH_RED_ZONE_DISTANCE: BOOTH_RED_ZONE_DISTANCE,
     BOOTH_RISK_LOOKBACK: BOOTH_RISK_LOOKBACK,
+    BOOTH_QUARTER_WALL_MS: BOOTH_QUARTER_WALL_MS,
+    BOOTH_QUARTER_GAME_MS: BOOTH_QUARTER_GAME_MS,
     boothClassify: boothClassify,
     boothResult: boothResult,
     boothMentionsScore: boothMentionsScore,
@@ -5823,6 +5920,10 @@
     boothHotGameIds: boothHotGameIds,
     boothHasUnresolvedRisk: boothHasUnresolvedRisk,
     freshBustUrl: freshBustUrl,
+    boothClockMs: boothClockMs,
+    boothEventAt: boothEventAt,
+    boothETLabel: boothETLabel,
+    boothFeedChronoCompare: boothFeedChronoCompare,
     lastPlayBooth: lastPlayBooth,
     boothRefreshPlan: boothRefreshPlan,
     createProviderGate: createProviderGate,

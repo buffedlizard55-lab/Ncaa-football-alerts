@@ -27,7 +27,9 @@ lookup:
   nullified audit rows are still tracked in separate tabs. The whole alert
   path is latency-first: a worker-metronome ticker keeps it alive in hidden
   tabs, the header feed accelerates while any score is at risk, and an at-risk
-  game gets its own 0.8 s verdict loop that bypasses busy-day pacing.
+  game gets its own 0.8 s verdict loop that bypasses busy-day pacing. The feed
+  is ordered **chronologically by when each play happened** (the provider's
+  per-play wallclock, with a documented fallback for rows without one).
 
 ## Run
 
@@ -226,7 +228,7 @@ already normalizes — see `boothClassify`, `boothEvents`, `dayBoothFeed`):
 | Nullified scores only | A nullified-score event is surfaced only when the play text mentions a score (offensive, defensive or special-teams touchdown, field goal, safety, PAT or 2-pt conversion) **and** the text/verdict wipes it (`nullified`, `No Play`, `reversed`, `overturned`, `overruled`, `void the score`, `erased`, or the 2025 replay-manual verdict script "… Therefore, **no touchdown** / no safety / no field goal"), or the running score actually drops. Ordinary plays are never flagged as nullified. |
 | Scores at risk (new) | `boothEventScoreAtRisk` / `boothEventAlertLevel`: a booth event that can rule on a score — penalty, coach's challenge, replay review, or under-review — **attached to a scoring play with no final decision yet**. Attached means the row's own text names the score, or the scoring play sits within `BOOTH_RISK_LOOKBACK = 3` rows behind it (the stoppage happens before the try/enforcement, so anything farther cannot be that score). Pending means the verdict word is `under (further) review` or absent (`upheld`/`confirmed`/`stands`/`declined`/`offsetting`/`overturned` all mean decided). A flag published on a kickoff/punt row is never associated with the preceding score (a foul during the kick cannot remove the touchdown/try/field goal), while a flagged kick- or punt-return touchdown is still at risk through its own text. The risk state auto-resolves when the verdict row lands or play resumes with a published running score (`boothRiskResolvedAhead`). Grounded in NCAA Rule 10 (fouls during a TD/FG down can keep, cancel or void the score — 10-2-5-d gives the scoring team the option to *cancel* a successful field goal) and the 2025 replay manual's stoppage scripts. |
 | Red zone | Opponent's 20 or closer, from the verified `start.yardsToEndzone` with a `downDistanceText`/goal-to-go fallback. An unknown distance is `null` — never guessed. |
-| All-games live feed | The top live section filters the merged feed through `dayBoothLiveEvents`, so **only at-risk and nullified scoring plays** are rendered there. Routine flags/reviews never appear in that live alert surface. |
+| All-games live feed | The top live section filters the merged feed through `dayBoothLiveEvents`, so **only at-risk and nullified scoring plays** are rendered there. Routine flags/reviews never appear in that live alert surface. The whole feed (live section and tracking tabs alike) is ordered **chronologically by when each play happened** — ascending, oldest first / newest last (the section autoscrolls to the bottom like a chat). The order key is the provider's own per-play `wallclock` when the row has one (exact), else a documented kickoff + quarter + game-clock estimate (`boothEventAt`; exact within a game, approximate across games only for rows the provider left without a wallclock — never displayed as a time), and every row shows its real ET wallclock in the header when the exact timestamp exists. A live header copy without a wallclock never clobbers the cached play's timestamp. |
 | Separate tracking tabs | The same merged event cache is still exposed through `dayBoothTrackingEvents` tabs for Flags, Challenges, Replay, Under review, Red zone and Nullified. A play later re-issued (e.g. `under review` → `overturned`) replaces its row in place. |
 | Alerts & sound | The chime plays **only for at-risk scoring plays and nullified scores** — never for a routine flag, challenge, review of a non-scoring play, or red-zone row. `boothAnnounceStep` is the pure two-level ladder (unit-tested): level 1 fires the instant a scoring play arrives with a pending flag/challenge/review (a sharper, faster lead-in plays), and level 2 fires when the verdict actually wipes the score (the rain chime) — including the upgrade from a level-1 risk on the same play. A risk that resolves cleanly (upheld/declined/resumed) never chimes again, and nothing repeats. |
 | Lowest latency | Score/status rides the 250 ms header feed, and four layers cut the time from "the flag/review/verdict is published" to "the alert sounds": **(ticker)** the tick is driven by a dedicated Web-Worker metronome (`createTickerClock`), not a main-thread `setInterval` — Chrome-family browsers align hidden pages' DOM-timer wake ups to 1/second and, after 5 minutes hidden + silent + a ≥5-deep timer chain, to once per **minute** (verified line by line against the official Chrome blog/chromestatus entries — see item 33), so the old interval silently stopped reading the feed in exactly the tab an alert must fire in; worker `postMessage` delivery, `fetch`, and Web Audio are not DOM-timer wake ups, so hidden tabs keep the full cadence (alerts fire, only DOM paints wait for the visibility repaint). **(adaptive cadence)** while ANY live game has a scoring play at risk, the header poll accelerates from 250 ms to **200 ms** (`liveTickerIntervalMs`); the header is one small feed for the whole slate. **(fast paths, unchanged in kind)** on every tick: (0) a live `situation.lastPlay` that is a booth event attached to a scoring play re-merges that game's cached booth events locally — the **at-risk alert (level 1) fires with zero provider requests**; (1) a lastPlay change to any flag/review/challenge/replay/verdict re-merges and re-renders locally; (2) `boothScoreRiskReason` (scoring play, score-naming booth event, or booth event right after a score) fetches that one game's play-by-play immediately — **cache-busted (`freshBustUrl`)** so the relay's 1 s micro-cache cannot hand back the routine pass's body, on the **secondary provider lane** so it never queues behind the booth lane, with a 500 ms per-game debounce; (3) a header total **drop** (`boothScoreDropped`) triggers the same immediate fetch. **(hot verdict loop)** a game with an unresolved at-risk score — or one the header just flagged — is armed "hot" (`armBoothHotGame`, 75 s window re-armed while the risk genuinely persists, 6 min absolute cap per episode) and polled on its own **800 ms** cadence (`boothHotGameIds` / `boothHotLoopTick`, ≤4 games, ≤2 fast fetches in flight), bypassing the busy-day pacing that otherwise spaces 30+ live games 12–16 s apart. This covers the one case the header cannot: a verdict row published and immediately superseded by the next play (try, kickoff) so the header's single `lastPlay` skips it. While any game is hot, routine poll passes defer (`poll-deferred-hot`) so the hot cadence is never the reason a provider throttles. None of these paths invents an alert — the chime still requires the play text/rollback to confirm (`boothAnnounceStep`). The header fetch timeout is 2 s (`LIVE_HEADER_TIMEOUT_MS`) so a dead transport chain cannot stall the serial tick. |
@@ -736,6 +738,43 @@ source below was read line by line:
     lane), the stale-header-copy regression (item 34a), and the
     enforcement-flag-never-re-flags regression (item 34b).
 
+Chronological alert ordering (2026-09-05, third pass). The live alerts must
+appear in the order the plays HAPPENED, not the order the polls discovered
+them:
+
+37. **Ordering defect found and fixed (flagged for review):**
+    `reconcileDayBoothFeed` deliberately preserved *chat discovery order* —
+    games entered the feed in pass/fetch order, so a later nullification in a
+    game fetched first would sit ABOVE an earlier at-risk review in a game
+    fetched second. On a 39-game slate the discovery order is effectively
+    arbitrary. Fix: every feed item now carries an `at` happened-time key
+    (`boothEventAt`) and `reconcileDayBoothFeed` sorts the whole feed
+    ascending by it (`boothFeedChronoCompare`: `at`, then kickoff, then the
+    feed key — deterministic and stable across in-place row updates). The
+    time sources were verified line by line against the captured fixtures:
+    ESPN summary plays carry an absolute ISO `wallclock` per play
+    (`test/fixtures/summary.json`: 4/4 plays; `summary-401769074.json`: 3/5;
+    `espn-core-plays.json`: 1/2 — real variance, so a fallback is required),
+    and the live header `lastPlay` carries NO wallclock (items 26/32) — so
+    (a) the fallback chain is kickoff + (quarter−1) × 20 wall minutes +
+    elapsed game clock (`BOOTH_QUARTER_WALL_MS`/`BOOTH_QUARTER_GAME_MS`;
+    exact for ordering WITHIN a game, approximate across games only for rows
+    the provider left without a wallclock; used for ordering only and NEVER
+    displayed as a time), and (b) a live header copy merged over a cached
+    play can no longer zero the cached wallclock (`if (!merged.time)` guard,
+    regression-tested). Rows with a real wallclock show it in Eastern time
+    (`boothETLabel`) so the ordering is auditable on the row itself. Proof
+    in the offline simulator (39 games, staggered per-play wallclocks, the
+    scripted at-risk window's rows deliberately wallclock-less to exercise
+    the fallback): with the sort disabled the 160-item feed shows **39
+    chronology inversions**; with it enabled, **0** — while the measured
+    alert latencies are unchanged (at-risk 450 ms, nullified verdict
+    400 ms) and there are still 0 HTTP 429s. The suite grew to **139
+    checks** (`boothClockMs` parsing, `boothEventAt` exact/monotone/fallback
+    behavior, cross-game chronological ordering regardless of discovery
+    order, live-surface order preservation, in-place update stability, the
+    header-copy time-clobber regression, and the ET label).
+
 The booth verification list above (item 15) is the score/status source: ESPN
 NCAA header events mirror the NFL scoreboard header the NFL booth polls at
 250 ms, so the same frame is used on the college side.
@@ -772,7 +811,7 @@ server.js                         static server, health check, allowlisted relay
 index.html                        scoreboard shell, #day-booth booth section, diagnostics footer
 styles.css                        responsive dark scoreboard/detail UI, booth styling
 app.js                            provider clients, parsers, live booth engine + wiring, UI, routing, polling
-test/run.js                       zero-dependency offline test runner (134 checks, incl. live booth + load-policy units)
+test/run.js                       zero-dependency offline test runner (139 checks, incl. live booth + load-policy units)
 test/perf-harness.js              offline load simulator: virtual clock, per-host socket pools, provider rate-limit emulation, scripted at-risk hot window with measured alert latency
 test/fixtures/scoreboard-event.json       verified ESPN final-game fixture
 test/fixtures/summary.json                verified ESPN summary/PBP/stats fixture

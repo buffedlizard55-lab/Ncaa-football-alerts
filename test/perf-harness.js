@@ -302,17 +302,24 @@ function hotRows(push, h) {
   // The flagged score: points on the board, review pending, no verdict.
   // During 'verdict', the overturn + enforcement rows land and the running
   // score rolls back — the nullified shape the booth must alert on.
-  push({ text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { id: '43', text: 'Rushing Touchdown', abbreviation: 'TD' }, scoreValue: 6, awayScore: 0, homeScore: h + 7, start: { down: 2, distance: 3, yardLine: 50, yardsToEndzone: 50, downDistanceText: '2nd & 3', possessionText: 'MID 50', team: { id: Number(HOT_GAME.hm[0]) } }, end: { down: 0, distance: 0, yardLine: 0, yardsToEndzone: 0, downDistanceText: '', possessionText: '', team: { id: Number(HOT_GAME.hm[0]) } } });
-  push({ text: 'The play is under further review.', type: { id: '90', text: 'Timeout', abbreviation: 'TO' }, awayScore: 0, homeScore: h + 7 });
+  // These rows deliberately carry NO wallclock (like the live header
+  // lastPlay) so the estimated ordering fallback is exercised at runtime.
+  push({ wallclock: undefined, text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { id: '43', text: 'Rushing Touchdown', abbreviation: 'TD' }, scoreValue: 6, awayScore: 0, homeScore: h + 7, start: { down: 2, distance: 3, yardLine: 50, yardsToEndzone: 50, downDistanceText: '2nd & 3', possessionText: 'MID 50', team: { id: Number(HOT_GAME.hm[0]) } }, end: { down: 0, distance: 0, yardLine: 0, yardsToEndzone: 0, downDistanceText: '', possessionText: '', team: { id: Number(HOT_GAME.hm[0]) } } });
+  push({ wallclock: undefined, text: 'The play is under further review.', type: { id: '90', text: 'Timeout', abbreviation: 'TO' }, awayScore: 0, homeScore: h + 7 });
   if (hotPhase === 'verdict') {
-    push({ text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.', type: { id: '98', text: 'Play Overturned', abbreviation: 'OVR' }, awayScore: 0, homeScore: h });
-    push({ text: `PENALTY ${HOT_GAME.hm[3]} Holding (#61 T.Baker) 10 yards from ${HOT_GAME.hm[1]}50 to ${HOT_GAME.hm[1]}40`, isPenalty: true, type: { id: '97', text: 'Penalty', abbreviation: 'PEN' }, penalty: { yards: 10, type: { text: 'Holding' } }, awayScore: 0, homeScore: h });
+    push({ wallclock: undefined, text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.', type: { id: '98', text: 'Play Overturned', abbreviation: 'OVR' }, awayScore: 0, homeScore: h });
+    push({ wallclock: undefined, text: `PENALTY ${HOT_GAME.hm[3]} Holding (#61 T.Baker) 10 yards from ${HOT_GAME.hm[1]}50 to ${HOT_GAME.hm[1]}40`, isPenalty: true, type: { id: '97', text: 'Penalty', abbreviation: 'PEN' }, penalty: { yards: 10, type: { text: 'Holding' } }, awayScore: 0, homeScore: h });
   }
 }
-function buildSummary(g) {
-  const plays = [];
-  let seq = 0, a = 0, h = 0;
-  const push = (obj) => { seq++; plays.push(Object.assign({ id: `${g.id}-${seq}`, sequenceNumber: String(seq), period: { number: 2 }, clock: { value: 420 - seq * 2, displayValue: '7:00' }, awayScore: a, homeScore: h, scoringPlay: false, isPenalty: false, isTurnover: false, priority: false, scoreValue: 0, type: { id: '51', text: 'Rushing', abbreviation: 'RUSH' }, teamParticipants: [{ team: { id: Number(g.hm[0]) }, id: String(g.hm[0]), order: 1, type: 'offense' }, { team: { id: Number(g.aw[0]) }, id: String(g.aw[0]), order: 2, type: 'defense' }], start: { down: 1, distance: 10, yardLine: 45, yardsToEndzone: 55, downDistanceText: '1st & 10', possessionText: 'MID 45', team: { id: Number(g.hm[0]) } }, end: { down: 2, distance: 8, yardLine: 47, yardsToEndzone: 53, downDistanceText: '2nd & 8 at MID 47', possessionText: 'MID 47', team: { id: Number(g.hm[0]) } }, wallclock: '2026-08-29T17:05:00Z' }, obj)); };
+  function buildSummary(g) {
+    const plays = [];
+    let seq = 0, a = 0, h = 0;
+    const kickoffMs = Date.parse(g.date);
+    // Real provider plays carry a per-play wallclock (verified in the
+    // captured fixtures — present on most, not all, rows; the hot-window rows
+    // below intentionally omit it to exercise the estimated ordering
+    // fallback). Stagger ~21 s per play from this game's kickoff.
+    const push = (obj) => { seq++; plays.push(Object.assign({ id: `${g.id}-${seq}`, sequenceNumber: String(seq), wallclock: new Date(kickoffMs + seq * 21000).toISOString(), period: { number: 2 }, clock: { value: 420 - seq * 2, displayValue: '7:00' }, awayScore: a, homeScore: h, scoringPlay: false, isPenalty: false, isTurnover: false, priority: false, scoreValue: 0, type: { id: '51', text: 'Rushing', abbreviation: 'RUSH' }, teamParticipants: [{ team: { id: Number(g.hm[0]) }, id: String(g.hm[0]), order: 1, type: 'offense' }, { team: { id: Number(g.aw[0]) }, id: String(g.aw[0]), order: 2, type: 'defense' }], start: { down: 1, distance: 10, yardLine: 45, yardsToEndzone: 55, downDistanceText: '1st & 10', possessionText: 'MID 45', team: { id: Number(g.hm[0]) } }, end: { down: 2, distance: 8, yardLine: 47, yardsToEndzone: 53, downDistanceText: '2nd & 8 at MID 47', possessionText: 'MID 47', team: { id: Number(g.hm[0]) } } }, obj)); };
   for (let i = 0; i < 8; i++) push({ text: `#${10 + i} R.Harrison rush for ${3 + (i % 5)} yards` });
   // TD that gets nullified by a flag on the play — the booth's core case.
   a += 0; h += 7;
@@ -680,6 +687,17 @@ async function run() {
   // Snapshot booth state.
   M.boothFeedFinal = NB.state ? (NB.state.booth.feed || []).length : -1;
   M.boothGamesFinal = NB.state ? Object.keys(NB.state.booth.eventsByGame || {}).length : -1;
+  // Chronology audit: the feed must be ascending by happened-time (`at`).
+  // With 39 games discovered in pass order and staggered per-play
+  // wallclocks, an unsorted (discovery-order) feed shows dozens of
+  // inversions; a correctly ordered feed shows zero.
+  M.chronologyViolations = 0;
+  if (NB.state && Array.isArray(NB.state.booth.feed)) {
+    const f = NB.state.booth.feed;
+    for (let i = 1; i < f.length; i++) {
+      if (Number(f[i - 1] && f[i - 1].at) > Number(f[i] && f[i].at)) M.chronologyViolations++;
+    }
+  }
   M.clockEnd = MINUTES;
   if (NB.state) { console.error("DEBUG state.error=", JSON.stringify(NB.state.error)); console.error("DEBUG state.loading=", NB.state.loading, "games=", NB.state.games.length, "loadedDate=", NB.state.loadedDate, "date=", NB.state.date); console.error("DEBUG main html len=", (globalThis.document.getElementById("main").innerHTML||"").length, "head=", (globalThis.document.getElementById("main").innerHTML||"").slice(0,300)); }
   const out = {
@@ -702,7 +720,7 @@ async function run() {
       readerBudgetUsed: M.readerBudgetUsed, readerRejected: M.readerRejected
     },
     browserPools: Object.fromEntries([...Object.entries(M.maxQueueDepthByHost)].filter(([k]) => !k.includes('#wait')).map(([k, v]) => [k, { queuePeak: v }])),
-    booth: { feedEvents: M.boothFeedFinal, gamesScanned: M.boothGamesFinal },
+    booth: { feedEvents: M.boothFeedFinal, gamesScanned: M.boothGamesFinal, chronologyViolations: M.chronologyViolations },
     hotWindowMs: {
       riskAlert: HOT.riskAlertMs,
       nullifiedVerdictAlert: HOT.verdictAlertMs,
