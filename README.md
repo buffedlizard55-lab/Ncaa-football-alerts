@@ -419,7 +419,7 @@ Current verification performed on **2026-08-27**:
    api.codetabs.com candidates were called independently; their observed
    authentication, coverage, or transport failures are recorded above rather
    than treated as working providers.
-9. `npm test` passes **133 offline checks** (count updated 2026-09-05), including the at-risk scoring-play alert ladder, syntax, URL construction,
+9. `npm test` passes **134 offline checks** (count updated 2026-09-05), including the at-risk scoring-play alert ladder, syntax, URL construction,
    Reader normalization/fallback behavior, ESPN response validation, NCAA
    scoreboard/detail parsing, conference filtering, single-day date filtering,
    real ESPN fixtures, date boundaries, merge/deduplication, live and final
@@ -684,48 +684,57 @@ source below was read line by line:
     there; keep the tab loaded (pinned/audible tabs resist discarding).
     When Workers are unavailable (Node tests, ancient browsers) the ticker
     falls back to a plain `setInterval` driving the identical step.
-34. **Engine irregularity found and fixed (flagged for review):** the new
-    harness scenario exposed a genuine bug in `boothMergeLiveLastPlay`. When
-    the header feed lags a just-fetched summary — exactly the state the fast
-    paths create (the immediate summary fetch already contains touchdown +
-    "under review" while the header still publishes the touchdown as its
-    lastPlay) — the live copy of the scoring play was appended *after* the
-    pending review row (or replaced it while adopting a zero/out-of-band
-    sequence, since real header rows carry no `sequenceNumber`; both live
-    shapes sort it to the wrong end). `boothRiskResolvedAhead` then read
-    that stale copy as "play resumed with a published score" and the
-    at-risk alert silently never fired. Fixes: a live lastPlay matching a
-    cached play's type+text+scoreValue now replaces it **in place, keeping
-    the cached row's sequence position**; and a row identical to the scoring
-    play under review is never treated as a resumption (a resumed game
-    publishes a *different* play — try, kickoff, next snap). Regression-
-    tested for all three observed live shapes (no seq / seq 0 / out-of-band
-    seq) in `test/run.js`.
+34. **Engine irregularities found and fixed (flagged for review):** the new
+    harness scenario exposed two genuine defects. **(a)** In
+    `boothMergeLiveLastPlay`, when the header feed lags a just-fetched
+    summary — exactly the state the fast paths create (the immediate summary
+    fetch already contains touchdown + "under review" while the header still
+    publishes the touchdown as its lastPlay) — the live copy of the scoring
+    play was appended *after* the pending review row (or replaced it while
+    adopting a zero/out-of-band sequence, since real header rows carry no
+    `sequenceNumber`; both live shapes sort it to the wrong end).
+    `boothRiskResolvedAhead` then read that stale copy as "play resumed with
+    a published score" and the at-risk alert silently never fired. Fixes: a
+    live lastPlay matching a cached play's type+text+scoreValue now replaces
+    it **in place, keeping the cached row's sequence position**; and a row
+    identical to the scoring play under review is never treated as a
+    resumption (a resumed game publishes a *different* play — try, kickoff,
+    next snap). Regression-tested for all three observed live shapes (no
+    seq / seq 0 / out-of-band seq). **(b)** The penalty-enforcement row that
+    follows an overturned-touchdown verdict sits within the risk lookback
+    of the (now decided) score, so it re-flagged as a *new* at-risk score —
+    a second chime after the nullified verdict. Fix: a booth event whose
+    associated scoring play already has a decided verdict (upheld /
+    overturned / declined / …) between them can never be at risk
+    (`decidedBetween` in `boothEventContext`); a flag with no verdict
+    between it and the score still alerts at level 1 (regression-tested).
 35. **Measured end-to-end alert latency (offline simulator, full 30-live-game
     slate, token-bucket rate limiter):** `test/perf-harness.js` now scripts a
     flagged-touchdown → pending-review → nullified-verdict window on one live
     game (phase-driven summary/header content, 50 ms measurement resolution,
-    the app's real timers/transports). Measured: the **at-risk alert fires
-    450 ms** after the flagged touchdown reaches the header feed, and the
-    **nullified verdict alert fires 400 ms** after publication — against
-    **12,000 ms**, the routine busy-day per-game interval (30 live games ×
-    `BOOTH_BUSY_DAY_GAME_MS`) that the hot loop bypasses — with **0 HTTP
-    429s**, no Reader/proxy use, queue depth ≤ 1, 39/39 games scanned.
-    Baseline parity over the same simulated 10 minutes without the window:
-    3,211 total fetches before these changes vs 3,578 after (the difference
-    is the ticker holding the true 250 ms serial cadence plus the scripted
-    window's own hot fetches); still 0 rate-limits in both. The with-window
-    run reports 158 feed events — the 156 routine events plus exactly the
-    two scripted hot rows (the at-risk review row and the nullified verdict
-    row), nothing else changes.
-36. The suite grew to **133 checks**: the adaptive-cadence decision
+    the app's real timers/transports; deterministic across repeated runs).
+    Measured: the **at-risk alert fires 450 ms** after the flagged touchdown
+    reaches the header feed, and the **nullified verdict alert fires 400 ms**
+    after publication — against **12,000 ms**, the routine busy-day per-game
+    interval (30 live games × `BOOTH_BUSY_DAY_GAME_MS`) that the hot loop
+    bypasses — with **0 HTTP 429s**, no Reader/proxy use, queue depth ≤ 1,
+    39/39 games scanned. Baseline parity over the same simulated 10 minutes
+    without the window: 3,211 total fetches before these changes vs 3,578
+    after (the difference is the ticker holding the true 250 ms serial
+    cadence plus the scripted window's own hot fetches); still 0 rate-limits
+    in both. The with-window run reports 160 feed events — the 156 routine
+    events plus exactly the four scripted-window rows (the at-risk review
+    row, the nullified verdict row, its locally merged header twin, and the
+    enforcement flag); nothing routine changes.
+36. The suite grew to **134 checks**: the adaptive-cadence decision
     (`liveTickerIntervalMs`), the hot-game decision (`boothHotGameIds`:
     risk-first ordering, armed windows, expiry, cap; `boothHasUnresolvedRisk`),
     the cache-buster (`freshBustUrl`), the wiring scan (worker metronome
     exists and drives the header poll + hot loop, no hidden-guard on the
     ticker step, alerts fire before any paint guard, both the score-risk and
     score-drop paths arm the hot loop, fast fetches are fresh + secondary
-    lane), and the stale-header-copy regression from item 34.
+    lane), the stale-header-copy regression (item 34a), and the
+    enforcement-flag-never-re-flags regression (item 34b).
 
 The booth verification list above (item 15) is the score/status source: ESPN
 NCAA header events mirror the NFL scoreboard header the NFL booth polls at
@@ -763,7 +772,7 @@ server.js                         static server, health check, allowlisted relay
 index.html                        scoreboard shell, #day-booth booth section, diagnostics footer
 styles.css                        responsive dark scoreboard/detail UI, booth styling
 app.js                            provider clients, parsers, live booth engine + wiring, UI, routing, polling
-test/run.js                       zero-dependency offline test runner (133 checks, incl. live booth + load-policy units)
+test/run.js                       zero-dependency offline test runner (134 checks, incl. live booth + load-policy units)
 test/perf-harness.js              offline load simulator: virtual clock, per-host socket pools, provider rate-limit emulation, scripted at-risk hot window with measured alert latency
 test/fixtures/scoreboard-event.json       verified ESPN final-game fixture
 test/fixtures/summary.json                verified ESPN summary/PBP/stats fixture

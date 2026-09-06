@@ -671,6 +671,10 @@ async function run() {
       HOT.verdictAlertMs = vnow - verT0;
       HOT.routineWouldBeMs = liveCount * 400; // busy-day per-game interval the hot loop bypasses
       hotPhase = 'idle'; // the rest of the run returns to routine pacing
+      if (process.env.HOT_DEBUG) {
+        console.error('[hot-debug] hot-game feed rows at the end of the window:');
+        (NB.state.booth.feed || []).filter(hotEv).forEach((e) => console.error('[hot-debug]', JSON.stringify({ id: e.id, key: e.key, kind: e.kind, text: String(e.text).slice(0, 60), atRisk: NB.boothEventScoreAtRisk(e), nullifies: NB.boothEventNullifies(e) })));
+      }
     }
   }
   // Snapshot booth state.

@@ -2290,6 +2290,21 @@
       tight = boothNearestScoringPlay(plays, index, BOOTH_RISK_LOOKBACK);
     }
     var t = boothTeamOf(teamMap, event.teamId);
+    // A flag/review that follows its scoring play can only put that score AT
+    // RISK if nothing between them has already decided it: an overturned /
+    // upheld / declined verdict row between the score and this row settles
+    // the score's fate (the enforcement flag that follows an overturned
+    // touchdown must not re-alert as a NEW at-risk score). Found by the
+    // harness scripted verdict window (2026-09-05).
+    var decidedBetween = false;
+    if (tight && tight.index != null) {
+      for (var b = tight.index + 1; b < index; b += 1) {
+        var bp = plays[b];
+        if (!bp) continue;
+        var bres = boothResult(boothPlayText(bp));
+        if (bres && bres !== 'pending') { decidedBetween = true; break; }
+      }
+    }
     var withScores = Object.assign({}, event, {
       team: t,
       yardsToEndzone: boothYardsToEndzone(plays[index], teamMap),
@@ -2307,7 +2322,7 @@
       riskScoringPlay: tight
     });
     withScores.nullified = boothEventNullifies(withScores);
-    withScores.atRisk = boothEventRiskPending(withScores) && !boothRiskResolvedAhead(plays, index);
+    withScores.atRisk = boothEventRiskPending(withScores) && !boothRiskResolvedAhead(plays, index) && !decidedBetween;
     return withScores;
   }
 

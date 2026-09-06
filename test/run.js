@@ -1512,6 +1512,35 @@ function waitForPort(url, ms) {
     assert.strictEqual(verdict2.pointsRemoved, 7);
   });
 
+  test('an enforcement flag after a decided verdict never re-flags the score at risk (harness-found, 2026-09-05)', () => {
+    // TD -> under review -> OVERTURNED verdict -> penalty enforcement row.
+    // The enforcement flag sits within the risk lookback of the touchdown,
+    // but the verdict between them already decided the score: it must NOT
+    // alert again as a new at-risk score (the nullified verdict owns it).
+    const plays = [
+      boothNorm({ id: 'e1', sequenceNumber: '1', text: '#2x D.Smith pass complete for 8 yards', awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'e2', sequenceNumber: '2', text: '#88 H.Loop rush for 50 yards TOUCHDOWN', scoringPlay: true, type: { text: 'Rushing Touchdown' }, scoreValue: 6, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 'e3', sequenceNumber: '3', text: 'The play is under further review.', type: { text: 'Timeout' }, awayScore: 0, homeScore: 7 }),
+      boothNorm({ id: 'e4', sequenceNumber: '4', text: 'After further review, the ruling on the field is overturned. The play is nullified. #88 H.Loop is called for holding on the play.', type: { text: 'Play Overturned' }, awayScore: 0, homeScore: 0 }),
+      boothNorm({ id: 'e5', sequenceNumber: '5', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, penalty: { yards: 10, type: { text: 'Holding' } }, awayScore: 0, homeScore: 0 })
+    ];
+    const evs = NB.boothEvents(plays, null, {});
+    const flag = evs.find((e) => String(e.text).indexOf('PENALTY TA&M') !== -1);
+    const verdict = evs.find((e) => String(e.text).indexOf('nullified') !== -1);
+    assert.ok(flag && verdict, 'both rows must be booth events');
+    assert.strictEqual(flag.atRisk, false, 'the enforcement flag must not re-flag the decided score');
+    assert.strictEqual(NB.boothEventAlertLevel(flag), 0, 'no alert level for the enforcement flag');
+    assert.strictEqual(NB.boothEventAlertLevel(verdict), 2, 'the nullified verdict owns the alert');
+    // The same flag DIRECTLY after the score (no verdict between, points
+    // still on the board) still alerts at risk.
+    const pendingFlag = boothNorm({ id: 'e5p', sequenceNumber: '5', text: 'PENALTY TA&M Holding (#61 T.Baker) 10 yards from TA&M50 to TA&M40', isPenalty: true, type: { text: 'Penalty' }, penalty: { yards: 10, type: { text: 'Holding' } }, awayScore: 0, homeScore: 7 });
+    const noVerdict = [plays[0], plays[1], pendingFlag];
+    const evs2 = NB.boothEvents(noVerdict, null, {});
+    const flag2 = evs2.find((e) => String(e.text).indexOf('PENALTY TA&M') !== -1);
+    assert.strictEqual(flag2.atRisk, true, 'a flag with no decided verdict between it and the score is still at risk');
+    assert.strictEqual(NB.boothEventAlertLevel(flag2), 1);
+  });
+
   test('freshBustUrl appends the provider-accepted _= buster without breaking the query', () => {
     assert.strictEqual(NB.freshBustUrl('https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401856668', 123),
       'https://site.api.espn.com/apis/site/v2/sports/football/college-football/summary?event=401856668&_=123');
